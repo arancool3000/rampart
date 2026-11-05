@@ -36,7 +36,7 @@ an XProtect engine called "Bastion"). Research lives in `docs/research/01..10-*.
 ## Building without colliding
 Ten agents build in parallel. Always use your own scratch path and target:
 ```sh
-cd /Users/arankeyhan/Bastion
+cd /Users/arankeyhan/Rampart
 swift build --scratch-path .build-<module> --target <YourTarget>
 swift build --scratch-path .build-<module> --product rampart-selftest && .build-<module>/out/Products/Debug/rampart-selftest <suite>
 ```
