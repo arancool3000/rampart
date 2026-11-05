@@ -1,6 +1,6 @@
 # Rampart — architecture and build rules
 
-Rampart is a macOS antivirus (folder still named Bastion; the product is **Rampart**, renamed because Apple ships
+Rampart is a macOS antivirus (the product is **Rampart**, renamed because Apple ships
 an XProtect engine called "Bastion"). Research lives in `docs/research/01..10-*.md`. Read the ones listed for your module.
 
 ## Hard constraints of this machine
