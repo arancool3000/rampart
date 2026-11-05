@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Per-user LaunchAgent (/Library/LaunchAgents): starts the Rampart menu bar app at login so alerts reach the user. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>app.rampart.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Rampart.app/Contents/MacOS/Rampart</string>
+        <string>--background</string>
+    </array>
+    <key>AssociatedBundleIdentifiers</key><array><string>app.rampart.app</string></array>
+    <key>LimitLoadToSessionType</key><string>Aqua</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>30</integer>
+    <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>

@@ -7,7 +7,7 @@ an XProtect engine called "Bastion"). Research lives in `docs/research/01..10-*.
 - macOS 27, arm64, Swift 6.4, **Command Line Tools only** (no Xcode, no xcodebuild, no paid Developer ID).
 - **No Endpoint Security entitlement.** Real-time events come from Apple's `/usr/bin/eslogger` (run by our root daemon), FSEvents, libproc polling and `/usr/bin/log stream`. We detect and respond right after execution; we cannot block before exec.
 - **No NetworkExtension.** Web protection = local DNS resolver + DoH upstream + blocklists, plus `pf` IP tables.
-- **No XCTest / Swift Testing** (macro plugins missing). Tests go in `Sources/rampart-selftest/SelfTest+<Module>.swift` using `check(cond, "name")`. Run: `.build-<you>/debug/rampart-selftest <suite>`.
+- **No XCTest / Swift Testing** (macro plugins missing). Tests go in `Sources/rampart-selftest/SelfTest+<Module>.swift` using `check(cond, "name")`. Run: `.build-<you>/out/Products/Debug/rampart-selftest <suite>`.
 - **SwiftUI `@State` does not compile** (SwiftUIMacros plugin missing). Use `typealias StateVar = SwiftUI.State` then `@StateVar`. `@Observable`, `@StateObject`, `@ObservedObject`, `@Bindable`, `@Environment`, `@AppStorage`, `@Binding` work. Do NOT use `#Preview`, `@Entry`. Do not name the `@main` file `main.swift`.
 - Language mode is Swift 5 (`swiftLanguageModes: [.v5]`) to reduce concurrency friction.
 - Never run `caffeinate` or anything that keeps the Mac awake. Never install system-wide (no sudo, no launchctl bootstrap, no networksetup changes, no pfctl changes) during development; write code and dry-run modes instead. A network web filter (Securly) blocks some security domains and raw.githubusercontent.com; downloaders must validate status and content.
@@ -38,7 +38,7 @@ Ten agents build in parallel. Always use your own scratch path and target:
 ```sh
 cd /Users/arankeyhan/Bastion
 swift build --scratch-path .build-<module> --target <YourTarget>
-swift build --scratch-path .build-<module> --product rampart-selftest && .build-<module>/debug/rampart-selftest <suite>
+swift build --scratch-path .build-<module> --product rampart-selftest && .build-<module>/out/Products/Debug/rampart-selftest <suite>
 ```
 Only the lead edits Package.swift, Sources/RampartShared, Sources/rampart-selftest/main.swift and Suites.swift.
 If another module's half-written code breaks your build of a combined product, build your own target only and retry later. Don't fix other agents' files.

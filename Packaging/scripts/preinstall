@@ -1,0 +1,4 @@
+#!/bin/bash
+# Runs as root before the payload is laid down: stop a previous version so its binary can be replaced.
+launchctl bootout system/app.rampart.daemon 2>/dev/null || true
+exit 0

@@ -1,0 +1,7 @@
+#!/bin/bash
+# Runs as root by Installer after Rampart.app is in /Applications ($2 = install target volume).
+TARGET="${3:-/}"
+APP="${TARGET%/}/Applications/Rampart.app"
+[ "$TARGET" = "/" ] && APP="/Applications/Rampart.app"
+RAMPART_APP="$APP" /bin/bash "$APP/Contents/Resources/rampart-setup.sh" install
+exit 0
