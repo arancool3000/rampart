@@ -54,6 +54,7 @@ enum DaemonWiring {
             hub.add(ExecWatchSource())
             hub.add(SocketSource(interval: 2))
             DaemonWiring.hub = hub
+            s.sourceCPU = { hub.cpuBySource }
             DaemonHooks.ingestClipboard = { e in hub.ingest(e) }
             let pipeline = RealtimePipeline(runtime: runtime, feed: HubFeed(hub: hub), scanner: s.scanner)
             let behaviourNote = BehaviourWiring.attach(pipeline, services: s, runtime: runtime)

@@ -32,7 +32,7 @@ struct BrandAssembly: View, Animatable {
         let meet = Ease.back(t / 0.5)                         // halves meet by 0.5 s (gentle overshoot)
         let sweep = (t - 0.45) / 0.35                         // one pass, 0.45–0.8 s
         VStack(spacing: wordHeight * 0.4) {
-            RamPartMark(size: markSize, tile: true, split: CGFloat(1 - meet), sweep: sweep > 0 && sweep < 1 ? CGFloat(sweep) : nil,
+            RamPartMark(size: markSize, tile: true, split: CGFloat(max(0, 1 - meet)), sweep: sweep > 0 && sweep < 1 ? CGFloat(sweep) : nil,
                         halfOpacity: Ease.clamp(t / 0.2))
                 .scaleEffect(0.94 + 0.06 * Ease.out(t / 0.5))
             word(t).frame(width: wordHeight * CGFloat(BrandPaths.wordmarkViewBox.w / BrandPaths.wordmarkViewBox.h), height: wordHeight)

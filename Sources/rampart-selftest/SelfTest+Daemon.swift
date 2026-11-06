@@ -144,6 +144,21 @@ extension SelfTest {
         if case .wifi? = call(.wifi).last { check(true, "daemon: wifi") } else { check(false, "daemon: wifi") }
         if case .ok? = call(.setRealtime(on: false)).last { check(true, "daemon: setRealtime") } else { check(false, "daemon: setRealtime") }
         try? FileManager.default.removeItem(at: fx2)
+        // v4 (RampartWeb).
+        if case .urlVerdict(let d)? = call(.checkURL(url: "http://paypa1-secure-login.com/verify")).last,
+           let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+            check((o["score"] as? Int ?? 0) >= 50, "daemon: checkURL flags a PayPal lookalike")
+        } else { check(false, "daemon: checkURL") }
+        if case .scamReport(let d)? = call(.scamCheck(text: "hello, lunch at noon?", kind: "message")).last { check(!d.isEmpty, "daemon: scamCheck") }
+        else { check(false, "daemon: scamCheck") }
+        if case .webLookup(let d)? = call(.webLookup(host: "example.com")).last { check(d == nil, "daemon: webLookup (not listed)") }
+        else { check(false, "daemon: webLookup") }
+        if case .ok? = call(.webVerdict(url: "https://phish.example/x", verdict: "likelyScam", score: 85, headline: "selftest warning")).last,
+           case .activity(let es)? = call(.activity(limit: 5)).last {
+            check(es.contains { $0.title == "selftest warning" }, "daemon: webVerdict logged to activity")
+        } else { check(false, "daemon: webVerdict") }
+        if case .health(let h)? = call(.health).last { check(h.sourceCPUSeconds.isEmpty || h.sourceCPUSeconds.values.allSatisfy { $0 >= 0 }, "daemon: health sourceCPUSeconds") }
+
         // v3 (RampartGuard).
         if case .tamper(let data)? = call(.tamperStatus).last { check(!data.isEmpty, "daemon: tamper status") } else { check(false, "daemon: tamper status") }
         if case .remoteAccess(let data)? = call(.remoteAccessReport).last { check(!data.isEmpty, "daemon: remote-access report") }

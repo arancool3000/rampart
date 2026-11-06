@@ -277,6 +277,11 @@ public enum IPCRequest: Codable, Sendable {
     case uninstall(token: String)
     // v3: forward per-user events (PasteGuard/clipboard) from the user session to the root daemon
     case forwardEvents([SecurityEvent])
+    // v4: web protection for rampart-nmh / extensions / browser (payloads are RampartWeb JSON)
+    case checkURL(url: String)
+    case scamCheck(text: String, kind: String)
+    case webLookup(host: String)
+    case webVerdict(url: String, verdict: String, score: Int, headline: String)
 }
 
 public enum IPCResponse: Codable, Sendable {
@@ -303,4 +308,8 @@ public enum IPCResponse: Codable, Sendable {
     case remoteAccess(Data)   // JSON of RampartGuard.RemoteAccessReport
     case tamper(Data)         // JSON of the tamper status struct
     case disableToken(String)
+    // v4
+    case urlVerdict(Data)     // JSON of RampartWeb.URLReport
+    case scamReport(Data)     // JSON of RampartWeb.ScamReport
+    case webLookup(Data?)     // JSON of RampartWeb.BlocklistHit, nil when not listed
 }

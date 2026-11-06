@@ -44,6 +44,8 @@ final class Router {
         case .tamperStatus: return "tamperStatus"; case .requestDisableProtection: return "requestDisableProtection"
         case .disableProtection: return "disableProtection"; case .requestUninstall: return "requestUninstall"
         case .uninstall: return "uninstall"; case .forwardEvents: return "forwardEvents"
+        case .checkURL: return "checkURL"; case .scamCheck: return "scamCheck"; case .webLookup: return "webLookup"
+        case .webVerdict: return "webVerdict"
         }
     }
 
@@ -209,6 +211,22 @@ final class Router {
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
                 try g.redeem(token, peer: peer, purpose: .uninstall, minutes: 10)
                 try p.beginUninstall()
+                _ = send(.ok)
+            case .checkURL(let url):
+                guard let w = p.services.webCheck else { throw ServiceError.unavailable("web checks") }
+                _ = send(.urlVerdict(try w.checkURL(url)))
+            case .scamCheck(let text, let kind):
+                guard let w = p.services.webCheck else { throw ServiceError.unavailable("scam check") }
+                guard text.utf8.count <= 2 << 20 else { throw ServiceError.failed("input too large") }
+                _ = send(.scamReport(try w.scamCheck(text, kind: kind)))
+            case .webLookup(let host):
+                guard let w = p.services.webCheck else { throw ServiceError.unavailable("web lookups") }
+                _ = send(.webLookup(try w.lookup(host)))
+            case .webVerdict(let url, let verdict, let score, let headline):
+                let sev: Severity = score >= 80 ? .high : score >= 50 ? .medium : .low
+                let host = URL(string: url)?.host ?? url
+                p.activity.add(.webBlock, headline.isEmpty ? "Web warning: \(host)" : headline,
+                               detail: String(url.prefix(300)), outcome: "\(verdict) (\(score))", severity: sev)
                 _ = send(.ok)
             case .forwardEvents(let events):
                 guard let rt = p.services.realtime as? RealtimePipeline else { throw ServiceError.unavailable("real-time pipeline") }

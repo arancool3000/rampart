@@ -131,9 +131,10 @@ public struct HealthReport: Codable, Hashable, Sendable {
     public var residentMB: Double
     public var sources: [String: Bool]
     public var lastErrors: [String]
+    public var sourceCPUSeconds: [String: Double]
     public init(mode: String, version: String, uptimeSeconds: Double, cpuPercent: Double, residentMB: Double,
-                sources: [String: Bool], lastErrors: [String]) {
+                sources: [String: Bool], lastErrors: [String], sourceCPUSeconds: [String: Double] = [:]) {
         self.mode = mode; self.version = version; self.uptimeSeconds = uptimeSeconds; self.cpuPercent = cpuPercent
-        self.residentMB = residentMB; self.sources = sources; self.lastErrors = lastErrors
+        self.residentMB = residentMB; self.sources = sources; self.lastErrors = lastErrors; self.sourceCPUSeconds = sourceCPUSeconds
     }
 }

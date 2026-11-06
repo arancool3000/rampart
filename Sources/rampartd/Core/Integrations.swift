@@ -81,6 +81,7 @@ enum Integrations {
         let web = WebProtection(runtime: runtime, lists: lists)
         s.web = web
         s.network = web
+        s.webCheck = WebCheckService(runtime: runtime, web: web)
         web.onBlock = { [weak s] d, l in s?.onWebBlock?(d, l) }
         web.onQuery = { [weak s] e in s?.onDNSEvent?(e) }
         s.signingLookup = { path in SigningInspector.inspectCached(path: path).info }
@@ -331,6 +332,9 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
         stats.byDay = stats.byDay.filter { $0.key >= cutoff }
         try? Util.writeJSON(stats, to: statsURL); statsDirty = false
     }
+
+    /// Current blocklist (built lazily, rebuilt on updates).
+    func currentBlocklist() -> DomainBlocklist { blocklist() }
 
     private func blocklist() -> DomainBlocklist {
         lock.lock(); defer { lock.unlock() }

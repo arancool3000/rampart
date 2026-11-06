@@ -59,6 +59,9 @@ struct RamPartMark: View {
                         .blendMode(.plusLighter)
                         .opacity(0.35)
                 }
+                // Keyhole where the two halves meet (appears once the halves have joined).
+                RamPartKeyhole().fill(Color(white: 0.10))
+                    .opacity(max(0, 1 - Double(split) * 6))
             }
             .frame(width: shieldW, height: shieldH)
             .opacity(halfOpacity)
@@ -117,5 +120,25 @@ enum BrandImages {
         let r = ImageRenderer(content: RamPartMark(size: size, tile: true))
         r.scale = 2
         return r.nsImage ?? NSImage()
+    }
+}
+
+
+/// Keyhole cut at the seam of the Two-Part Shield. Geometry mirrors Resources/Brand/generate-shield.swift
+/// (variant 2): circle radius 0.075·1.07·W, centred 0.10·W above the shield centre, tapered slot below.
+struct RamPartKeyhole: Shape {
+    func path(in rect: CGRect) -> Path {
+        let W = rect.width
+        let r = W * 0.075 * 1.07
+        let cx = rect.midX, cy = rect.midY - W * 0.10
+        var p = Path()
+        p.addEllipse(in: CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r))
+        var slot = Path()
+        slot.move(to: CGPoint(x: cx - r * 0.55, y: cy))
+        slot.addLine(to: CGPoint(x: cx + r * 0.55, y: cy))
+        slot.addLine(to: CGPoint(x: cx + r * 0.85, y: cy + r * 3.2))
+        slot.addLine(to: CGPoint(x: cx - r * 0.85, y: cy + r * 3.2))
+        slot.closeSubpath()
+        return p.union(slot)
     }
 }

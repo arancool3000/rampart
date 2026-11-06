@@ -211,7 +211,8 @@ extension Protection {
         return HealthReport(mode: runtime.userMode ? "user" : "root", version: Product.version,
                             uptimeSeconds: now.timeIntervalSince(started), cpuPercent: pct,
                             residentMB: (Util.residentMB * 10).rounded() / 10,
-                            sources: services.realtime?.sources ?? [:], lastErrors: DLog.shared.recentProblems)
+                            sources: services.realtime?.sources ?? [:], lastErrors: DLog.shared.recentProblems,
+                            sourceCPUSeconds: services.sourceCPU?() ?? [:])
     }
 }
 

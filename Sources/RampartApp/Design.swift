@@ -186,21 +186,12 @@ struct ShieldHero: View {
     var body: some View {
         let animate = breathe && gate.live && !reduceMotion
         ZStack {
-            if !reduceTransparency {
-                if Headless.renderDir != nil {
-                    // Offscreen rendering can't rasterise layer-hosted views; draw the glow's resting state.
-                    Circle().fill(RadialGradient(colors: [tint.opacity(0.42), tint.opacity(0)], center: .center, startRadius: 0, endRadius: size * 0.55))
-                } else {
-                    GlowPulse(color: NSColor(tint), animate: animate)
-                }
-            }
             Circle().strokeBorder(tint.opacity(0.24), lineWidth: 1).frame(width: size * 0.78, height: size * 0.78)
             Circle().strokeBorder(tint.opacity(0.12), lineWidth: 1).frame(width: size * 0.96, height: size * 0.96)
             Image(systemName: symbol)
                 .font(.system(size: size * 0.42, weight: .semibold))
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(LinearGradient(colors: [tint, tint.opacity(0.7)], startPoint: .top, endPoint: .bottom))
-                .shadow(color: reduceTransparency ? .clear : tint.opacity(0.55), radius: size * 0.08)
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)

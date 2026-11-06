@@ -53,7 +53,7 @@ func render(variant: Int, size: Int, name: String) {
     ctx.restoreGState()
     if variant == 2 {
         ctx.saveGState(); ctx.setFillColor(CGColor(gray: 0.10, alpha: 1))
-        let r = W*0.075, cy = c.y + W*0.10
+        let r = W*0.075*1.07, cy = c.y + W*0.10
         ctx.fillEllipse(in: CGRect(x: c.x - r, y: cy - r, width: 2*r, height: 2*r))
         let slot = CGMutablePath()
         slot.move(to: CGPoint(x: c.x - r*0.55, y: cy)); slot.addLine(to: CGPoint(x: c.x + r*0.55, y: cy))

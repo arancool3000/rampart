@@ -118,6 +118,9 @@ final class Services {
     var web: WebProtectionService?
     var network: NetworkInfoService?
     var guardian: GuardService?
+    var webCheck: WebCheckService?
+    /// EventHub.cpuBySource (daemon only).
+    var sourceCPU: (() -> [String: Double])?
     /// DNS query-log events (.dnsQuery, detail["name"]) for the behaviour engine; set by the daemon wiring.
     var onDNSEvent: ((SecurityEvent) -> Void)?
     /// Set by Protection: (domain, list) for every DNS block (rate-limited by the network adapter).

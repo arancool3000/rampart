@@ -42,6 +42,9 @@ commands:
   health                              daemon mode, uptime, CPU, memory, event sources, recent errors
   remote [report|allow <id> [min]|revoke <id>|lockdown on|off]   remote-access lockdown
   tamper                              tamper-protection status
+  check-url <url>                     URL verdict (lookalikes, blocklists, punycode, ...)
+  scam <text|url> [--kind K]          scam check of a message, email or URL
+  web-lookup <host>                   is this host on the daemon's blocklists?
   install --gui-auth [--app PATH]     "Enable full protection": one admin password dialog installs the
                                       root daemon (without --gui-auth or with --dry-run: print the command)
   uninstall --gui-auth [--keep-data]  remove everything (one admin dialog), verified clean
@@ -464,6 +467,25 @@ case "remote":
         }
         if let n = obj["note"] as? String, !n.isEmpty { print("  \(n)") }
     }
+
+case "check-url", "scam":
+    guard let input = args.first else { fail("usage: rampart check-url <url> | rampart scam <text|url> [--kind message|email|url]") }
+    let kind = option("--kind") ?? "auto"
+    let r = command == "check-url" ? call(.checkURL(url: input)) : call(.scamCheck(text: input, kind: kind))
+    switch r {
+    case .urlVerdict(let d), .scamReport(let d):
+        if json { print(String(data: d, encoding: .utf8) ?? "{}"); break }
+        let o = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] ?? [:]
+        print("Verdict: \(o["verdict"] ?? "?")  score \(o["score"] ?? "?")")
+        if let h = o["headline"] as? String { print("  \(h)") }
+        for sig in (o["signals"] as? [[String: Any]]) ?? [] { print("  - \(sig["title"] ?? "")  (\(sig["score"] ?? ""))") }
+    default: fail("unexpected response")
+    }
+
+case "web-lookup":
+    guard let host = args.first else { fail("usage: rampart web-lookup <host>") }
+    guard case .webLookup(let d) = call(.webLookup(host: host)) else { fail("unexpected response") }
+    if let d { print(String(data: d, encoding: .utf8) ?? "") } else { print(json ? "null" : "\(host): not on any blocklist") }
 
 case "tamper":
     guard case .tamper(let data) = call(.tamperStatus) else { fail("unexpected response") }

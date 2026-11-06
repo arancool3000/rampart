@@ -30,6 +30,9 @@ public struct SafariScriptGuard: Sendable {
         public var detail: String
         public var severity: Severity
         public var revokeCommand: String? { bundleID.map { "tccutil reset AppleEvents \($0)" } }
+        public init(source: Source, bundleID: String?, processPath: String?, detail: String, severity: Severity) {
+            self.source = source; self.bundleID = bundleID; self.processPath = processPath; self.detail = detail; self.severity = severity
+        }
     }
 
     public static let safariBundleID = "com.apple.Safari"

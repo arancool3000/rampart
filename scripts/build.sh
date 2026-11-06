@@ -7,6 +7,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
+# --quick: app bundle only (no DMG/PKG). Use for day-to-day builds; the full run is only needed for releases.
+for a in "$@"; do case "$a" in --quick) SKIP_DMG=1; SKIP_PKG=1; QUICK=1; CONFIG=debug; SCRATCH=.build-quick;; esac; done
 
 APP_NAME="Rampart"            # bundle/file name (paths stay lowercase-safe)
 DISPLAY_NAME="${DISPLAY_NAME:-$(sed -n 's/.*static let name = "\(.*\)".*/\1/p' Sources/RampartShared/Models.swift | head -1)}"
@@ -30,6 +32,12 @@ fi
 echo "==> swift build ($CONFIG, scratch $SCRATCH) v$VERSION ($BUILD)"
 PRODUCTS="rampartd rampart RampartApp"
 grep -q '"rampart-nmh"' Package.swift && PRODUCTS="$PRODUCTS rampart-nmh"
+if [ -n "${QUICK:-}" ]; then
+  # One incremental debug build of everything (seconds instead of minutes); release builds stay per-product below.
+  LOGF="$(mktemp -t rampart-build)"
+  swift build --scratch-path "$SCRATCH" >"$LOGF" 2>&1 || { grep -E "error" "$LOGF" | head -40 >&2; rm -f "$LOGF"; echo "quick build failed" >&2; exit 1; }
+  grep -E "Build complete" "$LOGF" | tail -1; rm -f "$LOGF"; PRODUCTS=""
+fi
 for p in $PRODUCTS; do
   LOGF="$(mktemp -t rampart-build)"
   if ! swift build -c "$CONFIG" --scratch-path "$SCRATCH" --product "$p" >"$LOGF" 2>&1; then
@@ -79,6 +87,7 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
 fi
 
+for f in MenuBarIconTemplate.png MenuBarIconTemplate@2x.png; do [ -f "Resources/Brand/$f" ] && cp "Resources/Brand/$f" "$APP/Contents/Resources/"; done
 echo "==> codesign (${SIGN_ID/#-/ad-hoc})"
 # Inside-out; explicit identifiers keep TCC/FDA grants stable with a stable identity.
 codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --identifier app.rampart.daemon "$APP/Contents/MacOS/rampartd"

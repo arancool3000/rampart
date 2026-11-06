@@ -237,11 +237,10 @@ struct DaemonBlocklistProvider: WebBlocklistProvider {
     func lookup(host: String) -> BlocklistHit? { bridge.isAvailable ? bridge.lookup(host: host) : nil }
 }
 
-/// Talks to rampartd over the RampartShared IPC socket.
-/// NOTE for the lead: `IPCRequest` has no web lookup case yet. This bridge uses `.status` to detect
-/// the daemon and `.networkStats` for list size; host lookups and web-verdict activity entries need
-/// two new cases (see the W1 report): `.webLookup(host:)` → `.webLookup(BlocklistHit?)` and
-/// `.webVerdict(url:verdict:score:headline:)` → `.ok`. Until they exist, `lookup` returns nil.
+/// Talks to rampartd over the RampartShared IPC socket using the web cases
+/// (`.webLookup(host:)` → `.webLookup(Data?)`, `.webVerdict(...)` → `.ok`). Short timeouts; everything
+/// degrades to nil when the daemon is down. Also exposes `checkURL`/`scamCheck` for callers that want
+/// the daemon's (list-backed) verdict instead of a local one.
 public final class IPCDaemonBridge: DaemonBridge, @unchecked Sendable {
     private let lock = NSLock()
     private var lastProbe: Date = .distantPast
@@ -258,27 +257,40 @@ public final class IPCDaemonBridge: DaemonBridge, @unchecked Sendable {
         return available
     }
 
-    public func lookup(host: String) -> BlocklistHit? { nil }   // see note above
-    public func report(url: String, verdict: ScamVerdict, score: Int, headline: String) { }
+    public func lookup(host: String) -> BlocklistHit? {
+        guard isAvailable, case .webLookup(let data)? = roundTrip(.webLookup(host: host)), let data else { return nil }
+        return try? JSONDecoder.rampart.decode(BlocklistHit.self, from: data)
+    }
+
+    public func report(url: String, verdict: ScamVerdict, score: Int, headline: String) {
+        guard isAvailable else { return }
+        _ = roundTrip(.webVerdict(url: url, verdict: verdict.rawValue, score: score, headline: headline))
+    }
+
+    public func daemonURLReport(_ url: String) -> URLReport? {
+        guard isAvailable, case .urlVerdict(let data)? = roundTrip(.checkURL(url: url), timeoutMs: 3000) else { return nil }
+        return try? JSONDecoder.rampart.decode(URLReport.self, from: data)
+    }
+
+    public func daemonScamReport(_ text: String, kind: ScamInputKind) -> ScamReport? {
+        guard isAvailable, case .scamReport(let data)? = roundTrip(.scamCheck(text: text, kind: kind.rawValue), timeoutMs: 5000) else { return nil }
+        return try? JSONDecoder.rampart.decode(ScamReport.self, from: data)
+    }
 
     private func roundTrip(_ req: IPCRequest, timeoutMs: Int32 = 800) -> IPCResponse? {
         let path = getuid() == 0 ? IPC.socketPath : (FileManager.default.fileExists(atPath: IPC.socketPath) ? IPC.socketPath : IPC.userSocketPath)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         var tv = timeval(tv_sec: Int(timeoutMs / 1000), tv_usec: Int32(timeoutMs % 1000) * 1000)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
-        let n = MemoryLayout.size(ofValue: addr.sun_path)
-        let ok = path.withCString { cs -> Bool in
-            guard strlen(cs) < n else { return false }
-            withUnsafeMutablePointer(to: &addr.sun_path) { p in
-                _ = p.withMemoryRebound(to: CChar.self, capacity: n) { strncpy($0, cs, n) }
-            }
-            return true
-        }
-        guard ok else { return nil }
+        let bytes = Array(path.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in for (i, b) in bytes.enumerated() { raw[i] = b }; raw[bytes.count] = 0 }
         let rc = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
         guard rc == 0, let data = try? IPC.encode(req), IPC.writeFrame(fd: fd, data), let resp = IPC.readFrame(fd: fd) else { return nil }
         return try? JSONDecoder.rampart.decode(IPCResponse.self, from: resp)
