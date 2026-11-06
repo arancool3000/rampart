@@ -120,6 +120,14 @@ enum DemoData {
             AppConnections(app: "ScreenRecorderPro", bundlePath: nil, sentKB: 0, receivedKB: 0, destinations: [
                 .init(host: "185.0.2.44", port: 8443, proto: "TCP", country: "—", blocked: true)]),
         ]
+        var st = RampartSettings()
+        st.exclusions = [home + "/Developer/build", home + "/Movies/Final Cut Projects"]
+        st.webProtection = true
+        m.settings = st
+        m.source = .none
+        m.webProtectionAvailable = true
+        m.recentBlocks = ["login-verify.example", "tracker-cdn.example", "185.0.2.44", "update-flash-player.example"]
+        m.blocklistDomains = 412_380
         m.wifi = WiFiInfo(ssid: "HomeNet", security: "WPA3 Personal", encrypted: true, gatewayChanged: false)
         m.blockedThisMonth = 14
         m.blockedToday = 3
@@ -134,8 +142,9 @@ enum DemoData {
         }
 
         m.allowRules = [
-            AllowRule(name: "build-tools", scope: .folder, value: home + "/Developer/build", created: ago(60 * 9), expires: nil),
-            AllowRule(name: "Homebrew", scope: .developer, value: "Homebrew (team 927JGANW46)", created: ago(60 * 24 * 12), expires: nil),
+            AllowRuleSpec(scope: .folder, value: home + "/Developer/build", name: "build", created: ago(60 * 9)),
+            AllowRuleSpec(scope: .developer, value: "927JGANW46", name: "Homebrew", created: ago(60 * 24 * 12)),
+            AllowRuleSpec(scope: .fileHash, value: "c3f1a9e0b2d4f6a8c0e2f4a6b8d0f2a4c6e8a0b2d4f6a8c0e2f4a6b8d0f2a4c6", name: "LegacyPrinterSetup.pkg", created: ago(60 * 24 * 30)),
         ]
     }
 

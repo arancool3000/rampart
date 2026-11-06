@@ -18,8 +18,37 @@ struct RampartConfig: Codable, Equatable {
     var watchPaths: [String]? = nil
     var allowlist: [String] = []        // sha256 values the user chose to trust
     var scanArchives = true
+    // v2 user-facing settings (RampartSettings is a view of these).
+    var scheduledQuickScan = true
+    var scheduledScanHour = 12
+    var notifyThreats = true
+    var notifyInfo = false
+    var learningMode = true
+    var developerMode = false
+    var ransomwareCanaries = false
+    var autoUpdate = true
+    var blockTrackers = false
 
     init() {}
+
+    var settings: RampartSettings {
+        var s = RampartSettings()
+        s.realtimeOn = realtime; s.autoQuarantine = autoQuarantine; s.scanArchives = scanArchives
+        s.scheduledQuickScan = scheduledQuickScan; s.scheduledScanHour = scheduledScanHour; s.exclusions = exclusions
+        s.notifyThreats = notifyThreats; s.notifyInfo = notifyInfo; s.learningMode = learningMode
+        s.developerMode = developerMode; s.ransomwareCanaries = ransomwareCanaries; s.autoUpdate = autoUpdate
+        s.webProtection = webProtection; s.blockTrackers = blockTrackers
+        return s
+    }
+
+    mutating func apply(_ s: RampartSettings) {
+        realtime = s.realtimeOn; autoQuarantine = s.autoQuarantine; scanArchives = s.scanArchives
+        scheduledQuickScan = s.scheduledQuickScan; scheduledScanHour = max(0, min(23, s.scheduledScanHour))
+        exclusions = s.exclusions.map { ($0 as NSString).expandingTildeInPath }.filter { $0.hasPrefix("/") }
+        notifyThreats = s.notifyThreats; notifyInfo = s.notifyInfo; learningMode = s.learningMode
+        developerMode = s.developerMode; ransomwareCanaries = s.ransomwareCanaries; autoUpdate = s.autoUpdate
+        webProtection = s.webProtection; blockTrackers = s.blockTrackers
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -39,6 +68,15 @@ struct RampartConfig: Codable, Equatable {
         watchPaths = (try? c.decodeIfPresent([String].self, forKey: .watchPaths)) ?? nil
         allowlist = (try? c.decodeIfPresent([String].self, forKey: .allowlist)) ?? []
         scanArchives = (try? c.decodeIfPresent(Bool.self, forKey: .scanArchives)) ?? d.scanArchives
+        scheduledQuickScan = (try? c.decodeIfPresent(Bool.self, forKey: .scheduledQuickScan)) ?? d.scheduledQuickScan
+        scheduledScanHour = (try? c.decodeIfPresent(Int.self, forKey: .scheduledScanHour)) ?? d.scheduledScanHour
+        notifyThreats = (try? c.decodeIfPresent(Bool.self, forKey: .notifyThreats)) ?? d.notifyThreats
+        notifyInfo = (try? c.decodeIfPresent(Bool.self, forKey: .notifyInfo)) ?? d.notifyInfo
+        learningMode = (try? c.decodeIfPresent(Bool.self, forKey: .learningMode)) ?? d.learningMode
+        developerMode = (try? c.decodeIfPresent(Bool.self, forKey: .developerMode)) ?? d.developerMode
+        ransomwareCanaries = (try? c.decodeIfPresent(Bool.self, forKey: .ransomwareCanaries)) ?? d.ransomwareCanaries
+        autoUpdate = (try? c.decodeIfPresent(Bool.self, forKey: .autoUpdate)) ?? d.autoUpdate
+        blockTrackers = (try? c.decodeIfPresent(Bool.self, forKey: .blockTrackers)) ?? d.blockTrackers
     }
 }
 
@@ -98,6 +136,13 @@ final class Runtime {
         do { try Util.writeJSON(c, to: configURL, mode: 0o644) } catch { logError("config save failed: \(error)") }
     }
 
+    /// Folder allow rules (set by Protection) — never scanned.
+    private var _allowFolders: [String] = []
+    var allowFolders: [String] {
+        get { lock.lock(); defer { lock.unlock() }; return _allowFolders }
+        set { lock.lock(); _allowFolders = newValue; lock.unlock() }
+    }
+
     var dnsPort: Int { config.dnsPort ?? ((getuid() == 0 && !userMode) ? 53 : 5353) }
 
     /// Paths scanned by a quick scan.
@@ -115,9 +160,9 @@ final class Runtime {
     /// Paths watched for on-write scanning.
     var watchPaths: [String] {
         if let p = config.watchPaths, !p.isEmpty { return p }
-        var paths = ["/Applications", "/Library/LaunchAgents", "/Library/LaunchDaemons", "/Users/Shared", "/private/tmp"]
+        var paths = ["/Applications", "/Library/LaunchAgents", "/Library/LaunchDaemons", "/Users/Shared", "/private/tmp", "/private/var/tmp"]
         for home in Util.homeDirectories() {
-            paths += ["Downloads", "Desktop", "Documents", "Library/LaunchAgents"].map { home + "/" + $0 }
+            paths += ["Downloads", "Desktop", "Documents", "Applications", "Library/LaunchAgents"].map { home + "/" + $0 }
         }
         return paths.filter { FileManager.default.fileExists(atPath: $0) }
     }
@@ -126,6 +171,6 @@ final class Runtime {
     var exclusions: [String] {
         ["/System", "/dev", "/private/var/vm", "/private/var/db/uuidtext", "/private/var/db/diagnostics",
          "/Volumes", "/cores", "/.Spotlight-V100", "/.fseventsd", "/System/Volumes",
-         quarantineDir.path, root.path] + config.exclusions
+         quarantineDir.path, root.path] + config.exclusions + allowFolders
     }
 }

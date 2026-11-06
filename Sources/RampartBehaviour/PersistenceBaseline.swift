@@ -219,6 +219,8 @@ public struct PersistenceAssessor: Sendable {
                 if trust(t) != .apple && trust(t) != .notarized {
                     out.append(PersistenceFinding(ruleID: "R17", detail: "Authorization/directory plugin \(it.label) added at \(it.location).", targetPath: t))
                 }
+            } else if r.attributes["class"] == "dock", let problem = r.attributes["dockProblem"] {
+                out.append(PersistenceFinding(ruleID: "R19", detail: "Dock tile \"\(r.attributes["label"] ?? it.label)\" opens \(it.target ?? "?"): \(problem).", targetPath: it.target))
             } else if r.attributes["class"] == "loginHook" {
                 out.append(PersistenceFinding(ruleID: "R18", detail: "\(it.label) set to \(it.target ?? "?").", targetPath: it.target))
             } else if r.attributes["class"] == "StartupItems" {

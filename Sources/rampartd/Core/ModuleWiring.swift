@@ -53,9 +53,38 @@ enum BehaviourWiring {
 
     static func persistence(runtime: Runtime) -> PersistenceService? {
         let signing: SigningProvider = { path in SigningInspector.inspectCached(path: path).info }
-        let e = BehaviourEngine(signing: signing)
+        var cfg = BehaviourConfig()
+        cfg.learningMode = runtime.config.learningMode
+        cfg.developerMode = runtime.config.developerMode
+        let e = BehaviourEngine(config: cfg, signing: signing)
         engine = e
         return BehaviourPersistence(runtime: runtime, engine: e, signing: signing)
+    }
+}
+
+/// Live behaviour-engine controls.
+final class BehaviourControlAdapter: BehaviourControl {
+    let engine: BehaviourEngine
+    init(engine: BehaviourEngine) { self.engine = engine }
+    func apply(learningMode: Bool, developerMode: Bool) {
+        engine.config.developerMode = developerMode
+        if learningMode { engine.config.learningMode = true } else { engine.endLearning() }
+    }
+    func setAllowRules(_ rules: [AllowRuleSpec]) {
+        let entries: [AllowEntry] = rules.compactMap { r in
+            switch r.scope {
+            case .developer: return AllowEntry(teamID: r.value, note: r.name)
+            case .signingID: return AllowEntry(signingID: r.value, note: r.name)
+            case .folder: return AllowEntry(pathPrefix: r.value, note: r.name)
+            case .fileHash: return nil
+            }
+        }
+        engine.config.allowlist = BehaviourConfig.defaultAllowlist + entries
+    }
+    func plantCanaries(in dirs: [String]) -> [String] {
+        let planted = engine.ransomware.plantCanaries(in: dirs)
+        engine.config.honeytokens.formUnion(planted)
+        return planted
     }
 }
 
@@ -66,6 +95,14 @@ final class BehaviourPersistence: PersistenceService {
     let signing: SigningProvider
     private let lock = NSLock()
     var snapshotURL: URL { runtime.root.appendingPathComponent("persistence-snapshot.json") }
+    private var last: [String: PersistenceRecord] = [:]
+    private var lastScan = Date.distantPast
+
+    func lookup(id: String) -> PersistenceLookup? {
+        lock.lock(); var r = last[id]; let age = Date().timeIntervalSince(lastScan); lock.unlock()
+        if r == nil && age > 5 { _ = scan(); lock.lock(); r = last[id]; lock.unlock() }
+        return r.map { PersistenceLookup(item: $0.item, attributes: $0.attributes) }
+    }
 
     init(runtime: Runtime, engine: BehaviourEngine, signing: @escaping SigningProvider) {
         self.runtime = runtime; self.engine = engine; self.signing = signing
@@ -95,6 +132,7 @@ final class BehaviourPersistence: PersistenceService {
             findings = engine.evaluatePersistence(added: records)
             logInfo("persistence baseline: \(records.count) items, \(findings.count) finding(s)")
         }
+        last = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }); lastScan = Date()
         do { try current.save(to: snapshotURL) } catch { logWarn("persistence snapshot save failed: \(error)") }
         return (records.map(\.item), findings)
     }

@@ -43,6 +43,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     func threat(_ d: Detection) {
+        guard AppModel.shared.settings.notifyThreats else { return }
         // De-duplicate repeated reports of the same detection within 10 minutes.
         if let last = recentThreatIDs[d.id], Date().timeIntervalSince(last) < 600 { return }
         recentThreatIDs[d.id] = Date()
@@ -57,7 +58,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     func scanFinished(_ r: ScanRecord) {
-        guard defaults.bool(forKey: "notif.scanFinished") else { return }
+        guard AppModel.shared.settings.notifyInfo else { return }
         let body = r.found == 0 ? "No threats found. Checked \(Fmt.count(r.scanned)) files." : "Found \(r.found) item\(r.found == 1 ? "" : "s"). They've been moved to quarantine."
         post(.scan, title: "\(r.kind.title) finished", body: body, critical: false)
     }

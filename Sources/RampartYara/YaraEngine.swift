@@ -24,6 +24,10 @@ public final class YaraEngine: FileDetector, @unchecked Sendable {
     private let xprotectRoots: [String]
     private let genericCandidates: [String]
     private let lock = NSLock()
+    /// Serialises compiles. Without it every scan worker that hits the lazy first-use path
+    /// compiled its own copy of the rules at once (10 concurrent compiles on a 10-core Mac,
+    /// each with a ~50-100 MB transient Aho-Corasick build), which was the CLI scan's RSS peak.
+    private let loadLock = NSLock()
     private var rules: YaraRules?
     private var status = Status()
     private var lastVersionCheck = Date.distantPast
@@ -75,6 +79,12 @@ public final class YaraEngine: FileDetector, @unchecked Sendable {
     /// Compiles (or recompiles) all rule sources. Safe to call concurrently with scans.
     @discardableResult
     public func load() -> Status {
+        loadLock.lock(); defer { loadLock.unlock() }
+        return loadLocked()
+    }
+
+    /// Body of `load()`; caller holds `loadLock`.
+    private func loadLocked() -> Status {
         var sources: [YaraSource] = []
         var st = Status()
         if let xp = YaraEngine.locateXProtect(xprotectRoots) {
@@ -104,13 +114,17 @@ public final class YaraEngine: FileDetector, @unchecked Sendable {
         lock.lock()
         let loaded = rules != nil
         let due = force || Date().timeIntervalSince(lastVersionCheck) > versionCheckInterval
-        let current = status.xprotectVersion
         if due { lastVersionCheck = Date() }
         lock.unlock()
-        if !loaded { load(); return true }
-        guard due else { return false }
-        let now = YaraEngine.locateXProtect(xprotectRoots)?.version
-        if now != current { load(); return true }
+        if !loaded || due {
+            // Only one thread compiles; the others wait here and then reuse its result.
+            loadLock.lock(); defer { loadLock.unlock() }
+            lock.lock(); let nowLoaded = rules != nil; let nowVersion = status.xprotectVersion; lock.unlock()
+            if !nowLoaded { loadLocked(); return true }
+            if !loaded { return false }   // another thread compiled while we waited
+            let now = YaraEngine.locateXProtect(xprotectRoots)?.version
+            if now != nowVersion { loadLocked(); return true }
+        }
         return false
     }
 

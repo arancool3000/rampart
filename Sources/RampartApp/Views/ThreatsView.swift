@@ -3,7 +3,7 @@ import AppKit
 import RampartShared
 
 struct ThreatsView: View {
-    enum Segment: String, CaseIterable, Identifiable { case detections = "Detections", quarantine = "Quarantine", allowed = "Allowed"; var id: String { rawValue } }
+    enum Segment: String, CaseIterable, Identifiable { case detections = "Detections", quarantine = "Quarantine"; var id: String { rawValue } }
     @Environment(AppModel.self) private var model
     @StateVar private var segment: Segment = .detections
     @StateVar private var selectedDetection: Detection.ID?
@@ -16,7 +16,6 @@ struct ThreatsView: View {
             switch segment {
             case .detections: detectionsTable
             case .quarantine: quarantineTable
-            case .allowed: allowedList
             }
         }
         .navigationTitle("Threats & Quarantine")
@@ -25,14 +24,18 @@ struct ThreatsView: View {
                 Picker("View", selection: $segment) {
                     ForEach(Segment.allCases) { Text($0.rawValue).tag($0) }
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 320)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 240)
+            }
+            ToolbarItem(placement: .automatic) {
+                Button { model.selection = .rules } label: { Label("Allowed Items", systemImage: "checkmark.seal") }
+                    .help("Files, developers and folders you've allowed are in Rules")
             }
             ToolbarItem(placement: .primaryAction) {
                 Button { showInspector.toggle() } label: { Label("Inspector", systemImage: "sidebar.trailing") }
                     .help("Show or hide details")
             }
         }
-        .inspector(isPresented: Binding(get: { showInspector && segment != .allowed }, set: { showInspector = $0 })) {
+        .inspector(isPresented: $showInspector) {
             Group {
                 if segment == .detections, let id = selectedDetection, let d = model.detections.first(where: { $0.id == id }) {
                     DetectionInspector(detection: d, record: record(for: d))
@@ -62,7 +65,10 @@ struct ThreatsView: View {
 
     @ViewBuilder private var detectionsTable: some View {
         if model.detections.isEmpty {
-            EmptyStateView(symbol: "checkmark.shield", title: "No threats found", detail: "When Rampart finds something, it will appear here with an explanation.")
+            EmptyStateView(symbol: "checkmark.shield", title: "No threats found",
+                           detail: model.mode == .live
+                               ? "Rampart checks new and changed files as they arrive. If it ever finds something, it will appear here with a plain explanation of why."
+                               : "When Rampart finds something, it will appear here with an explanation.")
         } else {
             Table(sortedDetections, selection: $selectedDetection, sortOrder: $sortOrder) {
                 TableColumn("Item", value: \.name) { d in
@@ -131,30 +137,6 @@ struct ThreatsView: View {
                 }
                 .font(.callout).padding(Spacing.m)
             }
-        }
-    }
-
-    @ViewBuilder private var allowedList: some View {
-        @Bindable var model = model
-        if model.allowRules.isEmpty {
-            EmptyStateView(symbol: "checkmark.seal", title: "Nothing allowed yet", detail: "Files, developers or folders you allow will be listed here. Rampart won't flag them.")
-        } else {
-            Table(model.allowRules) {
-                TableColumn("Allowed") { r in
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(r.name)
-                        Text(r.value).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                    }
-                }
-                TableColumn("Scope") { r in Badge(text: r.scope.rawValue, tint: .rampartTeal) }.width(min: 110, ideal: 130)
-                TableColumn("Created") { r in Text(Fmt.dayTime(r.created)).foregroundStyle(.secondary) }.width(min: 110, ideal: 130)
-                TableColumn("Expires") { r in Text(r.expires.map { $0.formatted(date: .abbreviated, time: .omitted) } ?? "Never").foregroundStyle(.secondary) }.width(80)
-                TableColumn("") { r in
-                    Button("Remove") { model.allowRules.removeAll { $0.id == r.id } }.controlSize(.small)
-                }
-                .width(80)
-            }
-            .scrollContentBackground(.hidden)
         }
     }
 
@@ -409,17 +391,17 @@ struct AllowSheet: View {
     let detection: Detection
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-    @StateVar private var scope: AllowRule.Scope = .file
+    @StateVar private var scope: AllowRuleSpec.Scope = .fileHash
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
             Text("Allow \"\(detection.path.map { ($0 as NSString).lastPathComponent } ?? detection.name)\"?").font(.title2.weight(.semibold))
-            Text("Rampart won't flag it again. You can remove this rule anytime from Threats › Allowed.")
+            Text("Rampart won't flag it again. You can remove this rule anytime in Rules.")
                 .foregroundStyle(.secondary)
             Picker("", selection: $scope) {
-                Text("This file only (by fingerprint)").tag(AllowRule.Scope.file)
-                Text("This developer").tag(AllowRule.Scope.developer)
-                Text("This folder").tag(AllowRule.Scope.folder)
+                Text("This file only (by fingerprint)").tag(AllowRuleSpec.Scope.fileHash)
+                Text("This developer").tag(AllowRuleSpec.Scope.developer)
+                Text("This folder").tag(AllowRuleSpec.Scope.folder)
             }
             .pickerStyle(.radioGroup).labelsHidden()
             HStack {

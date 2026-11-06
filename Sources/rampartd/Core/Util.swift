@@ -21,6 +21,16 @@ enum Eicar {
 }
 
 enum Util {
+    /// Resident memory of this process in MB (task_info).
+    static var residentMB: Double {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count) }
+        }
+        return kr == KERN_SUCCESS ? Double(info.resident_size) / 1_048_576 : 0
+    }
+
     static func sha256(path: String, limit: UInt64 = .max) -> String? {
         guard let h = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? h.close() }
@@ -110,6 +120,9 @@ final class DLog {
     private var fileHandle: FileHandle?
     private let lock = NSLock()
     private let oslog = RLog.logger("daemon")
+    private var problems: [String] = []
+    /// Last warnings/errors (newest last), for the health report.
+    var recentProblems: [String] { lock.lock(); defer { lock.unlock() }; return problems }
 
     func openFile(_ url: URL) {
         Util.ensureDir(url.deletingLastPathComponent(), mode: 0o755)
@@ -135,6 +148,9 @@ final class DLog {
         default: oslog.info("\(msg, privacy: .public)")
         }
         lock.lock(); defer { lock.unlock() }
+        if level == "warn" || level == "error" {
+            problems.append(line.trimmingCharacters(in: .newlines)); if problems.count > 20 { problems.removeFirst() }
+        }
         if let fh = fileHandle { fh.write(Data(line.utf8)) }
         if verbose || level == "error" { FileHandle.standardError.write(Data(line.utf8)) }
     }

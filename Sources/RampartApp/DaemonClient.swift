@@ -22,7 +22,14 @@ final class DaemonClient: @unchecked Sendable {
     private(set) var connectedPath: String?
     private let queue = DispatchQueue(label: "app.rampart.ipc", qos: .userInitiated, attributes: .concurrent)
 
-    init(paths: [String] = [IPC.socketPath, IPC.userSocketPath]) { candidatePaths = paths }
+    init(paths: [String]? = nil) {
+        if let p = paths { candidatePaths = p }
+        else if let i = CommandLine.arguments.firstIndex(of: "--socket"), i + 1 < CommandLine.arguments.count {
+            candidatePaths = [CommandLine.arguments[i + 1]]
+        } else {
+            candidatePaths = [IPC.socketPath, IPC.userSocketPath]
+        }
+    }
 
     /// Opens a connected socket to the first path that accepts, or nil.
     private func openSocket(timeout: TimeInterval?) -> Int32? {

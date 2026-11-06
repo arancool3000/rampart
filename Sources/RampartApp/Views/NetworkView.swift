@@ -1,13 +1,14 @@
 import SwiftUI
 import AppKit
 import CryptoKit
+import Charts
+import RampartShared
 
 struct NetworkView: View {
     @Environment(AppModel.self) private var model
     @StateVar private var onlyBlocked = false
     @StateVar private var filter = ""
-    @AppStorage("network.blockTrackers") private var blockTrackers = false
-    @AppStorage("network.firewallMode") private var firewallMode = "silent"
+    @StateVar private var showInstall = false
 
     private var filteredConnections: [AppConnections] {
         model.connections.compactMap { c in
@@ -28,6 +29,14 @@ struct NetworkView: View {
             .contentColumn()
         }
         .navigationTitle("Network")
+        .sheet(isPresented: $showInstall) { InstallFullProtectionSheet() }
+        .task {
+            // Connections change quickly: refresh every 10 s while this screen is open.
+            while !Task.isCancelled && model.mode == .live {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                await model.refreshConnections()
+            }
+        }
     }
 
     @ViewBuilder private var wifiCard: some View {
@@ -36,20 +45,20 @@ struct NetworkView: View {
                 IconBadge(symbol: w.encrypted && !w.gatewayChanged ? "wifi" : "wifi.exclamationmark",
                           tint: w.encrypted && !w.gatewayChanged ? .statusProtected : .statusAttention, size: 44)
                 VStack(alignment: .leading, spacing: 2) {
-                    (Text("Connected to ") + Text(w.ssid).bold() + Text(" · \(w.security)"))
+                    (Text("Connected to ") + Text(w.ssid ?? "your Wi-Fi network").bold() + Text(" · \(w.security)"))
                     if !w.encrypted {
                         Text("This network doesn't use encryption. Avoid entering passwords until you're on a trusted network.").foregroundStyle(.secondary)
                     } else if w.gatewayChanged {
                         Text("The router's hardware address changed. If you didn't replace your router, use a trusted network.").foregroundStyle(.secondary)
                     } else {
-                        Text("No issues found").foregroundStyle(.secondary)
+                        Text(w.note ?? "No issues found").foregroundStyle(.secondary)
                     }
                 }
             } else {
                 Image(systemName: "wifi").font(.title).foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Wi-Fi checks")
-                    Text("Wi-Fi details will appear when the background service reports them.").foregroundStyle(.secondary)
+                    Text(model.mode == .live ? "Not connected to Wi-Fi, or Wi-Fi details aren't available right now." : "Wi-Fi details will appear when the background service reports them.").foregroundStyle(.secondary)
                 }
             }
             Spacer()
@@ -66,13 +75,19 @@ struct NetworkView: View {
                     IconBadge(symbol: "globe", tint: model.status.webProtectionOn ? .rampartTeal : .gray, size: 34)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Block known malicious and phishing sites").font(.body.weight(.medium))
-                        Text("Checks every website and app connection against threat lists. Your browsing isn't recorded.")
+                        Text(model.webProtectionAvailable
+                             ? "Checks every website and app connection against threat lists\(model.blocklistDomains > 0 ? " (\(Fmt.count(model.blocklistDomains)) known-bad domains)" : ""). Your browsing isn't recorded."
+                             : "Needs the full system service, because it changes how your Mac looks up websites.")
                             .font(.callout).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Toggle("Web protection", isOn: Binding(get: { model.status.webProtectionOn },
-                                                           set: { v in Task { await model.setWebProtection(v) } }))
-                        .toggleStyle(.switch).labelsHidden()
+                    if model.webProtectionAvailable {
+                        Toggle("Web protection", isOn: Binding(get: { model.status.webProtectionOn },
+                                                               set: { v in model.updateSettings { $0.webProtection = v }; Task { await model.setWebProtection(v) } }))
+                            .toggleStyle(.switch).labelsHidden()
+                    } else {
+                        Button("Install Full Protection…") { showInstall = true }
+                    }
                 }
                 Divider()
                 HStack(spacing: Spacing.m) {
@@ -82,22 +97,37 @@ struct NetworkView: View {
                         Text("Privacy, not security. Some sites may not work as expected.").font(.callout).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Toggle("Block trackers", isOn: $blockTrackers).toggleStyle(.switch).labelsHidden()
+                    Toggle("Block trackers", isOn: model.setting(\.blockTrackers)).toggleStyle(.switch).labelsHidden()
+                        .disabled(!model.webProtectionAvailable)
                 }
                 Divider()
                 HStack(alignment: .bottom, spacing: Spacing.xxl) {
                     Stat(value: model.blockedThisMonth, label: "dangerous sites blocked this month")
                     Stat(value: model.blockedToday, label: "blocked today")
-                    if model.blockedLast7.contains(where: { $0 > 0 }) {
-                        MiniBars(values: model.blockedLast7, tint: .rampartTeal).frame(width: 120, height: 40)
-                    }
                     Spacer()
-                    Picker("Firewall mode", selection: $firewallMode) {
-                        Text("Silent (recommended)").tag("silent")
-                        Text("Ask me for new apps").tag("ask")
-                        Text("Block all new apps").tag("block")
+                }
+                if model.daily.contains(where: { $0.sitesBlocked > 0 }) {
+                    Chart(model.daily) { d in
+                        BarMark(x: .value("Day", d.day, unit: .day), y: .value("Blocked", d.sitesBlocked))
+                            .foregroundStyle(LinearGradient(colors: [Color.rampartTeal, Color.rampartTeal.opacity(0.5)], startPoint: .top, endPoint: .bottom))
+                            .cornerRadius(3)
                     }
-                    .fixedSize()
+                    .chartXAxis { AxisMarks(values: .stride(by: .day, count: 2)) { _ in AxisValueLabel(format: .dateTime.weekday(.abbreviated)) } }
+                    .chartYAxis { AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) }
+                    .frame(height: 110)
+                    .accessibilityLabel("Sites blocked per day over the last 14 days")
+                }
+                if !model.recentBlocks.isEmpty {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Recently blocked").font(.callout.weight(.medium)).foregroundStyle(.secondary)
+                        ForEach(model.recentBlocks.prefix(6), id: \.self) { host in
+                            HStack(spacing: Spacing.s) {
+                                Image(systemName: "hand.raised.fill").foregroundStyle(.orange).font(.caption)
+                                Text(host).font(.callout.monospaced()).textSelection(.enabled)
+                            }
+                        }
+                    }
                 }
             }
             .card()
@@ -108,11 +138,13 @@ struct NetworkView: View {
         VStack(alignment: .leading, spacing: Spacing.m) {
             SectionHeader("Connections", trailing: AnyView(HStack {
                 TextField("Filter", text: $filter).textFieldStyle(.roundedBorder).frame(width: 160)
-                Toggle("Only show blocked", isOn: $onlyBlocked).toggleStyle(.checkbox)
+                Toggle("Only show flagged", isOn: $onlyBlocked).toggleStyle(.checkbox)
             }))
             VStack(spacing: 0) {
                 if filteredConnections.isEmpty {
-                    Text(model.connections.isEmpty ? "Connection details will appear when the background service reports them." : "No matching connections.")
+                    Text(model.connections.isEmpty
+                         ? (model.mode == .live ? "No open connections right now." : "Connection details will appear when the background service reports them.")
+                         : "No matching connections.")
                         .foregroundStyle(.secondary).padding(Spacing.m).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 ForEach(Array(filteredConnections.enumerated()), id: \.element.id) { i, c in
@@ -150,8 +182,8 @@ struct ConnectionGroup: View {
                         Text(d.host).font(.callout.monospaced()).textSelection(.enabled)
                         Spacer()
                         Text("\(d.proto) \(d.port)").font(.callout).foregroundStyle(.secondary).monospacedDigit()
-                        Text(d.country).font(.callout).foregroundStyle(.secondary).frame(width: 30)
-                        Text(d.blocked ? "Blocked" : "Allowed").font(.callout).frame(width: 60, alignment: .trailing)
+                        if !d.country.isEmpty { Text(d.country).font(.callout).foregroundStyle(.secondary).frame(width: 30) }
+                        Text(d.statusLabel).font(.callout).frame(width: 90, alignment: .trailing)
                     }
                     .padding(.leading, 36)
                     .accessibilityElement(children: .combine)
@@ -169,12 +201,15 @@ struct ConnectionGroup: View {
                 }
                 .frame(width: 24, height: 24)
                 Text(conn.app).font(.body.weight(.medium))
+                if let sig = conn.signing { SigningBadge(status: sig) }
                 Text("\(conn.destinations.count) connection\(conn.destinations.count == 1 ? "" : "s")").foregroundStyle(.secondary)
                 Spacer()
-                Text("↑ \(Fmt.bytes(UInt64(conn.sentKB) * 1024))  ↓ \(Fmt.bytes(UInt64(conn.receivedKB) * 1024))")
-                    .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                if conn.sentKB + conn.receivedKB > 0 {
+                    Text("↑ \(Fmt.bytes(UInt64(conn.sentKB) * 1024))  ↓ \(Fmt.bytes(UInt64(conn.receivedKB) * 1024))")
+                        .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                }
                 if conn.blockedCount > 0 {
-                    Label("\(conn.blockedCount) blocked", systemImage: "hand.raised.fill").font(.callout)
+                    Label("\(conn.blockedCount) \(conn.destinations.first(where: \.blocked)?.flaggedOnly == true ? "flagged" : "blocked")", systemImage: "hand.raised.fill").font(.callout)
                         .labelStyle(.titleAndIcon).foregroundStyle(.primary)
                 }
             }
@@ -245,6 +280,23 @@ struct BreachCheckCard: View {
             } catch {
                 result = .error("Couldn't reach the breach database. Check your connection and try again.")
             }
+        }
+    }
+}
+
+/// Code-signing badge used for connections and startup items.
+struct SigningBadge: View {
+    let status: SigningInfo.Status
+    var notarized: Bool? = nil
+    var body: some View {
+        switch status {
+        case .apple: Badge(text: "Apple", tint: .green)
+        case .appStore: Badge(text: "App Store", tint: .green)
+        case .developerID: Badge(text: notarized == false ? "Signed" : "Notarized", tint: .green)
+        case .adHoc: Badge(text: "Ad-hoc signed", tint: .yellow)
+        case .unsigned: Badge(text: "Not signed", tint: .yellow)
+        case .invalid, .revoked: Badge(text: "Invalid signature", tint: .red)
+        case .unknown: Badge(text: "Unknown signer")
         }
     }
 }

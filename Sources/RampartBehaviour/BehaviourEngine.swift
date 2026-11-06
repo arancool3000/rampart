@@ -19,6 +19,10 @@ public struct BehaviourConfig: Sendable {
     public var knownTeamIDs: Set<String> = []
     /// Apply the first-seen ×1.2 multiplier once the engine has watched this long.
     public var firstSeenWarmup: TimeInterval = 3600
+    /// How long a risky browser clipboard copy stays armed for R31 token matching.
+    public var clipboardWindow: TimeInterval = 120
+    /// Salt for clipboard token hashes; must match the producer (default: per-boot salt).
+    public var clipboardSalt: String = ClipboardFingerprint.bootSalt
     public var beaconMinSamples = 6
     public var beaconMinSpan: TimeInterval = 1800
     public var beaconMaxCV = 0.1
@@ -73,6 +77,7 @@ public final class BehaviourEngine: @unchecked Sendable {
     private var beacons: [String: [Date]] = [:]
     private var beaconFired: Set<String> = []
     private var rcCache: [String: Set<String>] = [:]
+    private var clipboards: [(date: Date, tokens: Set<String>, source: String)] = []
     private var learned: Set<String> = []
     private var startDate: Date?
     private let lock = NSRecursiveLock()
@@ -96,6 +101,7 @@ public final class BehaviourEngine: @unchecked Sendable {
         if ProcessTracker.isExit(e) { return [] }
         let ctx = Context(engine: self, event: e, node: node)
         var hits: [PendingHit] = []
+        recordClipboard(e)
 
         for rule in matchRules {
             for m in rule.matchers ?? [] where matches(m, rule: rule, ctx) {
@@ -180,6 +186,28 @@ public final class BehaviourEngine: @unchecked Sendable {
         return "p:" + (all.last ?? node).key.description
     }
 
+    // MARK: clipboard
+
+    func recordClipboard(_ e: SecurityEvent) {
+        guard e.kind == .other, e.detail["type"] == "clipboard", e.detail["class"] == "risky",
+              let tok = e.detail["clip_tokens"], !tok.isEmpty else { return }
+        let src = e.detail["source_app"] ?? ""
+        guard anyRegex(["@browserRegex"], src) else { return }
+        clipboards = clipboards.filter { e.date.timeIntervalSince($0.date) <= config.clipboardWindow }
+        clipboards.append((e.date, ClipboardFingerprint.parse(tok), src))
+    }
+
+    /// Best overlap between the current command and an armed clipboard copy.
+    func clipboardMatch(_ ctx: Context, min: Double) -> (Double, Int, String)? {
+        let now = ctx.event.date
+        var best: (Double, Int, String)?
+        for c in clipboards where now.timeIntervalSince(c.date) <= config.clipboardWindow && now >= c.date {
+            let o = ClipboardFingerprint.overlap(command: ctx.argv, clip: c.tokens, salt: config.clipboardSalt)
+            if o.fraction >= min && o.shared >= 2 && o.distinctive >= 1 && o.fraction > (best?.0 ?? -1) { best = (o.fraction, o.shared, c.source) }
+        }
+        return best
+    }
+
     // MARK: matching
 
     func nameIn(_ name: String, _ patterns: [String]) -> Bool {
@@ -257,6 +285,15 @@ public final class BehaviourEngine: @unchecked Sendable {
         }
         if m.lineageUntrusted == true && !lineageUntrusted(ctx) { return false }
         if let r = m.requireMark, !markSatisfied(r, ctx) { return false }
+        if m.quarantined == true {
+            guard let ip = ctx.imagePath else { return false }
+            let q = e.detail["quarantined"] == "1" || getxattr(ip, "com.apple.quarantine", nil, 0, 0, 0) >= 0
+            if !q { return false }
+        }
+        if let min = m.storyMinScore {
+            guard let st = stories[ctx.storyKey], score(st, now: e.date).0 >= min else { return false }
+        }
+        if let f = m.clipboardOverlap, clipboardMatch(ctx, min: f) == nil { return false }
         if m.firstSeen == true {
             let k = rule.id + "|" + (ctx.imagePath ?? "")
             if firstSeenKeys.contains(k) { return false }
@@ -333,6 +370,11 @@ public final class BehaviourEngine: @unchecked Sendable {
         if let r = m.requireMark { f.append("follows earlier '\(r.name)' activity") }
         if let t = m.threshold { f.append("\(t.count)+ distinct events within \(Int(t.window)) s") }
         if let s = m.sibling, !s.isEmpty { f.append("piped from a sibling downloader") }
+        if let o = m.clipboardOverlap, let c = clipboardMatch(ctx, min: o) {
+            f.append("\(Int((c.0 * 100).rounded()))% of the command's tokens (\(c.1)) match a risky command copied from \(c.2)")
+        }
+        if m.quarantined == true { f.append("binary still carries the download quarantine flag") }
+        if let s = m.storyMinScore { f.append("story already scored \(s)+ from other rules") }
         return f.joined(separator: "; ")
     }
 

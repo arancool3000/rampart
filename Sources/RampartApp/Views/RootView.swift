@@ -53,6 +53,7 @@ struct RootView: View {
         case .activity: ActivityView()
         case .network: NetworkView()
         case .posture: PostureView()
+        case .rules: RulesView()
         case .settings: SettingsView(standalone: false)
         }
     }

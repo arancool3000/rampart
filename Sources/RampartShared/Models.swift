@@ -3,7 +3,8 @@ import Foundation
 // Shared contract for every Rampart module. Owned by the lead; change only by coordinating.
 
 public enum Product {
-    public static let name = "Rampart"
+    /// Display name. Change only here (and Info.plist via scripts/build.sh) if the product is renamed.
+    public static let name = "RamPart"
     public static let bundlePrefix = "app.rampart"
     public static let daemonLabel = "app.rampart.daemon"
     public static let agentLabel = "app.rampart.agent"
@@ -248,6 +249,22 @@ public enum IPCRequest: Codable, Sendable {
     case setWebProtection(on: Bool)
     case updateSignatures
     case subscribeEvents
+    // v2 (added for the app to show real data instead of demo data)
+    case activity(limit: Int)
+    case connections
+    case wifi
+    case networkStats
+    case getSettings
+    case setSettings(RampartSettings)
+    case pauseScan(paused: Bool)
+    case cancelScan
+    case setRealtime(on: Bool)
+    case previewRemediation(persistenceID: String)
+    case remediate(persistenceID: String)
+    case listAllowRules
+    case addAllowRule(AllowRuleSpec)
+    case removeAllowRule(id: UUID)
+    case health
 }
 
 public enum IPCResponse: Codable, Sendable {
@@ -261,4 +278,13 @@ public enum IPCResponse: Codable, Sendable {
     case scanProgress(scanned: Int, total: Int, current: String)
     case scanFinished(scanned: Int, detections: [Detection], seconds: Double)
     case event(Detection)
+    // v2
+    case activity([ActivityEntry])
+    case connections([ConnectionInfo])
+    case wifi(WiFiStatus)
+    case networkStats(NetworkStats)
+    case settings(RampartSettings)
+    case remediationPreview(RemediationPreview)
+    case allowRules([AllowRuleSpec])
+    case health(HealthReport)
 }

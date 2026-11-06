@@ -43,7 +43,35 @@ protocol PostureService: AnyObject {
     func fix(checkID: String, dryRun: Bool) throws -> String
 }
 
+/// A persistence item plus the scanner's raw attributes (browser, extensionID, cron line, ...).
+struct PersistenceLookup {
+    var item: PersistenceItem
+    var attributes: [String: String]
+}
+
+protocol NetworkInfoService: AnyObject {
+    func connections() -> [ConnectionInfo]
+    func wifi() -> WiFiStatus
+    func stats(available: Bool) -> NetworkStats
+}
+
+protocol PersistenceRemediationService: AnyObject {
+    func preview(_ r: PersistenceLookup) throws -> RemediationPreview
+    /// Applies the cleanup (journaled, undoable where possible). Returns a summary.
+    func remediate(_ r: PersistenceLookup) throws -> String
+}
+
+/// Live controls of the behaviour engine (settings + allow rules + ransomware canaries).
+protocol BehaviourControl: AnyObject {
+    func apply(learningMode: Bool, developerMode: Bool)
+    func setAllowRules(_ rules: [AllowRuleSpec])
+    /// Plants canary files in `dirs`; returns the paths planted.
+    func plantCanaries(in dirs: [String]) -> [String]
+}
+
 protocol PersistenceService: AnyObject {
+    /// Last-scanned item with this id (scans again if unknown).
+    func lookup(id: String) -> PersistenceLookup?
     /// Enumerates persistence and returns risky findings for items that are new or changed since the
     /// previous scan (on the very first scan: for everything).
     func scan() -> (items: [PersistenceItem], findings: [Detection])
@@ -88,6 +116,13 @@ final class Services {
     var updater: UpdateService?
     var realtime: RealtimeService?
     var web: WebProtectionService?
+    var network: NetworkInfoService?
+    /// Set by Protection: (domain, list) for every DNS block (rate-limited by the network adapter).
+    var onWebBlock: ((String, String?) -> Void)?
+    var persistenceRemediation: PersistenceRemediationService?
+    var behaviour: BehaviourControl?
+    /// Signing summary for a file (cached), used by developer/signing-ID allow rules.
+    var signingLookup: ((String) -> SigningInfo?)?
     /// Called with a lowercase SHA-256 when the user trusts a file (engine allowlist, etc.).
     var allowHooks: [(String) -> Void] = []
     /// Called after the daemon finishes wiring, e.g. to load rules in the background.

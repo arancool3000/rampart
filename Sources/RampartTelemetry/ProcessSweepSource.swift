@@ -256,6 +256,10 @@ public final class ProcessSweepSource: EventSource {
         var detail: [String: String] = ["start": "\(info.startSec).\(String(format: "%06llu", info.startUsec))"]
         if let id { detail["signing"] = id.tier }
         if replaced { detail["exec_replace"] = "1" }
+        if let rp = ProcInspector.responsiblePid(info.pid) {
+            detail["responsible_pid"] = String(rp)
+            if let rpath = ProcInspector.path(rp) { detail["responsible_path"] = rpath }
+        }
         if argv == nil { detail["argv"] = "unavailable" }
         let date = Date(timeIntervalSince1970: Double(info.startSec) + Double(info.startUsec) / 1e6)
         emitted += 1

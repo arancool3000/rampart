@@ -74,6 +74,11 @@ struct DaemonState: Codable {
     var signatureVersion: String?
     /// Files the user restored from quarantine (path -> sha256); not re-remediated while unchanged.
     var restored: [String: String]?
+    /// Ransomware canary files we planted (removed when the setting is turned off).
+    var canaries: [String]?
+    /// DNS blocks per day (yyyy-MM-dd) and the most recent blocked domains.
+    var dnsBlocksByDay: [String: Int]?
+    var recentBlocks: [String]?
 }
 
 final class StateStore {

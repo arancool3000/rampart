@@ -36,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationWillTerminate(_ notification: Notification) { DaemonLauncher.shared.appWillTerminate() }
 
     /// Dropping files or folders on the Dock icon starts a Custom Scan.
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -99,7 +100,8 @@ struct RampartCommands: Commands {
             Button("Protection Activity") { AppModel.shared.selection = .activity }.keyboardShortcut("4", modifiers: .command)
             Button("Network") { AppModel.shared.selection = .network }.keyboardShortcut("5", modifiers: .command)
             Button("Privacy & Posture") { AppModel.shared.selection = .posture }.keyboardShortcut("6", modifiers: .command)
-            Button("Settings") { AppModel.shared.selection = .settings }.keyboardShortcut("7", modifiers: .command)
+            Button("Rules") { AppModel.shared.selection = .rules }.keyboardShortcut("7", modifiers: .command)
+            Button("Settings") { AppModel.shared.selection = .settings }.keyboardShortcut("8", modifiers: .command)
         }
         CommandMenu("Scan") {
             Button("Quick Scan") { AppModel.shared.selection = .scan; AppModel.shared.startScan(.quick) }

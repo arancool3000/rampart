@@ -19,7 +19,8 @@ final class Router {
 
     static func isPrivileged(_ r: IPCRequest) -> Bool {
         switch r {
-        case .quarantine, .restore, .deleteQuarantined, .allow, .fixPosture, .setWebProtection, .updateSignatures: return true
+        case .quarantine, .restore, .deleteQuarantined, .allow, .fixPosture, .setWebProtection, .updateSignatures,
+             .setSettings, .setRealtime, .remediate, .addAllowRule, .removeAllowRule: return true
         default: return false
         }
     }
@@ -31,6 +32,12 @@ final class Router {
         case .deleteQuarantined: return "deleteQuarantined"; case .allow: return "allow"; case .posture: return "posture"
         case .fixPosture: return "fixPosture"; case .persistence: return "persistence"; case .setWebProtection: return "setWebProtection"
         case .updateSignatures: return "updateSignatures"; case .subscribeEvents: return "subscribeEvents"
+        case .activity: return "activity"; case .connections: return "connections"; case .wifi: return "wifi"
+        case .networkStats: return "networkStats"; case .getSettings: return "getSettings"; case .setSettings: return "setSettings"
+        case .pauseScan: return "pauseScan"; case .cancelScan: return "cancelScan"; case .setRealtime: return "setRealtime"
+        case .previewRemediation: return "previewRemediation"; case .remediate: return "remediate"
+        case .listAllowRules: return "listAllowRules"; case .addAllowRule: return "addAllowRule"
+        case .removeAllowRule: return "removeAllowRule"; case .health: return "health"
         }
     }
 
@@ -98,19 +105,70 @@ final class Router {
                 _ = send(.posture(try p.posture()))
             case .fixPosture(let id):
                 guard let ps = p.services.posture else { throw ServiceError.unavailable("posture fixer") }
-                let msg = try ps.fix(checkID: id, dryRun: p.runtime.userMode || getuid() != 0)
-                logInfo("posture fix \(id): \(msg)")
+                do {
+                    let msg = try ps.fix(checkID: id, dryRun: p.runtime.userMode || getuid() != 0)
+                    logInfo("posture fix \(id): \(msg)")
+                    p.activity.add(.posture, "Fixed \(id)", detail: msg, outcome: "fixed")
+                    _ = try? p.posture()
+                } catch {
+                    p.activity.add(.posture, "Could not fix \(id)", detail: error.localizedDescription, outcome: "failed", severity: .low)
+                    throw error
+                }
                 _ = send(.ok)
             case .persistence:
                 _ = send(.persistence(try p.persistence()))
             case .setWebProtection(let on):
                 guard let w = p.services.web else { throw ServiceError.unavailable("web protection") }
+                if on && p.runtime.userMode {
+                    throw ServiceError.failed("web protection needs the Rampart system service (it changes DNS settings); not available in user mode")
+                }
                 try w.setOn(on)
                 p.runtime.updateConfig { $0.webProtection = on }
+                p.activity.add(.settings, "Web protection \(on ? "on" : "off")", outcome: on ? "on" : "off")
                 _ = send(.ok)
             case .updateSignatures:
                 _ = p.updateSignatures()
                 _ = send(.ok)
+            case .activity(let limit):
+                _ = send(.activity(p.activity.list(limit: limit)))
+            case .connections:
+                guard let n = p.services.network else { throw ServiceError.unavailable("connection monitor") }
+                _ = send(.connections(n.connections()))
+            case .wifi:
+                guard let n = p.services.network else { throw ServiceError.unavailable("Wi-Fi guard") }
+                _ = send(.wifi(n.wifi()))
+            case .networkStats:
+                guard let n = p.services.network else { throw ServiceError.unavailable("network stats") }
+                _ = send(.networkStats(n.stats(available: !p.runtime.userMode && getuid() == 0)))
+            case .getSettings:
+                _ = send(.settings(p.settings()))
+            case .setSettings(let s):
+                _ = send(.settings(p.setSettings(s)))
+            case .pauseScan(let paused):
+                if p.scanControl.setPaused(paused) == 0 { throw ServiceError.failed("no scan is running") }
+                p.activity.add(.scan, paused ? "Scan paused" : "Scan resumed")
+                _ = send(.ok)
+            case .cancelScan:
+                if p.scanControl.cancelAll() == 0 { throw ServiceError.failed("no scan is running") }
+                _ = send(.ok)
+            case .setRealtime(let on):
+                p.setRealtime(on)
+                _ = send(.ok)
+            case .previewRemediation(let id):
+                _ = send(.remediationPreview(try p.previewRemediation(id)))
+            case .remediate(let id):
+                _ = try p.remediatePersistence(id)
+                _ = send(.ok)
+            case .listAllowRules:
+                _ = send(.allowRules(p.allowRules.all()))
+            case .addAllowRule(let r):
+                _ = try p.addAllowRule(r)
+                _ = send(.allowRules(p.allowRules.all()))
+            case .removeAllowRule(let id):
+                try p.removeAllowRule(id)
+                _ = send(.allowRules(p.allowRules.all()))
+            case .health:
+                _ = send(.health(p.health()))
             case .subscribeEvents:
                 let token = p.subscribe(send)
                 _ = send(.ok)

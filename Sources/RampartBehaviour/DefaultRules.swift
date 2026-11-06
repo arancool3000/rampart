@@ -116,6 +116,8 @@ enum DefaultRules {
      "matchers": [
        {"kinds": ["exec"], "process": ["defaults"], "args": ["write", "com\\.apple\\.loginwindow", "(LoginHook|LogoutHook)"]}
      ]},
+    {"id": "R19", "name": "Dock tile hijack", "type": "strong", "category": "malware", "score": 75, "stage": "persistence", "subject": "target", "builtin": true,
+     "why": "A Dock icon opens an app outside /Applications, ~/Applications and /System, or an app whose bundle ID differs from the one the tile claims: a look-alike launcher."},
     {"id": "R20", "name": "Browser extension sideloaded or force-installed", "type": "strong", "category": "adware", "score": 70, "stage": "persistence", "subject": "lineage", "builtin": true,
      "why": "A browser extension was installed outside the web store, or a force-install policy was written outside MDM.",
      "matchers": [
@@ -169,7 +171,9 @@ enum DefaultRules {
     {"id": "R29", "name": "Untrusted code run from a temp or hidden folder", "type": "weak", "category": "suspicious", "score": 40, "stage": "execution", "subject": "actor", "devSensitive": true,
      "why": "An unsigned or ad-hoc signed program started from /tmp, a per-user temp folder, /Users/Shared or a hidden folder.",
      "matchers": [
-       {"kinds": ["exec"], "pathClass": ["temp", "hidden", "usersShared"], "trust": "untrusted", "pathNot": ["/Sparkle/", "Autoupdate", "/\\.Sparkle", "/go-build[0-9]+/", "/TemporaryItems/NSIRD_"]}
+       {"kinds": ["exec"], "pathClass": ["temp", "hidden", "usersShared"], "trust": "untrusted", "pathNot": ["/Sparkle/", "Autoupdate", "/\\.Sparkle", "/go-build[0-9]+/", "/TemporaryItems/NSIRD_"]},
+       {"kinds": ["exec"], "pathClass": ["developer"], "trust": "untrusted", "quarantined": true},
+       {"kinds": ["exec"], "pathClass": ["developer"], "trust": "untrusted", "storyMinScore": 60}
      ]},
     {"id": "R30", "name": "Remote content piped into an interpreter", "type": "weak", "category": "suspicious", "score": 40, "stage": "execution", "subject": "lineage", "devSensitive": true,
      "why": "A downloader's output was piped straight into a shell or script interpreter.",
@@ -180,11 +184,12 @@ enum DefaultRules {
     {"id": "M01", "name": "Risky clipboard copied from a browser", "type": "marker", "category": "suspicious", "score": 0,
      "why": "Session agent classified a clipboard copy from a browser as a risky command.",
      "matchers": [
-       {"kinds": ["other"], "detail": {"type": "^clipboard$", "class": "^risky$", "source_app": "(?i)(chrome|safari|firefox|brave|edge|arc|opera|vivaldi|chromium|orion|webkit)"}, "setMark": {"name": "riskyClipboard", "from": "global", "window": 120}}
+       {"kinds": ["other"], "detail": {"type": "^clipboard$", "class": "^risky$", "source_app": "(?i)(chrome|safari|firefox|brave|edge|arc|opera|vivaldi|chromium|orion|webkit)"}, "detailNot": {"clip_tokens": ".+"}, "setMark": {"name": "riskyClipboard", "from": "global", "window": 120}}
      ]},
     {"id": "R31", "name": "ClickFix: browser copy pasted into Terminal", "type": "sequence", "category": "malware", "score": 70, "stage": "entry", "subject": "lineage",
      "why": "A command classified as risky was copied from a web page and, within two minutes, a Terminal shell ran a matching download/decode/script command.",
      "matchers": [
+       {"kinds": ["exec"], "ancestor": ["@terminals"], "clipboardOverlap": 0.6, "argsNot": ["@installerHosts"], "setMark": {"name": "pasteEntry", "from": "global", "window": 600}},
        {"kinds": ["exec"], "ancestor": ["@terminals"], "argsAny": ["\\b(curl|wget)\\b", "base64\\s+(-d|--decode|-D)", "\\bosascript\\b", "\\bopenssl\\s+(enc|base64)\\b"], "argsNot": ["@installerHosts"], "requireMark": {"name": "riskyClipboard", "scope": "global", "window": 120}, "setMark": {"name": "pasteEntry", "from": "global", "window": 600}}
      ]},
     {"id": "R32", "name": "Apple paste warning overridden", "type": "strong", "category": "malware", "score": 65, "stage": "entry", "subject": "lineage",
@@ -202,7 +207,8 @@ enum DefaultRules {
     {"id": "L08", "name": "Shell or interpreter spawned by a browser", "type": "weak", "category": "suspicious", "score": 50, "stage": "entry", "subject": "lineage",
      "why": "A web browser started a shell, script interpreter or downloader, which browsers do not normally do.",
      "matchers": [
-       {"kinds": ["exec"], "process": ["@shells", "@interpreters", "@fetchers"], "ancestor": ["@browsers"], "ancestorNot": ["@terminals"], "setMark": {"name": "entry", "from": "story", "window": 1800}}
+       {"kinds": ["exec"], "process": ["@shells", "@interpreters", "@fetchers"], "ancestor": ["@browsers"], "ancestorNot": ["@terminals"], "setMark": {"name": "entry", "from": "story", "window": 1800}},
+       {"kinds": ["exec"], "process": ["@shells", "@interpreters", "@fetchers"], "detail": {"responsible_path": "(?i)(chrome|safari|firefox|brave|edge|arc|opera|vivaldi|chromium|orion)"}, "ancestorNot": ["@terminals"], "setMark": {"name": "entry", "from": "story", "window": 1800}}
      ]},
     {"id": "L09", "name": "Untrusted code launched from a disk image", "type": "weak", "category": "suspicious", "score": 30, "stage": "entry", "subject": "actor",
      "why": "An unsigned or ad-hoc signed program was run from a mounted disk image, the usual fake-installer delivery.",
@@ -248,6 +254,7 @@ enum DefaultRules {
      "matchers": [
        {"kinds": ["exec"], "argsAny": ["api\\.telegram\\.org/bot", "discord(app)?\\.com/api/webhooks", "hooks\\.slack\\.com/services"], "processNot": ["@messagingApps"]},
        {"kinds": ["dnsQuery", "networkConnect"], "detail": {"name": "^(api\\.telegram\\.org|discord(app)?\\.com)\\.?$"}, "processNot": ["@messagingApps", "@browsers"]},
+       {"kinds": ["networkConnect"], "detail": {"remote_ip": "^(149\\.154\\.(16[0-9]|17[0-5])\\.|91\\.108\\.([4-9]|1[0-9]|2[0-3]|5[6-9])\\.|91\\.105\\.19[23]\\.|185\\.76\\.151\\.)"}, "processNot": ["@messagingApps", "@browsers"]},
        {"kinds": ["dnsQuery", "networkConnect"], "detail": {"host": "^(api\\.telegram\\.org|discord(app)?\\.com)\\.?$"}, "processNot": ["@messagingApps", "@browsers"]}
      ]},
     {"id": "L03", "name": "Archive of a temp staging folder", "type": "weak", "category": "infostealer", "score": 20, "stage": "collection", "subject": "lineage", "devSensitive": true,

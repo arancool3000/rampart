@@ -5,7 +5,7 @@ import RampartShared
 // MARK: - App-local types (UI-only; not part of the shared IPC contract)
 
 enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
-    case dashboard, scan, threats, activity, network, posture, settings
+    case dashboard, scan, threats, activity, network, posture, rules, settings
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -15,6 +15,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .activity: return "Protection Activity"
         case .network: return "Network"
         case .posture: return "Privacy & Posture"
+        case .rules: return "Rules"
         case .settings: return "Settings"
         }
     }
@@ -26,6 +27,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .activity: return "clock.arrow.circlepath"
         case .network: return "network"
         case .posture: return "hand.raised.square"
+        case .rules: return "list.bullet.rectangle"
         case .settings: return "gearshape"
         }
     }
@@ -106,10 +108,15 @@ struct AppConnections: Identifiable, Hashable {
     struct Destination: Hashable, Identifiable {
         var id: String { host + ":" + String(port) }
         var host: String; var port: Int; var proto: String; var country: String; var blocked: Bool
+        /// Live mode: the daemon flagged this destination (blocklist or behaviour rule) rather than blocking it.
+        var flaggedOnly = false
+        var state: String? = nil
+        var statusLabel: String { blocked ? (flaggedOnly ? "Flagged" : "Blocked") : (state ?? "Allowed") }
     }
     var id: String { app }
     var app: String
     var bundlePath: String?
+    var signing: SigningInfo.Status? = nil
     var sentKB: Int
     var receivedKB: Int
     var destinations: [Destination]
@@ -117,20 +124,41 @@ struct AppConnections: Identifiable, Hashable {
 }
 
 struct WiFiInfo: Hashable {
-    var ssid: String
+    var ssid: String?
     var security: String
     var encrypted: Bool
     var gatewayChanged: Bool
+    var note: String? = nil
 }
 
-struct AllowRule: Identifiable, Hashable {
-    enum Scope: String { case file = "This file only", developer = "This developer", folder = "This folder" }
-    let id = UUID()
-    var name: String
-    var scope: Scope
-    var value: String
-    var created: Date
-    var expires: Date?
+extension AllowRuleSpec.Scope {
+    var label: String {
+        switch self {
+        case .fileHash: return "This file only"
+        case .developer: return "This developer"
+        case .folder: return "This folder"
+        case .signingID: return "This app"
+        }
+    }
+}
+
+extension AllowRuleSpec {
+    /// Rule as a readable sentence.
+    var sentence: String {
+        switch scope {
+        case .fileHash: return "\(name) is always allowed (fingerprint \(value.prefix(12))…)."
+        case .developer: return "Apps from \(name) are allowed."
+        case .folder: return "Everything in \((value as NSString).abbreviatingWithTildeInPath) is allowed."
+        case .signingID: return "\(name) is allowed (signing ID \(value))."
+        }
+    }
+}
+
+/// Where the protection comes from.
+enum ProtectionSource: Equatable {
+    case none
+    case systemService          // root LaunchDaemon
+    case basic                  // `rampartd --user` (no install)
 }
 
 enum ConnectionMode: Equatable { case connecting, live, demo }
@@ -156,7 +184,14 @@ final class AppModel {
     var wifi: WiFiInfo?
     var blockedThisMonth = 0
     var blockedToday = 0
-    var allowRules: [AllowRule] = []
+    var allowRules: [AllowRuleSpec] = []
+    var settings = RampartSettings()
+    var health: HealthReport?
+    var source: ProtectionSource = .none
+    var webProtectionAvailable = true
+    var recentBlocks: [String] = []
+    var blocklistDomains = 0
+    var launchState: DaemonLauncher.State = .idle
     var ignoredChecks: Set<String> = []
     var dismissedRecommendations: Set<String> = []
     var pausedUntil: Date?
@@ -167,6 +202,7 @@ final class AppModel {
     var hasFullDiskAccess = FDAProbe.check()
     /// Last 14 days, oldest first (charts).
     var daily: [DayStat] = []
+    @ObservationIgnored var liveBlockedByDay: [Int] = []
     /// Most recent scanned paths, newest first (scan animation), updated at most 5×/s.
     var recentScanPaths: [String] = []
     @ObservationIgnored private var lastPathNote = Date.distantPast
@@ -177,6 +213,7 @@ final class AppModel {
     @ObservationIgnored private var demoTimer: Timer?
     @ObservationIgnored private var pollTimer: Timer?
     @ObservationIgnored private var started = false
+    @ObservationIgnored private var pauseTimer: Timer?
 
     var isDemo: Bool { mode == .demo }
     var openDetections: [Detection] { detections.filter { !$0.resolved } }
@@ -204,8 +241,11 @@ final class AppModel {
             let day = cal.date(byAdding: .day, value: -back, to: today)!
             let items = activity.filter { cal.isDate($0.date, inSameDayAs: day) }
             let files = scanHistory.filter { cal.isDate($0.date, inSameDayAs: day) }.reduce(0) { $0 + $1.scanned }
-            return DayStat(day: day, filesChecked: files, sitesBlocked: items.filter { $0.kind == .network }.count,
-                           threats: items.filter { $0.kind == .threat }.count)
+            let idx = 13 - back
+            let blocked = liveBlockedByDay.count == 14 ? liveBlockedByDay[idx] : items.filter { $0.kind == .network }.count
+            let scanFiles = files > 0 ? files : 0
+            return DayStat(day: day, filesChecked: scanFiles, sitesBlocked: blocked,
+                           threats: items.filter { $0.kind == .threat && ($0.outcome.contains("uarantin") || $0.title.lowercased().contains("detect")) }.count)
         }
     }
 
@@ -222,7 +262,7 @@ final class AppModel {
         guard !started else { return }
         started = true
         if ProcessInfo.processInfo.arguments.contains("--demo") { enterDemo(); return }
-        Task { await connect() }
+        Task { await connect(autoLaunch: true) }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in
             Task { @MainActor in await AppModel.shared.periodic() }
         }
@@ -232,36 +272,110 @@ final class AppModel {
         hasFullDiskAccess = FDAProbe.check()
         if mode == .demo, ProcessInfo.processInfo.arguments.contains("--demo") { return }
         if await client.isReachable() {
-            if mode != .live { await connect() } else { await refresh() }
-        } else if mode != .demo {
-            enterDemo()
+            if mode != .live { await connect(autoLaunch: false) } else { await refresh() }
+        } else if mode == .live {
+            // The service went away: try to bring basic protection back, else fall back.
+            await connect(autoLaunch: true)
         }
     }
 
-    func connect() async {
+    func connect(autoLaunch: Bool = true) async {
+        if !(await client.isReachable()), autoLaunch, DaemonLauncher.shared.helperURL != nil {
+            launchState = .starting
+            launchState = await DaemonLauncher.shared.launchAndWait(client: client)
+        }
         if await client.isReachable() {
+            if mode == .demo { clearDemo() }
             mode = .live
             demoTimer?.invalidate()
             await refresh()
             subscribe()
-        } else {
+        } else if DaemonLauncher.shared.helperURL == nil || mode != .live {
+            // Demo only when there is no helper binary (dev builds) or it could not start.
             enterDemo()
         }
+    }
+
+    private func clearDemo() {
+        detections = []; quarantine = []; posture = []; persistence = []; activity = []; scanHistory = []
+        connections = []; wifi = nil; allowRules = []; daily = []; blockedToday = 0; blockedThisMonth = 0
+        recentBlocks = []; definitionsUpdated = nil
     }
 
     func refresh() async {
         guard mode == .live else { return }
         do {
-            if case .status(let s) = try await client.request(.status) { status = s; definitionsUpdated = s.lastScan ?? definitionsUpdated }
-            if case .detections(let d) = try await client.request(.listDetections) { detections = d.sorted { $0.date > $1.date } }
-            if case .quarantine(let q) = try await client.request(.listQuarantine) { quarantine = q.sorted { $0.date > $1.date } }
-            if case .posture(let p) = try await client.request(.posture, timeout: 30) { posture = p }
-            if case .persistence(let p) = try? await client.request(.persistence, timeout: 30) { persistence = p }
-            rebuildLiveActivity()
+            if case .status(let s) = try await client.request(.status) { status = s }
             lastError = nil
         } catch {
             lastError = error.localizedDescription
+            return
         }
+        // Each v2 request is optional: an older daemon answers .error and that screen keeps its empty state.
+        if case .health(let h)? = try? await client.request(.health) {
+            health = h
+            source = h.mode == "user" ? .basic : .systemService
+        } else {
+            source = .systemService
+        }
+        if case .detections(let d)? = try? await client.request(.listDetections) { detections = d.sorted { $0.date > $1.date } }
+        if case .quarantine(let q)? = try? await client.request(.listQuarantine) { quarantine = q.sorted { $0.date > $1.date } }
+        if case .settings(let st)? = try? await client.request(.getSettings) { settings = st }
+        if case .allowRules(let r)? = try? await client.request(.listAllowRules) { allowRules = r.sorted { $0.created > $1.created } }
+        if case .networkStats(let n)? = try? await client.request(.networkStats) { apply(n) }
+        if case .wifi(let w)? = try? await client.request(.wifi) {
+            wifi = w.connected ? WiFiInfo(ssid: w.ssid, security: w.security ?? "Unknown security", encrypted: !w.weakSecurity,
+                                          gatewayChanged: w.gatewayMACChanged, note: w.note) : nil
+        }
+        if case .connections(let c)? = try? await client.request(.connections) { apply(c) }
+        if case .activity(let a)? = try? await client.request(.activity(limit: 500)) { apply(a) } else { rebuildLiveActivity() }
+        if case .posture(let p)? = try? await client.request(.posture, timeout: 30) { posture = p }
+        if case .persistence(let p)? = try? await client.request(.persistence, timeout: 30) { persistence = p }
+        definitionsUpdated = status.lastScan ?? definitionsUpdated
+    }
+
+    private func apply(_ n: NetworkStats) {
+        status.webProtectionOn = n.webProtectionOn
+        webProtectionAvailable = n.webProtectionAvailable
+        blockedToday = n.blockedToday
+        blockedThisMonth = n.blockedThisMonth
+        recentBlocks = n.recentBlocks
+        blocklistDomains = n.blocklistDomains
+        liveBlockedByDay = n.blockedByDay
+    }
+
+    private func apply(_ c: [ConnectionInfo]) {
+        let groups = Dictionary(grouping: c) { $0.processName }
+        connections = groups.map { name, rows in
+            AppConnections(app: name, bundlePath: rows.first?.processPath.flatMap(Self.bundlePath(forExecutable:)), signing: rows.first?.signing, sentKB: 0, receivedKB: 0,
+                           destinations: rows.map {
+                               .init(host: $0.remoteHost ?? $0.remoteAddress, port: $0.remotePort, proto: $0.proto, country: "", blocked: $0.flagged,
+                                     flaggedOnly: true, state: $0.state.map { $0.capitalized })
+                           }.uniqued())
+        }
+        .sorted { ($0.blockedCount, $0.destinations.count) > ($1.blockedCount, $1.destinations.count) }
+    }
+
+    static func bundlePath(forExecutable p: String) -> String? {
+        if let r = p.range(of: ".app/") { return String(p[..<r.lowerBound]) + ".app" }
+        return p
+    }
+
+    private func apply(_ entries: [ActivityEntry]) {
+        activity = entries.map { e in
+            let kind: ActivityItem.Kind
+            switch e.kind {
+            case .scan: kind = .scan
+            case .detection, .quarantine, .restore: kind = .threat
+            case .webBlock: kind = .network
+            case .update: kind = .update
+            case .posture, .settings: kind = .settings
+            case .persistence, .system: kind = .protection
+            }
+            return ActivityItem(date: e.date, kind: kind, title: e.title, outcome: e.outcome.isEmpty ? e.detail : e.outcome)
+        }
+        .sorted { $0.date > $1.date }
+        rebuildDaily()
     }
 
     private func subscribe() {
@@ -410,9 +524,14 @@ final class AppModel {
         guard case .running(var p) = scanPhase else { return }
         p.paused.toggle()
         scanPhase = .running(p)
+        if mode == .live {
+            let paused = p.paused
+            Task { do { _ = try await client.request(.pauseScan(paused: paused)) } catch { lastError = error.localizedDescription } }
+        }
     }
 
     func stopScan() {
+        if mode == .live, isScanning { Task { _ = try? await client.request(.cancelScan) } }
         scanHandle?.cancel(); scanHandle = nil
         demoTimer?.invalidate()
         if case .running(let p) = scanPhase {
@@ -441,8 +560,8 @@ final class AppModel {
         } else {
             quarantine.removeAll { $0.id == r.id }
         }
-        if allow {
-            allowRules.insert(AllowRule(name: (r.originalPath as NSString).lastPathComponent, scope: .file, value: r.sha256, created: Date(), expires: nil), at: 0)
+        if allow && mode != .live {
+            allowRules.insert(AllowRuleSpec(scope: .fileHash, value: r.sha256, name: (r.originalPath as NSString).lastPathComponent), at: 0)
         }
         activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Restored \((r.originalPath as NSString).lastPathComponent)\(allow ? " and allowed it" : " once")", outcome: "Restored"), at: 0)
     }
@@ -456,20 +575,98 @@ final class AppModel {
         activity.insert(ActivityItem(date: Date(), kind: .threat, title: "Deleted \((r.originalPath as NSString).lastPathComponent) permanently", outcome: "Deleted"), at: 0)
     }
 
-    func allow(_ d: Detection, scope: AllowRule.Scope) async {
-        if mode == .live, let h = d.sha256 {
-            do { _ = try await client.request(.allow(sha256: h)) } catch { lastError = error.localizedDescription; return }
-        }
+    func allow(_ d: Detection, scope: AllowRuleSpec.Scope) async {
+        let name = (d.path.map { ($0 as NSString).lastPathComponent }) ?? d.name
         let value: String
         switch scope {
-        case .file: value = d.sha256 ?? d.path ?? d.name
-        case .developer: value = d.evidence.first { $0.source == .signing }?.detail ?? "Unknown developer"
+        case .fileHash: value = d.sha256 ?? d.path ?? d.name
+        case .developer, .signingID: value = d.evidence.first { $0.source == .signing }?.detail ?? "Unknown developer"
         case .folder: value = ((d.path ?? "/") as NSString).deletingLastPathComponent
         }
-        allowRules.insert(AllowRule(name: (d.path.map { ($0 as NSString).lastPathComponent }) ?? d.name, scope: scope, value: value, created: Date(), expires: nil), at: 0)
+        let ok = await addAllowRule(AllowRuleSpec(scope: scope, value: value, name: scope == .folder ? (value as NSString).lastPathComponent : name))
+        guard ok else { return }
         mark(d.id, resolved: true)
-        activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Allowed \(d.name) (\(scope.rawValue.lowercased()))", outcome: "Rule added"), at: 0)
         if mode == .live { await refresh() }
+    }
+
+    @discardableResult
+    func addAllowRule(_ rule: AllowRuleSpec) async -> Bool {
+        if mode == .live {
+            do { _ = try await client.request(.addAllowRule(rule)) } catch { lastError = error.localizedDescription; return false }
+            if case .allowRules(let r)? = try? await client.request(.listAllowRules) { allowRules = r.sorted { $0.created > $1.created } }
+        } else {
+            allowRules.insert(rule, at: 0)
+        }
+        activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Allowed \(rule.name) (\(rule.scope.label.lowercased()))", outcome: "Rule added"), at: 0)
+        return true
+    }
+
+    func removeAllowRule(_ rule: AllowRuleSpec) async {
+        if mode == .live {
+            do { _ = try await client.request(.removeAllowRule(id: rule.id)) } catch { lastError = error.localizedDescription; return }
+            if case .allowRules(let r)? = try? await client.request(.listAllowRules) { allowRules = r.sorted { $0.created > $1.created } }
+        } else {
+            allowRules.removeAll { $0.id == rule.id }
+        }
+        activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Removed rule for \(rule.name)", outcome: "Rule removed"), at: 0)
+    }
+
+    // MARK: Settings (owned by the daemon in live mode)
+
+    func updateSettings(_ change: (inout RampartSettings) -> Void) {
+        var next = settings
+        change(&next)
+        guard next != settings else { return }
+        let previous = settings
+        settings = next
+        if next.realtimeOn != previous.realtimeOn { status.realtimeOn = next.realtimeOn }
+        guard mode == .live else { return }
+        Task {
+            do {
+                let resp = try await client.request(.setSettings(next))
+                if case .settings(let confirmed) = resp { self.settings = confirmed }
+            } catch {
+                self.settings = previous
+                self.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    // MARK: Startup item cleanup
+
+    func previewRemediation(_ item: PersistenceItem) async -> Result<RemediationPreview, Error> {
+        if mode != .live {
+            return .success(RemediationPreview(persistenceID: item.id, title: "Turn off \(item.label)",
+                steps: ["Stop \(item.label) if it is running", "Turn it off so it doesn't start at login", "Move \((item.location as NSString).lastPathComponent) to Rampart's quarantine so you can undo this"],
+                commands: ["launchctl bootout gui/501 \(item.location)", "launchctl disable gui/501/\(item.label)", "mv \(item.location) ~/Library/Application Support/Rampart/Quarantine/"],
+                undoable: true, requiresRoot: item.kind == .launchDaemon))
+        }
+        do {
+            let resp = try await client.request(.previewRemediation(persistenceID: item.id), timeout: 20)
+            if case .remediationPreview(let p) = resp { return .success(p) }
+            return .failure(DaemonClient.ClientError.unexpected)
+        } catch { return .failure(error) }
+    }
+
+    func remediate(_ item: PersistenceItem) async -> String? {
+        if mode == .live {
+            do { _ = try await client.request(.remediate(persistenceID: item.id), timeout: 60) } catch { return error.localizedDescription }
+            await refresh()
+        } else {
+            persistence.removeAll { $0.id == item.id }
+        }
+        activity.insert(ActivityItem(date: Date(), kind: .protection, title: "Turned off startup item \(item.label)", outcome: "Removed"), at: 0)
+        return nil
+    }
+
+    func refreshConnections() async {
+        guard mode == .live else { return }
+        if case .connections(let c)? = try? await client.request(.connections) { apply(c) }
+    }
+
+    func refreshHealth() async {
+        guard mode == .live else { return }
+        if case .health(let h)? = try? await client.request(.health) { health = h }
     }
 
     private func mark(_ id: UUID, resolved: Bool) {
@@ -490,6 +687,7 @@ final class AppModel {
 
     func setWebProtection(_ on: Bool) async {
         if mode == .live {
+            guard webProtectionAvailable else { lastError = "Web protection needs the full system service."; return }
             do { _ = try await client.request(.setWebProtection(on: on)); await refresh() } catch { lastError = error.localizedDescription; return }
         } else { status.webProtectionOn = on }
         activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Web protection turned \(on ? "on" : "off")", outcome: "Changed"), at: 0)
@@ -497,7 +695,22 @@ final class AppModel {
 
     func setRealtime(_ on: Bool, pauseFor minutes: Int? = nil) {
         if let minutes { pausedUntil = Date().addingTimeInterval(Double(minutes) * 60) } else { pausedUntil = nil }
-        if mode != .live { status.realtimeOn = on || minutes != nil }
+        let effectiveOn = on && minutes == nil
+        status.realtimeOn = effectiveOn || minutes != nil
+        settings.realtimeOn = effectiveOn
+        if mode == .live {
+            Task {
+                do { _ = try await client.request(.setRealtime(on: effectiveOn)); await self.refresh() } catch { self.lastError = error.localizedDescription }
+            }
+            if let minutes {
+                pauseTimer?.invalidate()
+                pauseTimer = Timer.scheduledTimer(withTimeInterval: Double(minutes) * 60, repeats: false) { _ in
+                    Task { @MainActor in AppModel.shared.setRealtime(true) }
+                }
+            }
+        } else {
+            status.realtimeOn = on || minutes != nil
+        }
         activity.insert(ActivityItem(date: Date(), kind: .protection,
                                      title: minutes.map { "Real-time protection paused for \($0 >= 60 ? "\($0 / 60) hour" : "\($0) minutes")" } ?? "Real-time protection turned \(on ? "on" : "off")",
                                      outcome: "Changed"), at: 0)
@@ -528,4 +741,8 @@ enum FDAProbe {
         return false
     }
     static let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+}
+
+extension Array where Element: Hashable {
+    func uniqued() -> [Element] { var seen = Set<Element>(); return filter { seen.insert($0).inserted } }
 }

@@ -29,6 +29,11 @@ public final class EsloggerParser {
     public var dropUnmodifiedClose = true
     /// When true, events with an unsupported schema version are dropped instead of parsed best-effort.
     public var strictSchema = false
+    /// Resolves `responsible_pid` to an executable path for exec events (`detail["responsible_path"]`).
+    /// Defaults to libproc; the process is normally still alive when eslogger reports its exec.
+    /// Results are cached briefly because one app's helpers exec in bursts.
+    public var responsiblePathResolver: ((Int32) -> String?)? = { ProcInspector.path($0) }
+    private var responsibleCache: [Int32: (path: String, at: Date)] = [:]
 
     public init() {}
 
@@ -76,7 +81,10 @@ public final class EsloggerParser {
             if let prev = actor?.path, prev != p.path { detail["prev_path"] = prev }
             if let cwd = Self.filePath(ev["cwd"]) { detail["cwd"] = cwd }
             if let script = Self.filePath(ev["script"]) { detail["script"] = script }
-            if let rp = Self.responsiblePid(target) { detail["responsible_pid"] = String(rp) }
+            if let rp = Self.responsiblePid(target) {
+                detail["responsible_pid"] = String(rp)
+                if rp != p.pid, let path = responsiblePath(Int32(truncatingIfNeeded: rp)) { detail["responsible_path"] = path }
+            }
         case "fork":
             kind = .other
             if let child = (ev["child"] as? [String: Any]).flatMap({ Self.process($0) }) {
@@ -172,6 +180,14 @@ public final class EsloggerParser {
     }
 
     // MARK: helpers
+
+    private func responsiblePath(_ pid: Int32) -> String? {
+        if let c = responsibleCache[pid], Date().timeIntervalSince(c.at) < 5 { return c.path }
+        guard let path = responsiblePathResolver?(pid), !path.isEmpty else { return nil }
+        if responsibleCache.count > 512 { responsibleCache.removeAll(keepingCapacity: true) }
+        responsibleCache[pid] = (path, Date())
+        return path
+    }
 
     static func int(_ v: Any?) -> Int? {
         if let n = v as? NSNumber { return n.intValue }

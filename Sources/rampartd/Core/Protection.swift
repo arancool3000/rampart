@@ -14,11 +14,29 @@ final class Protection {
     private var subscribers: [UUID: (IPCResponse) -> Bool] = [:]
     private let scanLock = NSLock()
     private var activeScans = 0
+    let activity: ActivityLog
+    let allowRules: AllowRuleStore
+    let started = Date()
+    /// Controls of scans currently running (pause/cancel).
+    let scanControl = ScanControl.shared
+    private let persistLock = NSLock()
+    private var _lastPersistence: [PersistenceItem] = []
+    var lastPersistence: [PersistenceItem] {
+        get { persistLock.lock(); defer { persistLock.unlock() }; return _lastPersistence }
+        set { persistLock.lock(); _lastPersistence = newValue; persistLock.unlock() }
+    }
+    var cpuSample: (wall: Date, cpu: Double)?
 
     init(runtime: Runtime, services: Services) {
         self.runtime = runtime; self.services = services
         store = DetectionStore(url: runtime.detectionsURL)
         state = StateStore(url: runtime.stateURL)
+        activity = ActivityLog(url: runtime.root.appendingPathComponent("activity.jsonl"))
+        allowRules = AllowRuleStore(url: runtime.root.appendingPathComponent("allowrules.json"))
+        applyAllowRules()
+        services.onWebBlock = { [weak self] domain, list in
+            self?.activity.add(.webBlock, "Blocked \(domain)", detail: list.map { "Listed in \($0)" } ?? "", outcome: "blocked", severity: .low)
+        }
     }
 
     // MARK: events
@@ -38,6 +56,7 @@ final class Protection {
     @discardableResult
     func handle(_ detection: Detection) -> Detection? {
         if let h = detection.sha256, runtime.config.allowlist.contains(h) { return nil }
+        if isAllowedByRule(detection) { return nil }
         if let path = detection.path, let h = detection.sha256, state.value.restored?[path] == h { return nil }
         var d = store.add(detection)
         let cfg = runtime.config
@@ -56,7 +75,17 @@ final class Protection {
                     d = store.update(d.id) { $0.resolved = true } ?? d
                 } catch { actions.append("quarantine failed: \(error.localizedDescription)") }
             }
-            if !actions.isEmpty { logInfo("remediation for \(d.name) at \(d.path ?? "pid \(d.pid ?? 0)"): \(actions.joined(separator: "; "))") }
+            if !actions.isEmpty {
+                logInfo("remediation for \(d.name) at \(d.path ?? "pid \(d.pid ?? 0)"): \(actions.joined(separator: "; "))")
+                if d.resolved {
+                    activity.add(.quarantine, "Quarantined \(d.name)", detail: d.path ?? "", outcome: "quarantined", severity: d.severity, detectionID: d.id)
+                }
+            }
+        }
+        if d.confidence >= 30 {
+            activity.add(.detection, d.name, detail: d.path ?? d.pid.map { "process \($0)" } ?? "",
+                         outcome: d.resolved ? "contained" : (d.confidence >= 60 ? "needs review" : "logged"),
+                         severity: d.severity, detectionID: d.id)
         }
         logInfo("detection \(d.name) conf=\(d.confidence) path=\(d.path ?? "-") resolved=\(d.resolved)")
         if d.confidence >= 60 || d.category == .test { broadcast(.event(d)) }
@@ -74,8 +103,16 @@ final class Protection {
         scanLock.lock(); activeScans += 1; scanLock.unlock()
         defer { scanLock.lock(); activeScans -= 1; scanLock.unlock() }
         logInfo("scan start (\(quick ? "quick" : "custom/full")) \(targets.count) roots")
-        var out = services.scanner.scan(paths: targets, progress: progress, cancelled: cancelled)
+        let token = scanControl.begin()
+        defer { scanControl.end(token) }
+        activity.add(.scan, quick ? "Quick scan started" : "Scan started", detail: targets.prefix(5).joined(separator: ", ") + (targets.count > 5 ? " …" : ""))
+        var out = services.scanner.scan(paths: targets, progress: progress, cancelled: { cancelled() || self.scanControl.isCancelled(token) })
         out.detections = out.detections.compactMap { handle($0) }
+        let wasCancelled = scanControl.isCancelled(token)
+        activity.add(.scan, wasCancelled ? "Scan cancelled" : (quick ? "Quick scan finished" : "Scan finished"),
+                     detail: "\(out.scanned) files in \(String(format: "%.1f", out.seconds)) s",
+                     outcome: out.detections.isEmpty ? "no threats" : "\(out.detections.count) found",
+                     severity: out.detections.isEmpty ? .info : .medium)
         state.update { s in s.lastScan = Date(); if quick || paths.isEmpty { s.lastQuickScan = Date() } }
         logInfo("scan done: \(out.scanned) files, \(out.detections.count) detections, \(String(format: "%.1f", out.seconds)) s")
         return out
@@ -112,7 +149,16 @@ final class Protection {
                 logInfo("new persistence item: \(item.kind.rawValue) \(item.label) -> \(item.target ?? "?")")
             }
         }
+        if let base = state.value.persistenceBaseline.map(Set.init) {
+            let added = items.filter { !base.contains($0.id) }
+            let removed = base.subtracting(ids)
+            for item in added.prefix(20) {
+                activity.add(.persistence, "New \(item.kind.rawValue): \(item.label)", detail: item.target ?? item.location, outcome: "recorded")
+            }
+            if !removed.isEmpty { activity.add(.persistence, "\(removed.count) persistence item(s) removed", outcome: "recorded") }
+        }
         for d in findings { handle(d) }
+        lastPersistence = items
         if updateBaseline { state.update { $0.persistenceBaseline = Array(ids).sorted() } }
         return items
     }
@@ -121,6 +167,7 @@ final class Protection {
         guard let u = services.updater else { return "no updatable engines in this build" }
         let summary = u.update()
         state.update { $0.lastUpdate = Date(); $0.lastUpdateSummary = summary }
+        activity.add(.update, "Protection updated", detail: summary, outcome: summary.contains("failed") ? "partial" : "ok")
         logInfo("update: \(summary)")
         return summary
     }
@@ -134,14 +181,14 @@ final class Protection {
             if allow { self.allow(sha256: h) }
         }
         logInfo("restored \(id.uuidString) to \(path)\(allow ? " (trusted)" : "")")
+        activity.add(.restore, "Restored \(rec?.detectionName ?? "item")", detail: path, outcome: allow ? "restored and trusted" : "restored")
         return path
     }
 
     func allow(sha256: String) {
         let h = sha256.lowercased()
-        runtime.updateConfig { if !$0.allowlist.contains(h) { $0.allowlist.append(h) } }
-        store.resolveAll(sha256: h)
-        for hook in services.allowHooks { hook(h) }
+        allowRules.add(AllowRuleSpec(scope: .fileHash, value: h, name: "File \(h.prefix(12))…"))
+        applyAllowRules()
     }
 
     /// Full-scan roots: every top-level folder except the sealed system volume and mounts.

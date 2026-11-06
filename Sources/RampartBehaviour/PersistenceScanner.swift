@@ -482,6 +482,8 @@ public final class PersistenceScanner: @unchecked Sendable {
                                              attributes: ["class": PathUtil.basename(d)]))
             }
         }
+        let dock = config.home + "/Library/Preferences/com.apple.dock.plist"
+        if let d = fm.contents(atPath: dock) { out += Self.parseDock(data: d, plistPath: dock, home: config.home) }
         for plist in ["/var/root/Library/Preferences/com.apple.loginwindow.plist", "/Library/Preferences/com.apple.loginwindow.plist"] {
             guard let d = fm.contents(atPath: plist),
                   let o = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] else { continue }
@@ -491,6 +493,45 @@ public final class PersistenceScanner: @unchecked Sendable {
                                                  attributes: ["class": "loginHook"]))
                 }
             }
+        }
+        return out
+    }
+
+    /// Bundle identifier of the app at `path` (nil if unreadable).
+    public static func bundleID(atAppPath path: String) -> String? {
+        let info = (path as NSString).appendingPathComponent("Contents/Info.plist")
+        guard let d = FileManager.default.contents(atPath: info),
+              let o = try? PropertyListSerialization.propertyList(from: d, format: nil) as? [String: Any] else { return nil }
+        return o["CFBundleIdentifier"] as? String
+    }
+
+    /// Dock `persistent-apps` tiles (R19). Each record carries the tile label, the stored bundle ID, the resolved
+    /// path, the bundle ID actually found at that path, and `dockProblem` when the tile looks hijacked.
+    public static func parseDock(data: Data, plistPath: String, home: String,
+                                 bundleIDAt: (String) -> String? = PersistenceScanner.bundleID(atAppPath:)) -> [PersistenceRecord] {
+        guard let o = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+              let apps = o["persistent-apps"] as? [[String: Any]] else { return [] }
+        var out: [PersistenceRecord] = []
+        for (i, e) in apps.enumerated() {
+            guard let tile = e["tile-data"] as? [String: Any] else { continue }
+            let label = tile["file-label"] as? String ?? "?"
+            let stored = tile["bundle-identifier"] as? String
+            guard let urlString = (tile["file-data"] as? [String: Any])?["_CFURLString"] as? String else { continue }
+            var path = URL(string: urlString)?.path ?? urlString
+            if path.count > 1 && path.hasSuffix("/") { path.removeLast() }
+            var attrs: [String: String] = ["class": "dock", "label": label, "index": String(i), "path": path]
+            if let stored { attrs["bundleID"] = stored }
+            let actual = bundleIDAt(path)
+            if let actual { attrs["actualBundleID"] = actual }
+            var problems: [String] = []
+            let allowed = ["/Applications/", home + "/Applications/", "/System/"]
+            if !allowed.contains(where: { path.hasPrefix($0) }) { problems.append("app lives outside /Applications, ~/Applications and /System (\(PathClass.classify(path).rawValue) folder)") }
+            if let stored, let actual, stored.lowercased() != actual.lowercased() {
+                problems.append("tile says \(stored) but the app at that path is \(actual)")
+            }
+            if !problems.isEmpty { attrs["dockProblem"] = problems.joined(separator: "; ") }
+            out.append(PersistenceRecord(item: PersistenceItem(kind: .other, label: "Dock: \(label)", location: plistPath + "#" + label + "|" + path,
+                                                               target: path), attributes: attrs))
         }
         return out
     }

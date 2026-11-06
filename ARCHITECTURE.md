@@ -43,3 +43,18 @@ swift build --scratch-path .build-<module> --product rampart-selftest && .build-
 Only the lead edits Package.swift, Sources/RampartShared, Sources/rampart-selftest/main.swift and Suites.swift.
 If another module's half-written code breaks your build of a combined product, build your own target only and retry later. Don't fix other agents' files.
 Do not `git commit`; the lead commits.
+
+## Phase 2 additions (2026-11-06)
+Display name is now **RamPart** (`Product.name`). Bundle IDs, paths and module names stay lowercase `rampart`.
+No sample/demo data in shipping builds: the app auto-starts the bundled `rampartd --user` and shows only real data (demo only with an explicit `--demo` dev flag).
+
+| Module | Owner | Scope |
+|---|---|---|
+| RampartGuard | G1 (Fable) | Tamper protection (self-defence) and remote-access lockdown: block remote access until the user allows it. Wired into rampartd by B9. |
+| RampartWeb + rampart-nmh + Extensions/ | W1 (Fable) | Scam Check engine, website auto-scanning (URL + page heuristics), browser extensions (Chromium MV3 + Safari Web Extension sources) with a native messaging host. |
+| RampartNetwork/NetworkScanner*.swift | N1 (Fable) | LAN device discovery and risk scan (own subnet only, rate-limited), open ports on this Mac and the router. |
+| RampartVault | V1 (Opus) | Password generator, encrypted vault, password storage, Touch ID unlock, Keychain integration, breach check. |
+| RampartAI | A1 (Opus) | Gemini-powered tools. API key lives ONLY in the login Keychain (service `app.rampart.ai.gemini`, account `gemini-api-key`). Never write it to disk, logs, or the repo. |
+| Resources/Brand | L1 (Opus) | Logo and app icon. |
+
+Every new feature must also be explained honestly in the UI where macOS limits it (e.g. no pre-execution blocking without the Endpoint Security entitlement; Safari extension needs a signed app).

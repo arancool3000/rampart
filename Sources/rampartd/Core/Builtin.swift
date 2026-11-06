@@ -174,6 +174,7 @@ final class BuiltinQuarantine: QuarantineService {
 /// Minimal persistence enumeration (launchd plists) until RampartBehaviour's PersistenceScanner is wired.
 final class BuiltinPersistence: PersistenceService {
     func scan() -> (items: [PersistenceItem], findings: [Detection]) { (items(), []) }
+    func lookup(id: String) -> PersistenceLookup? { items().first { $0.id == id }.map { PersistenceLookup(item: $0, attributes: [:]) } }
     func items() -> [PersistenceItem] {
         var dirs: [(String, PersistenceItem.Kind)] = [("/Library/LaunchAgents", .launchAgent), ("/Library/LaunchDaemons", .launchDaemon)]
         for h in Util.homeDirectories() { dirs.append((h + "/Library/LaunchAgents", .launchAgent)) }

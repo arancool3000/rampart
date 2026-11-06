@@ -16,6 +16,7 @@ public enum PathClass: String, Codable, Sendable, CaseIterable {
     case downloads       // ~/Downloads
     case library         // ~/Library, /Library
     case home            // anything else under /Users/<name>
+    case developer       // build-output / toolchain dirs: SwiftPM .build*, DerivedData, Cargo target/, node_modules/.bin, ~/go/bin, ~/.cargo/bin
     case other
 
     /// Dot-directories that are normal developer / tool locations; they do not make a path "hidden".
@@ -29,6 +30,7 @@ public enum PathClass: String, Codable, Sendable, CaseIterable {
     public static func classify(_ rawPath: String) -> PathClass {
         let p = rawPath
         if p.contains("/AppTranslocation/") { return .translocated }
+        if isDeveloperToolchain(p) { return .developer }
         if p.hasPrefix("/tmp/") || p.hasPrefix("/private/tmp/") || p.hasPrefix("/var/tmp/") || p.hasPrefix("/private/var/tmp/") {
             return .temp
         }
@@ -63,6 +65,23 @@ public enum PathClass: String, Codable, Sendable, CaseIterable {
         return .other
     }
 
+    /// Developer build output and toolchain bin dirs. Unsigned/ad-hoc binaries here are normal.
+    public static func isDeveloperToolchain(_ p: String) -> Bool {
+        let comps = p.split(separator: "/").map(String.init)
+        for (i, c) in comps.enumerated() {
+            if c.hasPrefix(".build") || c == "DerivedData" { return true }
+            if c == "node_modules", i + 1 < comps.count, comps[i + 1] == ".bin" { return true }
+            if c == "target", i + 1 < comps.count {
+                let n = comps[i + 1]
+                if n == "debug" || n == "release" { return true }
+                if n.split(separator: "-").count >= 3, i + 2 < comps.count, comps[i + 2] == "debug" || comps[i + 2] == "release" { return true }
+            }
+            if c.hasPrefix("go-build") { return true }
+        }
+        let h = PathUtil.home
+        return p.hasPrefix(h + "/go/bin/") || p.hasPrefix(h + "/.cargo/bin/") || p.hasPrefix(h + "/.rustup/toolchains/")
+    }
+
     static func isHidden(_ p: String) -> Bool {
         let comps = p.split(separator: "/")
         // Ignore the final component when it is a well-known dotfile (handled by shell rc rules instead).
@@ -76,6 +95,66 @@ public enum PathClass: String, Codable, Sendable, CaseIterable {
 
     /// Classes that count as "temp or hidden" for the ×1.3 multiplier and R29.
     public var isSuspiciousLocation: Bool { self == .temp || self == .hidden || self == .usersShared }
+}
+
+/// Privacy-preserving clipboard fingerprint shared by the session agent (producer) and the engine (consumer).
+///
+/// Format of `detail["clip_tokens"]`: comma-separated list of `hash(token)`, where
+/// `hash(t) = first 8 lowercase hex chars of SHA-256(salt + t)` and `salt` = `bootSalt` (the kernel boot
+/// session UUID, so hashes are only comparable within one boot). Tokens come from `tokens(_:)`.
+public enum ClipboardFingerprint {
+    /// Per-boot salt: `sysctl kern.bootsessionuuid` (falls back to kern.boottime seconds).
+    public static let bootSalt: String = {
+        var size = 0
+        if sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 1 {
+            var buf = [CChar](repeating: 0, count: size)
+            if sysctlbyname("kern.bootsessionuuid", &buf, &size, nil, 0) == 0 { return String(cString: buf) }
+        }
+        var tv = timeval(); var sz = MemoryLayout<timeval>.size
+        if sysctlbyname("kern.boottime", &tv, &sz, nil, 0) == 0 { return "boot-\(tv.tv_sec)" }
+        return "rampart-unsalted"
+    }()
+
+    static let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "|;&<>()`\"'{}$"))
+
+    /// Normalised tokens: split on whitespace and shell metacharacters, lowercased, absolute paths reduced to
+    /// their last component, empty tokens dropped, de-duplicated in order.
+    public static func tokens(_ text: String) -> [String] {
+        var seen = Set<String>(); var out: [String] = []
+        for raw in text.components(separatedBy: separators) {
+            var t = raw.lowercased()
+            if t.hasPrefix("/") && t.count > 1 { t = (t as NSString).lastPathComponent }
+            if t.isEmpty || t == "\\" { continue }
+            if seen.insert(t).inserted { out.append(t) }
+        }
+        return out
+    }
+
+    public static func hash(_ token: String, salt: String = bootSalt) -> String {
+        String(Hashing.sha256(salt + token).prefix(8))
+    }
+
+    /// The value telemetry puts in `detail["clip_tokens"]`.
+    public static func fingerprint(_ text: String, salt: String = bootSalt) -> String {
+        tokens(text).map { hash($0, salt: salt) }.joined(separator: ",")
+    }
+
+    public static func parse(_ clipTokens: String) -> Set<String> {
+        Set(clipTokens.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty })
+    }
+
+    /// Share of the command's tokens that appear in the clipboard, the number shared, and how many of the shared
+    /// tokens are distinctive (not a flag, not the command name, at least 6 characters, e.g. a URL or path).
+    public static func overlap(command: String, clip: Set<String>, salt: String = bootSalt) -> (fraction: Double, shared: Int, distinctive: Int) {
+        let toks = tokens(command)
+        guard !toks.isEmpty, !clip.isEmpty else { return (0, 0, 0) }
+        var shared = 0, distinctive = 0
+        for (i, t) in toks.enumerated() where clip.contains(hash(t, salt: salt)) {
+            shared += 1
+            if i > 0 && !t.hasPrefix("-") && t.count >= 6 { distinctive += 1 }
+        }
+        return (Double(shared) / Double(toks.count), shared, distinctive)
+    }
 }
 
 enum PathUtil {

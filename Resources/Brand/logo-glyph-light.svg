@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="268 190 498 644">
+  <title>RamPart</title>
+  <path id="part-1" d="M300 222H340V276H388V222H428V802H300Z" fill="#0B1B2E"/>
+  <path id="part-2" d="M450 254H550A174 174 0 0 1 550 602H450V482H550A54 54 0 0 0 550 374H450Z" fill="#0B1B2E"/>
+  <path id="part-3" d="M508 624H640L734 802H580Z" fill="#0A84A0"/>
+</svg>

@@ -11,6 +11,11 @@ extension SelfTest {
             ("network", SelfTest.network),
             ("posture", SelfTest.posture),
             ("daemon", SelfTest.daemon),
+            ("guard", SelfTest.guardSuite),
+            ("web", SelfTest.web),
+            ("vault", SelfTest.vault),
+            ("ai", SelfTest.ai),
+            ("netscan", SelfTest.netscan),
         ]
     }
 }

@@ -105,6 +105,7 @@ enum HeadlessRunner {
         func sleep(_ s: Double) async { try? await Task.sleep(nanoseconds: UInt64(s * 1e9)) }
         var samples: [(t: Double, cpu: Double, mb: Double)] = []
         var scanDone = false
+        var scanEndedAt: Double?
         var lastC = ProcStats.cpuSeconds(), lastT = Date()
         while Date().timeIntervalSince(t0) < total {
             await sleep(1)
@@ -113,6 +114,7 @@ enum HeadlessRunner {
                 if case .idle = model.scanPhase { log("headless-check: starting simulated Quick Scan at \(Int(el)) s"); model.selection = .scan; model.startScan(.quick) }
                 scanDone = true
             }
+            if scanEndedAt == nil, scanDone, !model.isScanning { scanEndedAt = el }
             if case .finished = model.scanPhase, el > 12 {
                 model.scanPhase = .idle; model.selection = .dashboard
                 // Worst-case run: resolve the demo threat so the hero shows its calm, breathing state.
@@ -129,10 +131,17 @@ enum HeadlessRunner {
         let cpuTotal = ProcStats.cpuSeconds() - c0
         let idle = samples.filter { $0.t >= min(14, total * 0.5) }
         let idleCPU = idle.isEmpty ? 0 : idle.map(\.cpu).reduce(0, +) / Double(idle.count)
-        let mbFirst = idle.first?.mb ?? 0, mbLast = idle.last?.mb ?? 0
-        log(String(format: "headless-check: elapsed=%.1fs cpu_time=%.2fs avg_cpu=%.1f%% idle_cpu=%.2f%% peak_rss=%.1f MB footprint %.1f→%.1f MB during idle",
+        func median(_ v: [Double]) -> Double { let s = v.sorted(); return s.isEmpty ? 0 : s[s.count / 2] }
+        // Memory: settled footprint (median of the last 5 s) vs the median just after the demo scan ends
+        // (5 s window), so scan churn and its release don't count as growth.
+        let end = scanEndedAt ?? 0
+        let mbFirst = median(samples.filter { $0.t >= end && $0.t < end + 5 }.map(\.mb))
+        let mbLast = median(samples.filter { $0.t > (samples.last?.t ?? 0) - 5 }.map(\.mb))
+        let settledGrowth = mbLast - mbFirst
+        log(String(format: "headless-check: elapsed=%.1fs cpu_time=%.2fs avg_cpu=%.1f%% idle_cpu=%.2f%% peak_rss=%.1f MB footprint median after scan %.1f MB → settled %.1f MB",
                    elapsed, cpuTotal, cpuTotal / elapsed * 100, idleCPU, ProcStats.peakRSSMB(), mbFirst, mbLast))
-        let ok = idleCPU < 3 && (mbLast - mbFirst) < 15
+        DaemonLauncher.shared.stopChild()
+        let ok = idleCPU < 3 && settledGrowth < 15
         logOnscreenWindows()
         log("headless-check: \(ok ? "PASS" : "FAIL")")
         exit(ok ? 0 : 1)

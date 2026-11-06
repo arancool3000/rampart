@@ -94,6 +94,13 @@ public struct Matcher: Codable, Sendable {
     public var setMark: MarkSpec?
     public var threshold: Threshold?
     public var firstSeen: Bool?          // only the first time this image path matches this rule
+    /// Exec'd image carries com.apple.quarantine (or the event says detail["quarantined"] == "1").
+    public var quarantined: Bool?
+    /// The story already scores at least this much (corroboration from other rules).
+    public var storyMinScore: Int?
+    /// A risky clipboard copied from a browser (with `clip_tokens`) within the clipboard window shares at least
+    /// this fraction (and ≥2) of the command's token hashes. See `ClipboardFingerprint`.
+    public var clipboardOverlap: Double?
 }
 
 public struct Rule: Codable, Sendable {

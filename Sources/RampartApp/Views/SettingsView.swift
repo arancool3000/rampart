@@ -3,13 +3,14 @@ import AppKit
 import RampartShared
 
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case general = "General", protection = "Protection", scans = "Scans", notifications = "Notifications", updates = "Updates", privacy = "Privacy", account = "Account", advanced = "Advanced"
+    case general = "General", protection = "Protection", scans = "Scans", network = "Network", notifications = "Notifications",
+         updates = "Updates", privacy = "Privacy", account = "Account", advanced = "Advanced"
     var id: String { rawValue }
     var symbol: String {
         switch self {
         case .general: return "gearshape"; case .protection: return "shield.lefthalf.filled"; case .scans: return "magnifyingglass"
-        case .notifications: return "bell.badge"; case .updates: return "arrow.down.circle"; case .privacy: return "hand.raised"
-        case .account: return "person.crop.circle"; case .advanced: return "wrench.and.screwdriver"
+        case .network: return "network"; case .notifications: return "bell.badge"; case .updates: return "arrow.down.circle"
+        case .privacy: return "hand.raised"; case .account: return "person.crop.circle"; case .advanced: return "wrench.and.screwdriver"
         }
     }
 }
@@ -41,14 +42,23 @@ struct SettingsView: View {
     }
 }
 
+/// Binding into the daemon-owned settings; writes go through `setSettings`.
+extension AppModel {
+    func setting<T: Equatable>(_ kp: WritableKeyPath<RampartSettings, T>) -> Binding<T> {
+        Binding(get: { self.settings[keyPath: kp] }, set: { v in self.updateSettings { $0[keyPath: kp] = v } })
+    }
+}
+
 struct SettingsPane: View {
     let tab: SettingsTab
+    @Environment(AppModel.self) private var model
     var body: some View {
         Group {
             switch tab {
             case .general: GeneralSettings()
             case .protection: ProtectionSettings()
             case .scans: ScanSettings()
+            case .network: NetworkSettings()
             case .notifications: NotificationSettings()
             case .updates: UpdateSettings()
             case .privacy: PrivacySettings()
@@ -61,20 +71,35 @@ struct SettingsPane: View {
     }
 }
 
+/// Footer shown where a setting is held by the background service.
+struct ServiceFooter: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        switch model.mode {
+        case .live: Text("Saved by the Rampart background service.").foregroundStyle(.secondary)
+        case .demo: Text("Demo mode: changes here aren't saved.").foregroundStyle(.secondary)
+        case .connecting: Text("Connecting to the background service…").foregroundStyle(.secondary)
+        }
+    }
+}
+
 struct GeneralSettings: View {
     @AppStorage("general.launchAtLogin") private var launchAtLogin = true
     @AppStorage("general.showDock") private var showDock = true
+    @AppStorage(DaemonLauncher.keepRunningKey) private var keepProtecting = true
     @AppStorage("general.textSize") private var textSize = "default"
     var body: some View {
         Form {
             Section {
-                Toggle("Launch Rampart at login", isOn: $launchAtLogin)
+                Toggle("Open Rampart at login", isOn: $launchAtLogin)
+                Toggle("Keep protecting when Rampart is closed", isOn: $keepProtecting)
                 Toggle("Show in menu bar", isOn: Binding(get: { ChromeState.shared.menuBarInserted },
                                                           set: { ChromeState.shared.setMenuBarInserted($0) }))
                 Toggle("Show Dock icon", isOn: $showDock)
-                    .onChange(of: showDock) { _, v in NSApp.setActivationPolicy(v ? .regular : .accessory) }
+                    .onChange(of: showDock) { _, v in if !Headless.active { NSApp.setActivationPolicy(v ? .regular : .accessory) } }
             } footer: {
-                Text("When the Dock icon is hidden, open Rampart from the menu bar.").foregroundStyle(.secondary)
+                Text("With basic protection, closing Rampart leaves checking running in the background unless you turn that off here.")
+                    .foregroundStyle(.secondary)
             }
             Section {
                 Picker("Text size", selection: $textSize) {
@@ -88,62 +113,30 @@ struct GeneralSettings: View {
 
 struct ProtectionSettings: View {
     @Environment(AppModel.self) private var model
-    @AppStorage("prot.onOpen") private var onOpen = true
-    @AppStorage("prot.onDownload") private var onDownload = true
-    @AppStorage("prot.onMount") private var onMount = true
-    @AppStorage("prot.behaviour") private var behaviour = true
-    @AppStorage("prot.ransomware") private var ransomware = true
-    @AppStorage("prot.pup") private var pup = true
-    @AppStorage("prot.adware") private var adware = true
-    @AppStorage("prot.archives") private var archives = true
-    @AppStorage("prot.archiveDepth") private var archiveDepth = 3
-    @AppStorage("prot.quarantineDays") private var quarantineDays = 30
-    @AppStorage("prot.exclusions") private var exclusionsRaw = ""
-    @StateVar private var selectedExclusion: String?
     @StateVar private var confirmOff = false
-
-    private var exclusions: [String] { exclusionsRaw.split(separator: "\n").map(String.init) }
 
     var body: some View {
         Form {
             Section {
-                Toggle("Real-time protection", isOn: Binding(get: { model.status.realtimeOn && model.pausedUntil == nil },
+                Toggle("Real-time protection", isOn: Binding(get: { model.settings.realtimeOn && model.pausedUntil == nil },
                                                              set: { v in if v { model.setRealtime(true) } else { confirmOff = true } }))
-                    .disabled(model.mode == .live)
-                Toggle("Scan files when they open", isOn: $onOpen)
-                Toggle("Scan downloads", isOn: $onDownload)
-                Toggle("Scan USB and external drives when connected", isOn: $onMount)
-                Toggle("Behavior monitoring", isOn: $behaviour)
-                Toggle("Ransomware guard", isOn: $ransomware)
-            } header: { Text("Real-time") }
-            Section("Detection") {
-                Toggle("Detect potentially unwanted programs", isOn: $pup)
-                Toggle("Detect adware", isOn: $adware)
-                Toggle("Scan inside archives and disk images", isOn: $archives)
-                Stepper("Maximum archive depth: \(archiveDepth)", value: $archiveDepth, in: 1...8).disabled(!archives)
+                Toggle("Move threats to quarantine automatically", isOn: model.setting(\.autoQuarantine))
+                Toggle("Scan inside archives and disk images", isOn: model.setting(\.scanArchives))
+                Toggle("Ransomware early warning (decoy files)", isOn: model.setting(\.ransomwareCanaries))
+            } header: { Text("Real-time") } footer: { ServiceFooter() }
+            Section {
+                Toggle("Learn quietly for the first 48 hours", isOn: model.setting(\.learningMode))
+            } footer: {
+                Text("While learning, Rampart records how your apps normally behave and only interrupts you for clear threats.").foregroundStyle(.secondary)
             }
             Section {
-                List(selection: $selectedExclusion) {
-                    ForEach(exclusions, id: \.self) { e in
-                        Label((e as NSString).abbreviatingWithTildeInPath, systemImage: "folder").tag(e)
-                    }
+                LabeledContent("Not scanned") {
+                    Text(model.settings.exclusions.isEmpty ? "Nothing excluded" : "\(model.settings.exclusions.count) folder\(model.settings.exclusions.count == 1 ? "" : "s")")
+                        .foregroundStyle(.secondary)
                 }
-                .frame(minHeight: 90)
-                .overlay { if exclusions.isEmpty { Text("No exclusions").foregroundStyle(.secondary) } }
-                HStack {
-                    Button("Add…") { addExclusion() }
-                    Button("Remove") {
-                        if let s = selectedExclusion { exclusionsRaw = exclusions.filter { $0 != s }.joined(separator: "\n"); selectedExclusion = nil }
-                    }
-                    .disabled(selectedExclusion == nil)
-                }
+                Button("Edit in Rules…") { model.selection = .rules }
             } header: { Text("Exclusions") } footer: {
                 Label("Excluded items aren't checked. Only exclude things you trust.", systemImage: "info.circle").foregroundStyle(.secondary)
-            }
-            Section("Quarantine") {
-                Picker("Delete quarantined files automatically after", selection: $quarantineDays) {
-                    Text("7 days").tag(7); Text("30 days").tag(30); Text("90 days").tag(90); Text("Never").tag(0)
-                }
             }
         }
         .confirmationDialog("Turn off real-time protection?", isPresented: $confirmOff) {
@@ -152,53 +145,44 @@ struct ProtectionSettings: View {
             Button("Until I turn it on", role: .destructive) { model.setRealtime(false) }
         } message: { Text("Files won't be checked as they open. Choose how long:") }
     }
+}
 
-    private func addExclusion() {
-        let p = NSOpenPanel(); p.canChooseDirectories = true; p.canChooseFiles = true; p.allowsMultipleSelection = true
-        p.message = "Excluded items aren't checked. Only exclude things you trust."
-        guard p.runModal() == .OK else { return }
-        let new = Array(Set(exclusions + p.urls.map(\.path))).sorted()
-        exclusionsRaw = new.joined(separator: "\n")
-        for u in p.urls {
-            model.activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Excluded \((u.path as NSString).abbreviatingWithTildeInPath) from scans", outcome: "Rule added"), at: 0)
+struct ScanSettings: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Run a Quick Scan every day", isOn: model.setting(\.scheduledQuickScan))
+                Picker("Time", selection: model.setting(\.scheduledScanHour)) {
+                    ForEach(0..<24, id: \.self) { Text(String(format: "%02d:00", $0)).tag($0) }
+                }
+                .disabled(!model.settings.scheduledQuickScan)
+            } header: { Text("Scheduled scan") } footer: { ServiceFooter() }
         }
     }
 }
 
-struct ScanSettings: View {
-    @AppStorage("scan.schedule") private var schedule = "daily"
-    @AppStorage("scan.scheduleType") private var scheduleType = "quick"
-    @AppStorage("scan.scheduleHour") private var hour = 12
-    @AppStorage("scan.pauseBattery") private var pauseBattery = true
-    @AppStorage("scan.pauseLowPower") private var pauseLowPower = true
-    @AppStorage("scan.pauseFullscreen") private var pauseFullscreen = true
-    @AppStorage("scan.priority") private var priority = "balanced"
+struct NetworkSettings: View {
+    @Environment(AppModel.self) private var model
     var body: some View {
         Form {
-            Section("Scheduled scan") {
-                Picker("Repeat", selection: $schedule) { Text("Off").tag("off"); Text("Daily").tag("daily"); Text("Weekly").tag("weekly") }
-                Picker("Type", selection: $scheduleType) { Text("Quick Scan").tag("quick"); Text("Full Scan").tag("full") }.disabled(schedule == "off")
-                Picker("Time", selection: $hour) { ForEach(0..<24, id: \.self) { Text(String(format: "%02d:00", $0)).tag($0) } }.disabled(schedule == "off")
-            }
-            Section("Performance") {
-                Toggle("Pause scans on battery", isOn: $pauseBattery)
-                Toggle("Pause during Low Power Mode", isOn: $pauseLowPower)
-                Toggle("Pause during video calls or full-screen apps", isOn: $pauseFullscreen)
-                Picker("Scan priority", selection: $priority) { Text("Low impact").tag("low"); Text("Balanced").tag("balanced"); Text("Fast").tag("fast") }
+            Section {
+                Toggle("Block known malicious and phishing sites", isOn: Binding(get: { model.settings.webProtection },
+                                                                              set: { v in model.updateSettings { $0.webProtection = v }; Task { await model.setWebProtection(v) } }))
+                    .disabled(!model.webProtectionAvailable)
+                Toggle("Block trackers (privacy, not security)", isOn: model.setting(\.blockTrackers))
+                    .disabled(!model.webProtectionAvailable)
+            } header: { Text("Web protection") } footer: {
+                if !model.webProtectionAvailable {
+                    Text("Web protection needs the full system service, because it changes how your Mac looks up websites.").foregroundStyle(.secondary)
+                } else { ServiceFooter() }
             }
         }
     }
 }
 
 struct NotificationSettings: View {
-    @AppStorage("notif.threatStyle") private var threatStyle = "banner"
-    @AppStorage("notif.scanFinished") private var scanFinished = false
-    @AppStorage("notif.blocked") private var blocked = false
-    @AppStorage("notif.weekly") private var weekly = true
-    @AppStorage("notif.updates") private var updates = false
-    @AppStorage("notif.recommendations") private var recommendations = "weekly"
-    @AppStorage("notif.focus") private var focus = true
-    @AppStorage("notif.fullscreen") private var fullscreen = true
+    @Environment(AppModel.self) private var model
     @AppStorage("notif.sounds") private var sounds = false
     @StateVar private var authorized: Bool? = Notifier.shared.authorized
     var body: some View {
@@ -213,21 +197,11 @@ struct NotificationSettings: View {
                 }
             }
             Section {
-                LabeledContent("Threats") {
-                    Picker("", selection: $threatStyle) { Text("Banner").tag("banner"); Text("Alert").tag("alert") }.labelsHidden().fixedSize()
-                }
-                Toggle("Scan finished", isOn: $scanFinished)
-                Toggle("Blocked connections", isOn: $blocked)
-                Toggle("Weekly summary", isOn: $weekly)
-                Toggle("Updates", isOn: $updates)
-                Picker("Recommendations", selection: $recommendations) { Text("Off").tag("off"); Text("Weekly digest").tag("weekly") }
-            } header: { Text("Notify me about") } footer: {
-                Text("Threat notifications are always on. Other notifications are limited to one per hour.").foregroundStyle(.secondary)
-            }
-            Section("Quiet Mode") {
-                Toggle("Follow macOS Focus", isOn: $focus)
-                Toggle("Stay quiet during full-screen apps", isOn: $fullscreen)
+                Toggle("Threats Rampart blocks", isOn: model.setting(\.notifyThreats))
+                Toggle("Finished scans and updates", isOn: model.setting(\.notifyInfo))
                 Toggle("Play sounds", isOn: $sounds)
+            } header: { Text("Notify me about") } footer: {
+                Text("Everything other than threats is limited to one notification per hour.").foregroundStyle(.secondary)
             }
         }
     }
@@ -235,19 +209,15 @@ struct NotificationSettings: View {
 
 struct UpdateSettings: View {
     @Environment(AppModel.self) private var model
-    @AppStorage("upd.definitions") private var defs = true
-    @AppStorage("upd.app") private var app = true
-    @AppStorage("upd.beta") private var beta = false
     var body: some View {
         Form {
             Section {
-                Toggle("Update definitions automatically (hourly)", isOn: $defs)
-                Toggle("Update Rampart automatically", isOn: $app)
-                Toggle("Beta updates", isOn: $beta)
-            }
+                Toggle("Update definitions automatically", isOn: model.setting(\.autoUpdate))
+            } footer: { ServiceFooter() }
             Section {
                 LabeledContent("Definitions", value: model.status.signatureVersion == "0" ? "—" : model.status.signatureVersion)
                 LabeledContent("Apple XProtect", value: model.status.xprotectVersion ?? "—")
+                if model.blocklistDomains > 0 { LabeledContent("Blocked domains", value: Fmt.count(model.blocklistDomains)) }
                 LabeledContent("App version", value: Product.version)
                 HStack {
                     Text("Last checked \(Fmt.ago(model.definitionsUpdated).lowercased())").foregroundStyle(.secondary)
@@ -261,25 +231,14 @@ struct UpdateSettings: View {
 }
 
 struct PrivacySettings: View {
-    @AppStorage("priv.analytics") private var analytics = false
-    @AppStorage("priv.crash") private var crash = "ask"
-    @AppStorage("priv.reputation") private var reputation = true
-    @AppStorage("priv.samples") private var samples = false
     var body: some View {
         Form {
             Section {
-                Toggle("Share anonymous usage statistics", isOn: $analytics)
-                Picker("Crash reports", selection: $crash) { Text("Ask each time").tag("ask"); Text("Always send").tag("always"); Text("Never send").tag("never") }
-                Toggle("Cloud reputation lookups", isOn: $reputation)
-                Toggle("Automatically submit samples of new threats", isOn: $samples)
-            } footer: {
-                Text("Reputation lookups send file fingerprints (SHA-256) only, never file contents or names.").foregroundStyle(.secondary)
-            }
-            Section {
-                Button("View What Rampart Sends") {
-                    NSWorkspace.shared.open(Paths.userRoot.appendingPathComponent("Telemetry"))
-                }
-            }
+                Label("Rampart doesn't collect usage statistics.", systemImage: "chart.bar.xaxis")
+                Label("Scanning happens on this Mac. Your files are never uploaded.", systemImage: "internaldrive")
+                Label("Definition updates download public threat lists; nothing about you is sent.", systemImage: "arrow.down.circle")
+                Label("The password breach check sends only the first 5 characters of a fingerprint.", systemImage: "key")
+            } header: { Text("What leaves your Mac") }
         }
     }
 }
@@ -307,34 +266,36 @@ struct AccountSettings: View {
 
 struct AdvancedSettings: View {
     @Environment(AppModel.self) private var model
-    @AppStorage("adv.adminToDisable") private var adminToDisable = false
-    @AppStorage("adv.touchID") private var touchID = false
     @StateVar private var confirmReset = false
     @StateVar private var showUninstall = false
+    @StateVar private var showInstall = false
     var body: some View {
         Form {
-            Section {
-                Toggle("Require an administrator password to turn off protection", isOn: $adminToDisable)
-                Toggle("Lock settings with Touch ID", isOn: $touchID)
+            Section("Protection service") {
+                LabeledContent("Running as") { ProtectionSourceLabel() }
+                if model.source == .basic {
+                    Button("Install Full Protection…") { showInstall = true }
+                }
             }
+            HealthPanel()
+            Section {
+                Toggle("Developer mode (fewer alerts for build tools)", isOn: model.setting(\.developerMode))
+            } footer: { ServiceFooter() }
             Section("Diagnostics") {
-                LabeledContent("Background service") {
-                    Text(model.mode == .live ? "Connected (\(model.client.connectedPath ?? ""))" : "Not running · demo mode")
-                        .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Button("Open Logs Folder") {
+                    let dir = model.source == .basic ? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Rampart") : URL(fileURLWithPath: "/Library/Logs/Rampart")
+                    NSWorkspace.shared.open(dir)
                 }
-                ForEach(model.status.sources.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
-                    LabeledContent(k) { StatusLabel(text: v ? "Running" : "Stopped", symbol: v ? "checkmark.circle.fill" : "minus.circle", tint: v ? .green : .secondary) }
-                }
-                Button("Open Logs Folder") { NSWorkspace.shared.open(URL(fileURLWithPath: "/Library/Logs/Rampart")) }
             }
             Section {
-                Button("Reset All Rules…", role: .destructive) { confirmReset = true }
+                Button("Remove All Allow Rules…", role: .destructive) { confirmReset = true }.disabled(model.allowRules.isEmpty)
                 Button("Uninstall Rampart…") { showUninstall = true }
             }
         }
-        .confirmationDialog("Reset all rules?", isPresented: $confirmReset) {
-            Button("Reset", role: .destructive) { model.allowRules.removeAll(); model.ignoredChecks.removeAll() }
-        } message: { Text("Every allowed file, developer and folder will be removed. This can't be undone.") }
+        .sheet(isPresented: $showInstall) { InstallFullProtectionSheet() }
+        .confirmationDialog("Remove all allow rules?", isPresented: $confirmReset) {
+            Button("Remove All", role: .destructive) { Task { for r in model.allowRules { await model.removeAllowRule(r) } } }
+        } message: { Text("Every allowed file, developer and folder will be checked normally again. This can't be undone.") }
         .alert("Uninstall Rampart", isPresented: $showUninstall) {
             Button("Cancel", role: .cancel) {}
             Button("Copy Uninstall Command") {
@@ -344,5 +305,102 @@ struct AdvancedSettings: View {
         } message: {
             Text("This removes the app, its background protection and your rules. Quarantined files will be deleted. Paste the copied command into Terminal to finish; macOS will ask for your password.")
         }
+    }
+}
+
+struct ProtectionSourceLabel: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        switch (model.mode, model.source) {
+        case (.live, .systemService): StatusLabel(text: "System service (full protection)", symbol: "checkmark.shield.fill", tint: .statusProtected)
+        case (.live, _): StatusLabel(text: "Basic protection (no install)", symbol: "shield.lefthalf.filled", tint: .rampartTeal)
+        case (.demo, _): StatusLabel(text: "Not running · demo mode", symbol: "sparkles.rectangle.stack", tint: .statusInfo)
+        case (.connecting, _): StatusLabel(text: "Starting…", symbol: "hourglass", tint: .secondary)
+        }
+    }
+}
+
+/// The daemon's own resource use, refreshed every 3 s while visible.
+struct HealthPanel: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        Section("Rampart health") {
+            if let h = model.health {
+                LabeledContent("Version", value: "\(h.version) · \(h.mode == "user" ? "basic" : "system") mode")
+                LabeledContent("Running for", value: Fmt.duration(h.uptimeSeconds))
+                LabeledContent("CPU") { meter(h.cpuPercent, max: 100, text: String(format: "%.1f%%", h.cpuPercent)) }
+                LabeledContent("Memory") { meter(h.residentMB, max: 500, text: String(format: "%.0f MB", h.residentMB)) }
+                ForEach(h.sources.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
+                    LabeledContent(k) { StatusLabel(text: v ? "Running" : "Not available", symbol: v ? "checkmark.circle.fill" : "minus.circle", tint: v ? .green : .secondary) }
+                }
+                if !h.lastErrors.isEmpty {
+                    DisclosureGroup("Recent problems (\(h.lastErrors.count))") {
+                        ForEach(h.lastErrors, id: \.self) { Text($0).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled) }
+                    }
+                }
+            } else {
+                Text(model.mode == .live ? "This version of the background service doesn't report its health." : "Health appears when the background service is running.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                await model.refreshHealth()
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+    }
+
+    private func meter(_ v: Double, max: Double, text: String) -> some View {
+        HStack(spacing: Spacing.s) {
+            Gauge(value: min(v, max), in: 0...max) { EmptyView() }
+                .gaugeStyle(.accessoryLinearCapacity).tint(Color.rampartTeal).frame(width: 90)
+            Text(text).monospacedDigit().frame(minWidth: 60, alignment: .trailing)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(text)
+    }
+}
+
+/// Calm upgrade path from basic protection to the full system service.
+struct InstallFullProtectionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateVar private var copied = false
+    private var command: String {
+        let scripts = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("scripts/install.sh").path
+        return FileManager.default.fileExists(atPath: scripts) ? "sudo \"\(scripts)\"" : "sudo ./scripts/install.sh"
+    }
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.l) {
+            HStack(spacing: Spacing.m) {
+                IconBadge(symbol: "shield.lefthalf.filled", tint: .rampartTeal, size: 44)
+                VStack(alignment: .leading) {
+                    Text("Install full protection").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                    Text("Optional. Basic protection keeps working either way.").foregroundStyle(.secondary)
+                }
+            }
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                Text("The system service adds:").font(.headline)
+                Label("Web protection that blocks malicious and phishing sites for every app", systemImage: "globe")
+                Label("System-wide monitoring of new processes and startup items", systemImage: "waveform.path.ecg")
+                Label("Protection that starts before you log in", systemImage: "power")
+            }
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                Text("How to install").font(.headline)
+                Text("Open Rampart.pkg from the Rampart disk image, or run this in Terminal. macOS will ask for an administrator password; Rampart never sees it.")
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Text(command).font(.callout.monospaced()).textSelection(.enabled)
+                        .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    Button(copied ? "Copied" : "Copy") {
+                        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(command, forType: .string); copied = true
+                    }
+                }
+            }
+            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+        }
+        .padding(Spacing.xl)
+        .frame(width: 540)
     }
 }
