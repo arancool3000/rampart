@@ -34,7 +34,7 @@ final class AIChatModel {
     }
 
     struct Message: Identifiable, Equatable {
-        let id = UUID()
+        var id = UUID()
         var isUser: Bool
         var title: String? = nil
         var payload: Payload
@@ -49,7 +49,13 @@ final class AIChatModel {
 
     var messages: [Message] = []
     var draft = ""
-    var mode: Mode = .ask
+    var mode: Mode = .ask { didSet { if mode != oldValue { updateCurrent { $0.mode = self.mode.rawValue } } } }
+    /// All chats (redacted text only), newest first. Persisted encrypted when "Keep chat history" is on.
+    var chats: [ChatRecord] = []
+    var currentID: UUID?
+    var search = ""
+    var keepHistory: Bool
+    var unreadableChats = 0
     var isSending = false
     var enabled: Bool
     var keyStatus: GeminiKeyStore.Status = .missing
@@ -57,6 +63,7 @@ final class AIChatModel {
     var modelID: String
 
     @ObservationIgnored let settings = AISettings.shared
+    @ObservationIgnored let store = ChatStore()
     @ObservationIgnored lazy var service = AIService(settings: settings)
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var revealTask: Task<Void, Never>?
@@ -64,7 +71,122 @@ final class AIChatModel {
     init() {
         enabled = AISettings.shared.enabled
         modelID = AISettings.shared.modelID
+        keepHistory = AISettings.shared.keepChatHistory
         refreshKey()
+        if keepHistory {
+            chats = store.loadAll()
+            unreadableChats = store.unreadable.count
+        }
+    }
+
+    // MARK: Chats
+
+    var current: ChatRecord? { chats.first { $0.id == currentID } }
+
+    var filteredGroups: [(ChatGroup, [ChatRecord])] {
+        ChatGroup.grouped(chats.filter { $0.matches(search) })
+    }
+
+    /// Starts a fresh, empty conversation (the record is created on the first message).
+    func newChat(mode: Mode = .ask) {
+        cancel(); revealTask?.cancel()
+        currentID = nil; messages = []; draft = ""
+        self.mode = mode
+    }
+
+    func select(_ id: UUID?) {
+        guard let id, id != currentID, let c = chats.first(where: { $0.id == id }) else { return }
+        cancel(); revealTask?.cancel()
+        currentID = id
+        messages = c.messages.map(Self.message(from:))
+        mode = Mode(rawValue: c.mode) ?? .ask
+        draft = ""
+    }
+
+    func rename(_ id: UUID, to title: String) {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        update(id) { $0.title = String(t.prefix(80)); $0.titleIsCustom = true }
+    }
+
+    func togglePin(_ id: UUID) { update(id) { $0.pinned.toggle() } }
+
+    func delete(_ id: UUID) {
+        if id == currentID { newChat() }
+        chats.removeAll { $0.id == id }
+        store.delete(id)
+    }
+
+    func deleteAllChats() {
+        newChat()
+        chats = []
+        store.deleteAll()
+        unreadableChats = 0
+    }
+
+    func setKeepHistory(_ on: Bool) {
+        settings.keepChatHistory = on; keepHistory = on
+        if on { chats.forEach { try? store.save($0) } }
+    }
+
+    private func update(_ id: UUID, touch: Bool = false, _ change: (inout ChatRecord) -> Void) {
+        guard let i = chats.firstIndex(where: { $0.id == id }) else { return }
+        change(&chats[i])
+        if touch { chats[i].updated = Date() }
+        if keepHistory { try? store.save(chats[i]) }
+    }
+    private func updateCurrent(_ change: (inout ChatRecord) -> Void) { if let id = currentID { update(id, change) } }
+
+    /// Ensures there is a record for the conversation, titling it from the first (redacted) question.
+    private func ensureChat(firstText: String, title: String?) -> UUID {
+        if let id = currentID, chats.contains(where: { $0.id == id }) { return id }
+        let t: String
+        if let title { t = title } else {
+            switch mode {
+            case .ask: t = ChatTitle.make(from: firstText)
+            case .scam: t = "Scam check: " + ChatTitle.make(from: firstText, maxLength: 28)
+            case .link: t = "Link: " + (URLComponents(string: firstText.contains("://") ? firstText : "https://" + firstText)?.host ?? ChatTitle.make(from: firstText, maxLength: 30))
+            }
+        }
+        let c = ChatRecord(title: t, mode: mode.rawValue)
+        chats.insert(c, at: 0)
+        currentID = c.id
+        if keepHistory { try? store.save(c) }
+        return c.id
+    }
+
+    private func record(_ m: Message, in chatID: UUID) {
+        update(chatID, touch: true) { $0.messages.append(Self.stored(from: m)) }
+    }
+
+    static func stored(from m: Message) -> StoredChatMessage {
+        var s = StoredChatMessage(id: m.id, isUser: m.isUser, date: m.date, kind: .text, title: m.title, text: mainText(m.payload),
+                                  sent: m.sent, redactionSummary: m.redactionSummary, meta: m.meta)
+        switch m.payload {
+        case .text: s.kind = .text
+        case .error: s.kind = .error
+        case .reply(let r): s.kind = .reply; s.reply = r
+        case .scam(let x): s.kind = .scam; s.scam = x
+        case .url(let x): s.kind = .url; s.url = x
+        case .detection(let x): s.kind = .detection; s.detection = x
+        case .plan(let x): s.kind = .plan; s.plan = x
+        }
+        return s
+    }
+
+    static func message(from s: StoredChatMessage) -> Message {
+        let p: Payload
+        switch s.kind {
+        case .reply: p = s.reply.map(Payload.reply) ?? .text(s.text)
+        case .scam: p = s.scam.map(Payload.scam) ?? .text(s.text)
+        case .url: p = s.url.map(Payload.url) ?? .text(s.text)
+        case .detection: p = s.detection.map(Payload.detection) ?? .text(s.text)
+        case .plan: p = s.plan.map(Payload.plan) ?? .text(s.text)
+        case .error: p = .error(s.text)
+        case .text: p = .text(s.text)
+        }
+        return Message(id: s.id, isUser: s.isUser, title: s.title, payload: p, date: s.date, sent: s.sent,
+                       redactionSummary: s.redactionSummary, meta: s.meta, revealed: .max)
     }
 
     var pasteCheckEnabled: Bool {
@@ -143,7 +265,8 @@ final class AIChatModel {
     }
 
     func explain(_ d: Detection) {
-        run(userText: "Explain “\(d.name)”", title: "Detection explained", prepared: ExplainDetection.prepare(d, service: service)) { .detection($0) }
+        newChat()
+        run(userText: "Explain “\(d.name)”", title: "Detection explained", prepared: ExplainDetection.prepare(d, service: service), chatTitle: "Explain: \(d.name)") { .detection($0) }
     }
 
     func planPosture(_ checks: [PostureCheck]) {
@@ -151,24 +274,35 @@ final class AIChatModel {
     }
 
     func cancel() { task?.cancel(); task = nil; isSending = false }
-    func clear() { cancel(); revealTask?.cancel(); messages = [] }
 
-    private func run<O: Sendable>(userText: String, title: String?, prepared: AIPrepared<O>, wrap: @escaping (O) -> Payload) {
+
+    private func run<O: Sendable>(userText: String, title: String?, prepared: AIPrepared<O>, chatTitle: String? = nil, wrap: @escaping (O) -> Payload) {
         guard enabled else { return }
-        messages.append(Message(isUser: true, payload: .text(userText), sent: prepared.disclosure, redactionSummary: prepared.redaction.summary))
+        // Only redacted text is shown, kept and stored; the raw input is dropped here.
+        let shown = service.redactor.redact(userText).text
+        let chatID = ensureChat(firstText: shown, title: chatTitle)
+        let userMsg = Message(isUser: true, payload: .text(shown), sent: prepared.disclosure, redactionSummary: prepared.redaction.summary)
+        messages.append(userMsg)
+        record(userMsg, in: chatID)
         isSending = true
         let svc = service
         task = Task { [weak self] in
             do {
                 let out = try await svc.run(prepared)
-                guard let self, !Task.isCancelled else { return }
+                guard let self, !Task.isCancelled, self.currentID == chatID else { self?.isSending = false; return }
                 let meta = "\(out.model) · \(String(format: "%.1f", out.latency)) s · ~\(out.estimatedTokens) tokens estimated" + (out.usage?.totalTokenCount.map { ", \($0) used" } ?? "")
-                self.append(Message(isUser: false, title: title, payload: wrap(out.output), sent: out.sentText, redactionSummary: out.redactionSummary, meta: meta, revealed: 0))
+                let m = Message(isUser: false, title: title, payload: wrap(out.output), sent: out.sentText, redactionSummary: out.redactionSummary, meta: meta, revealed: 0)
+                self.record(m, in: chatID)
+                self.append(m)
             } catch {
                 guard let self else { return }
                 if case GeminiError.noKey(let m) = error, m == GeminiKeyStore.KeyError.interactionNotAllowed.description { self.needsKeychainPermission = true }
                 let text = (error as? GeminiError)?.description ?? error.localizedDescription
-                if (error as? GeminiError) != .cancelled { self.append(Message(isUser: false, payload: .error(text))) }
+                if (error as? GeminiError) != .cancelled, self.currentID == chatID {
+                    let m = Message(isUser: false, payload: .error(text))
+                    self.record(m, in: chatID)
+                    self.append(m)
+                }
             }
             self?.isSending = false
         }

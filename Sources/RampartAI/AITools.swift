@@ -145,6 +145,9 @@ public struct AssistantReply: Codable, Hashable, Sendable {
     public var relatedCheckIDs: [String]
     public var onTopic: Bool
     public var refused: Bool
+    public init(answer: String, steps: [String], relatedCheckIDs: [String], onTopic: Bool, refused: Bool) {
+        self.answer = answer; self.steps = steps; self.relatedCheckIDs = relatedCheckIDs; self.onTopic = onTopic; self.refused = refused
+    }
 }
 
 public struct ChatTurn: Hashable, Sendable {

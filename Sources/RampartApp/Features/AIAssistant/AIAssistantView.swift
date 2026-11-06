@@ -14,8 +14,44 @@ struct AIAssistantView: View {
     @StateVar private var confirmRemoveKey = false
     @StateVar private var showPreview = true
     @StateVar private var keyError: String?
+    @StateVar private var confirmDeleteAll = false
 
     var body: some View {
+        HStack(spacing: 0) {
+            if chat.enabled && chat.keyStatus == .present {
+                ChatListColumn(chat: chat)
+                    .frame(width: 250)
+                Divider()
+            }
+            conversation
+        }
+        .navigationTitle("AI Assistant")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                if chat.enabled && chat.keyStatus == .present {
+                    Button { chat.newChat() } label: { Label("New Chat", systemImage: "square.and.pencil") }
+                        .keyboardShortcut("n", modifiers: .command)
+                        .help("New Chat (⌘N)")
+                }
+            }
+        }
+        .onAppear { chat.refreshKey() }
+        .alert("Turn on AI Assistant?", isPresented: $confirmEnable) {
+            Button("Turn On") { chat.setEnabled(true) }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text(verbatim: AISettings.disclosure) }
+        .alert("Remove the Gemini API key?", isPresented: $confirmRemoveKey) {
+            Button("Remove", role: .destructive) { do { try chat.removeKey() } catch { keyError = "\(error)" } }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("AI features stop working until you add a key again. Nothing else changes.") }
+        .alert("Delete all chats?", isPresented: $confirmDeleteAll) {
+            Button("Delete All", role: .destructive) { chat.deleteAllChats() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("Every saved conversation and its encryption key are permanently removed from this Mac.") }
+        .sheet(isPresented: $showKeySheet) { KeySheet(chat: chat, isPresented: $showKeySheet) }
+    }
+
+    private var conversation: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -27,7 +63,13 @@ struct AIAssistantView: View {
                             keyMissingCard
                         } else {
                             if chat.needsKeychainPermission { keychainPermissionCard }
-                            if chat.messages.isEmpty { suggestions }
+                            if chat.messages.isEmpty {
+                                if chat.unreadableChats > 0 {
+                                    Label("\(chat.unreadableChats) saved chat\(chat.unreadableChats == 1 ? "" : "s") couldn't be opened (damaged or changed outside RamPart) and were left untouched.", systemImage: "exclamationmark.lock")
+                                        .font(.callout).foregroundStyle(.secondary)
+                                }
+                                suggestions
+                            }
                             ForEach(chat.messages) { m in
                                 MessageRow(message: m, reduceMotion: reduceMotion).id(m.id)
                             }
@@ -42,24 +84,7 @@ struct AIAssistantView: View {
             }
             if chat.enabled && chat.keyStatus == .present { composer }
         }
-        .navigationTitle("AI Assistant")
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                if !chat.messages.isEmpty {
-                    Button { chat.clear() } label: { Label("Clear Conversation", systemImage: "trash") }
-                }
-            }
-        }
-        .onAppear { chat.refreshKey() }
-        .alert("Turn on AI Assistant?", isPresented: $confirmEnable) {
-            Button("Turn On") { chat.setEnabled(true) }
-            Button("Cancel", role: .cancel) {}
-        } message: { Text(verbatim: AISettings.disclosure) }
-        .alert("Remove the Gemini API key?", isPresented: $confirmRemoveKey) {
-            Button("Remove", role: .destructive) { do { try chat.removeKey() } catch { keyError = "\(error)" } }
-            Button("Cancel", role: .cancel) {}
-        } message: { Text("AI features stop working until you add a key again. Nothing else changes.") }
-        .sheet(isPresented: $showKeySheet) { KeySheet(chat: chat, isPresented: $showKeySheet) }
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: Header
@@ -90,6 +115,10 @@ struct AIAssistantView: View {
                     Divider()
                     Toggle("Check pasted Terminal commands", isOn: Binding(get: { chat.pasteCheckEnabled }, set: { chat.pasteCheckEnabled = $0 }))
                         .disabled(!chat.enabled)
+                    Divider()
+                    Toggle("Keep chat history", isOn: Binding(get: { chat.keepHistory }, set: { chat.setKeepHistory($0) }))
+                    Button("Delete All Chats…", role: .destructive) { confirmDeleteAll = true }
+                        .disabled(chat.chats.isEmpty)
                 } label: { Label("Settings", systemImage: "gearshape") }
                 .menuStyle(.borderlessButton).fixedSize()
             }
@@ -481,5 +510,114 @@ private struct KeySheet: View {
         }
         .padding(Spacing.xl)
         .frame(width: 440)
+    }
+}
+
+
+// MARK: - Chat list column
+
+private struct ChatListColumn: View {
+    @Bindable var chat: AIChatModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateVar private var renaming: ChatRecord?
+    @StateVar private var renameText = ""
+    @StateVar private var deleting: ChatRecord?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            Button { chat.newChat() } label: {
+                Label("New Chat", systemImage: "square.and.pencil").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(GlowButtonStyle())
+            .accessibilityHint("Starts a new conversation. Shortcut Command N.")
+            .padding(.horizontal, Spacing.m).padding(.top, Spacing.m)
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                TextField("Search chats", text: $chat.search).textFieldStyle(.plain)
+                if !chat.search.isEmpty {
+                    Button { chat.search = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                        .buttonStyle(.plain).accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .padding(.horizontal, Spacing.m)
+
+            let groups = chat.filteredGroups
+            if groups.isEmpty {
+                VStack(spacing: Spacing.s) {
+                    Image(systemName: chat.search.isEmpty ? "bubble.left.and.bubble.right" : "magnifyingglass").font(.title2).foregroundStyle(.tertiary)
+                    Text(chat.search.isEmpty ? "No chats yet" : "No matching chats").font(.callout).foregroundStyle(.secondary)
+                    if !chat.keepHistory { Text("History is off: chats aren't saved.").font(.caption).foregroundStyle(.tertiary) }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: Binding(get: { chat.currentID }, set: { chat.select($0) })) {
+                    ForEach(groups, id: \.0) { group, items in
+                        Section(group.rawValue) {
+                            ForEach(items) { c in
+                                ChatRow(chat: c, selected: c.id == chat.currentID)
+                                    .tag(c.id)
+                                    .contextMenu { menu(for: c) }
+                            }
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: chat.chats.map(\.id))
+                .onDeleteCommand { if let c = chat.current { deleting = c } }
+                .accessibilityLabel("Chats")
+            }
+            if !chat.keepHistory && !chat.chats.isEmpty {
+                Label("Not saved: history is off", systemImage: "clock.badge.xmark").font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, Spacing.m).padding(.bottom, Spacing.s)
+            }
+        }
+        .background(.ultraThinMaterial.opacity(0.5))
+        .alert("Rename Chat", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("Title", text: $renameText)
+            Button("Rename") { if let r = renaming { chat.rename(r.id, to: renameText) }; renaming = nil }
+            Button("Cancel", role: .cancel) { renaming = nil }
+        }
+        .confirmationDialog("Delete “\(deleting?.title ?? "")”?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
+            Button("Delete Chat", role: .destructive) { if let d = deleting { chat.delete(d.id) }; deleting = nil }
+            Button("Cancel", role: .cancel) { deleting = nil }
+        } message: { Text("This conversation is permanently removed from this Mac.") }
+    }
+
+    @ViewBuilder private func menu(for c: ChatRecord) -> some View {
+        Button(c.pinned ? "Unpin" : "Pin") { chat.togglePin(c.id) }
+        Button("Rename…") { renameText = c.title; renaming = c }
+        Divider()
+        Button("Delete…", role: .destructive) { deleting = c }
+    }
+}
+
+private struct ChatRow: View {
+    let chat: ChatRecord
+    let selected: Bool
+    private var symbol: String {
+        switch chat.mode {
+        case AIChatModel.Mode.scam.rawValue: return "envelope.badge.shield.half.filled"
+        case AIChatModel.Mode.link.rawValue: return "link"
+        default: return chat.title.hasPrefix("Explain:") ? "questionmark.bubble" : "bubble.left"
+        }
+    }
+    var body: some View {
+        HStack(spacing: Spacing.s) {
+            Image(systemName: symbol).foregroundStyle(Color.rampartTeal).frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(verbatim: chat.title).font(.callout.weight(selected ? .semibold : .regular)).lineLimit(1)
+                Text(Fmt.dayTime(chat.updated)).font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if chat.pinned { Image(systemName: "pin.fill").font(.caption2).foregroundStyle(.secondary).accessibilityHidden(true) }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(chat.title), \(chat.mode)\(chat.pinned ? ", pinned" : ""), \(Fmt.dayTime(chat.updated))")
+        .accessibilityHint("Opens this conversation. Use the context menu to pin, rename or delete.")
     }
 }

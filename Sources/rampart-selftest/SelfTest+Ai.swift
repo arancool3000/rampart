@@ -44,6 +44,7 @@ extension SelfTest {
         aiPaste()
         aiConsent()
         aiKeychain()
+        aiChatStore()
         aiLive()
     }
 
@@ -267,6 +268,66 @@ extension SelfTest {
         check(!fresh.enabled && fresh.modelID == GeminiModel.fast.id && fresh.strongModelID == GeminiModel.strong.id, "opt-in: off by default, default models")
         fresh.modelID = "bad/model?x"
         check(fresh.modelID == GeminiModel.fast.id, "settings: invalid model id ignored")
+    }
+
+    static func aiChatStore() {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("com.rampart.test.chats-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = ChatStore(directory: dir)
+        let reply = AssistantReply(answer: "Turn on FileVault in Privacy & Security.", steps: ["Open System Settings"], relatedCheckIDs: ["filevault"], onTopic: true, refused: false)
+        var c = ChatRecord(title: ChatTitle.make(from: "How do I turn on FileVault?"), mode: "Scam Check", messages: [
+            StoredChatMessage(isUser: true, kind: .text, text: "How do I turn on FileVault? mail [EMAIL]"),
+            StoredChatMessage(isUser: false, kind: .reply, text: reply.answer, reply: reply, sent: "<<<DATA question x", redactionSummary: "1 email address", meta: "m"),
+        ])
+        check((try? store.save(c)) != nil, "chats: save")
+        let fm = FileManager.default
+        let keyPerm = (try? fm.attributesOfItem(atPath: dir.appendingPathComponent("chats.key").path))?[.posixPermissions] as? Int
+        let dirPerm = (try? fm.attributesOfItem(atPath: dir.path))?[.posixPermissions] as? Int
+        check(keyPerm == 0o600 && dirPerm == 0o700, "chats: key 0600, folder 0700")
+        let raw = fm.contents(atPath: dir.appendingPathComponent(c.id.uuidString + ".chat").path) ?? Data()
+        check(!raw.isEmpty && raw.range(of: Data("FileVault".utf8)) == nil && raw.range(of: Data("Scam Check".utf8)) == nil, "chats: ciphertext on disk")
+        let fresh = ChatStore(directory: dir)
+        let back = fresh.loadAll()
+        check(back.count == 1 && back.first == c, "chats: encrypt round trip")
+        // Tamper: flip one byte.
+        var bad = raw; bad[bad.count / 2] ^= 0x01
+        try? bad.write(to: dir.appendingPathComponent(c.id.uuidString + ".chat"))
+        check(ChatStore(directory: dir).loadAll().isEmpty, "chats: tampered file rejected")
+        let s2 = ChatStore(directory: dir); _ = s2.loadAll()
+        check(s2.unreadable.count == 1, "chats: tampered file reported")
+        // Swap: a valid file renamed to another chat's id is rejected (id is authenticated).
+        try? raw.write(to: dir.appendingPathComponent(c.id.uuidString + ".chat"))
+        let otherID = UUID()
+        try? raw.write(to: dir.appendingPathComponent(otherID.uuidString + ".chat"))
+        check(ChatStore(directory: dir).loadAll().map(\.id) == [c.id], "chats: swapped file rejected")
+        try? fm.removeItem(at: dir.appendingPathComponent(otherID.uuidString + ".chat"))
+        // Wrong key: replacing the key makes old chats unreadable.
+        c.pinned = true; try? store.save(c)
+        check(ChatStore(directory: dir).loadAll().first?.pinned == true, "chats: update persisted")
+        store.delete(c.id)
+        check(ChatStore(directory: dir).loadAll().isEmpty, "chats: delete")
+        try? store.save(c); store.deleteAll()
+        check(!fm.fileExists(atPath: dir.appendingPathComponent("chats.key").path) && ChatStore(directory: dir).loadAll().isEmpty, "chats: delete all removes key")
+
+        // Titles.
+        check(ChatTitle.make(from: "How do I turn on FileVault?") == "How do I turn on FileVault", "title: simple question")
+        check(ChatTitle.make(from: "hey, can you tell me whether this email from my bank is a scam? It says urgent") == "Whether this email from my bank is a scam", "title: filler + first sentence")
+        let long = ChatTitle.make(from: "What is the safest way to configure the macOS application firewall for a home network setup")
+        check(long.count <= 43 && long.hasSuffix("…") && !long.contains("  "), "title: truncated on word boundary")
+        check(ChatTitle.make(from: "   ") == "New Chat", "title: empty")
+
+        // Grouping.
+        var cal = Calendar(identifier: .gregorian); cal.timeZone = TimeZone(identifier: "UTC")!
+        let now = ISO8601DateFormatter().date(from: "2026-11-06T15:00:00Z")!
+        func at(_ s: String, pinned: Bool = false) -> ChatRecord { ChatRecord(updated: ISO8601DateFormatter().date(from: s)!, pinned: pinned) }
+        let g = ChatGroup.grouped([at("2026-11-06T09:00:00Z"), at("2026-11-05T23:00:00Z"), at("2026-11-01T10:00:00Z"),
+                                   at("2026-10-01T10:00:00Z"), at("2026-09-01T10:00:00Z", pinned: true)], now: now, calendar: cal)
+        check(g.map(\.0) == [.pinned, .today, .yesterday, .previous7, .older] && g.allSatisfy { $0.1.count == 1 }, "grouping: buckets")
+        check(ChatGroup.of(at("2026-10-30T00:00:00Z"), now: now, calendar: cal) == .previous7 && ChatGroup.of(at("2026-10-29T23:59:00Z"), now: now, calendar: cal) == .older, "grouping: 7-day edge")
+
+        // Search.
+        let rec = ChatRecord(title: "Firewall", messages: [StoredChatMessage(isUser: false, kind: .reply, text: "x", reply: reply)])
+        check(rec.matches("firewall") && rec.matches("PRIVACY & security") && rec.matches("open system") && !rec.matches("bitcoin") && rec.matches(""), "search: titles and messages")
     }
 
     static func aiKeychain() {

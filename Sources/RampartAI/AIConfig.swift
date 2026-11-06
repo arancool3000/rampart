@@ -32,7 +32,7 @@ public struct GeminiModel: Hashable, Codable, Sendable, Identifiable {
 public final class AISettings: @unchecked Sendable {
     public static let shared = AISettings()
     private let defaults: UserDefaults
-    private enum K { static let enabled = "ai.enabled", consentDate = "ai.consentDate", model = "ai.model", strongModel = "ai.strongModel", paste = "ai.pasteCheck" }
+    private enum K { static let enabled = "ai.enabled", consentDate = "ai.consentDate", model = "ai.model", strongModel = "ai.strongModel", paste = "ai.pasteCheck", history = "ai.keepHistory" }
 
     public init(defaults: UserDefaults = UserDefaults(suiteName: Product.bundlePrefix + ".ai") ?? .standard) { self.defaults = defaults }
 
@@ -51,6 +51,12 @@ public final class AISettings: @unchecked Sendable {
     public var pasteCheckEnabled: Bool {
         get { enabled && defaults.bool(forKey: K.paste) }
         set { defaults.set(newValue, forKey: K.paste) }
+    }
+
+    /// Keep chat history on disk (encrypted, redacted). Default on.
+    public var keepChatHistory: Bool {
+        get { defaults.object(forKey: K.history) == nil ? true : defaults.bool(forKey: K.history) }
+        set { defaults.set(newValue, forKey: K.history) }
     }
 
     /// Default model for chat and explanations (configurable).

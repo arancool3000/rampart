@@ -230,10 +230,10 @@ struct ScoreRing: View {
                     .opacity(reduceTransparency ? 0 : 1)
             }
             VStack(spacing: 0) {
-                Text("\(score)")
+                // Counts up in step with the ring as it draws (interpolated by SwiftUI's animation).
+                CountingNumber(value: value)
                     .font(.system(size: size * 0.34, weight: .bold, design: .rounded))
                     .monospacedDigit()
-                    .contentTransition(.numericText())
                 if size >= 80 { Text("of 100").font(.caption).foregroundStyle(.secondary) }
             }
         }
@@ -248,6 +248,16 @@ struct ScoreRing: View {
         }
         .onChange(of: score) { _, new in withAnimation(reduceMotion ? nil : .easeOut(duration: 0.5)) { shown = Double(new) } }
     }
+}
+
+/// A number that SwiftUI can animate: each animation frame gets the interpolated value.
+struct CountingNumber: View, Animatable {
+    var value: Double
+    var animatableData: Double {
+        get { value }
+        set { value = newValue }
+    }
+    var body: some View { Text("\(Int(value.rounded()))") }
 }
 
 struct EmptyStateView: View {

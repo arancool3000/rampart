@@ -12,7 +12,7 @@ enum FeatureRouter {
         case .passwords: PasswordsView()
         case .networkScan: NetworkScanView()
         // Not built yet: replace the placeholder with the owner's view when it lands.
-        case .scamCheck: FeaturePlaceholderView(item: item)
+        case .scamCheck: ScamCheckView()
         default: FeaturePlaceholderView(item: item)
         }
     }
@@ -20,7 +20,7 @@ enum FeatureRouter {
 
 /// Feature services that run in the user session. Kept here so the core app files don't import feature modules.
 enum AppFeatures {
-    @MainActor static func startBackgroundServices() { PasteGuardHost.shared.start() }
+    @MainActor static func startBackgroundServices() { PasteGuardHost.shared.start(); ScamAIWiring.install() }
     @MainActor static func explain(_ d: Detection) {
         AIChatModel.shared.explain(d)
         AppModel.shared.selection = .aiAssistant
