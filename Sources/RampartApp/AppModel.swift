@@ -145,12 +145,12 @@ final class AppModel {
     var mode: ConnectionMode = .connecting
     var selection: SidebarItem? = .dashboard
     var status = ProtectionStatus()
-    var detections: [Detection] = []
+    var detections: [Detection] = [] { didSet { syncChrome() } }
     var quarantine: [QuarantineRecord] = []
     var posture: [PostureCheck] = []
     var persistence: [PersistenceItem] = []
     var activity: [ActivityItem] = []
-    var scanPhase: ScanPhase = .idle
+    var scanPhase: ScanPhase = .idle { didSet { syncChrome() } }
     var scanHistory: [ScanRecord] = []
     var connections: [AppConnections] = []
     var wifi: WiFiInfo?
@@ -165,6 +165,11 @@ final class AppModel {
     var isUpdatingDefinitions = false
     var fixingChecks: Set<String> = []
     var hasFullDiskAccess = FDAProbe.check()
+    /// Last 14 days, oldest first (charts).
+    var daily: [DayStat] = []
+    /// Most recent scanned paths, newest first (scan animation), updated at most 5×/s.
+    var recentScanPaths: [String] = []
+    @ObservationIgnored private var lastPathNote = Date.distantPast
 
     @ObservationIgnored let client = DaemonClient()
     @ObservationIgnored private var scanHandle: DaemonClient.StreamHandle?
@@ -182,6 +187,34 @@ final class AppModel {
         posture.filter { $0.state == .fail && !ignoredChecks.contains($0.id) }.sorted { $0.weight > $1.weight }
     }
     var recommendations: [PostureCheck] { failingChecks.filter { !dismissedRecommendations.contains($0.id) } }
+
+    func noteScanPath(_ p: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastPathNote) >= 0.2, recentScanPaths.first != p else { return }
+        lastPathNote = now
+        recentScanPaths.insert(p, at: 0)
+        if recentScanPaths.count > 7 { recentScanPaths.removeLast(recentScanPaths.count - 7) }
+    }
+
+    /// Derives per-day stats from the activity log (live mode).
+    func rebuildDaily() {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        daily = (0..<14).reversed().map { back in
+            let day = cal.date(byAdding: .day, value: -back, to: today)!
+            let items = activity.filter { cal.isDate($0.date, inSameDayAs: day) }
+            let files = scanHistory.filter { cal.isDate($0.date, inSameDayAs: day) }.reduce(0) { $0 + $1.scanned }
+            return DayStat(day: day, filesChecked: files, sitesBlocked: items.filter { $0.kind == .network }.count,
+                           threats: items.filter { $0.kind == .threat }.count)
+        }
+    }
+
+    var blockedLast7: [Double] { daily.suffix(7).map { Double($0.sitesBlocked) } }
+    var filesLast14: [Double] { daily.map { Double($0.filesChecked) } }
+
+    private func syncChrome() {
+        ChromeState.shared.update(hasThreat: detections.contains { !$0.resolved }, isScanning: isScanning)
+    }
 
     // MARK: Lifecycle
 
@@ -258,6 +291,7 @@ final class AppModel {
             items.append(ActivityItem(date: ls, kind: .scan, title: "Scheduled scan finished", outcome: "Completed"))
         }
         activity = items.sorted { $0.date > $1.date }
+        rebuildDaily()
     }
 
     func enterDemo() {
@@ -324,6 +358,7 @@ final class AppModel {
         case .full: targets = ["/"]
         case .custom: targets = paths
         }
+        recentScanPaths = []
         let progress = ScanProgress(kind: kind, scanned: 0, total: 0, current: "Preparing…", started: Date(), found: 0, paused: false)
         scanPhase = .running(progress)
         if mode == .live {
@@ -338,6 +373,7 @@ final class AppModel {
                     lastUI = now
                     p.scanned = scanned; p.total = total; p.current = current
                     m.scanPhase = .running(p)
+                    m.noteScanPath(current)
                     return true
                 case .scanFinished(let scanned, let found, let seconds):
                     m.finishScan(kind: kind, scanned: scanned, found: found, seconds: seconds, skipped: 0)

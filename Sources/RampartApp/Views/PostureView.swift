@@ -142,7 +142,7 @@ struct PostureRow: View {
 
     private var stateInfo: (String, String, Color) {
         switch check.state {
-        case .pass: return ("checkmark.circle.fill", "On", .statusProtected)
+        case .pass: return ("checkmark.circle.fill", "Good", .statusProtected)
         case .fail: return ("exclamationmark.circle.fill", "Recommended", .statusAttention)
         case .unknown: return ("questionmark.circle", "Couldn't check", .secondary)
         case .notApplicable: return ("minus.circle", "Info", .secondary)
@@ -164,7 +164,7 @@ struct PostureRow: View {
                     if model.fixingChecks.contains(check.id) {
                         ProgressView().controlSize(.small)
                     } else if check.fixable {
-                        Button("Fix") { Task { await model.fix(check) } }.buttonStyle(.borderedProminent)
+                        Button("Fix") { Task { await model.fix(check) } }.buttonStyle(GlowButtonStyle())
                             .help(check.fixHint)
                     } else {
                         Button("Open Settings") { openSettings() }.help(check.fixHint)

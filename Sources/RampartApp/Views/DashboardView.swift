@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 import RampartShared
 
 struct DashboardView: View {
@@ -12,6 +13,7 @@ struct DashboardView: View {
             VStack(alignment: .leading, spacing: Spacing.xl) {
                 hero
                 tiles
+                if !model.daily.isEmpty { weekChart }
                 if !model.recommendations.isEmpty { recommendations }
                 recentActivity
             }
@@ -78,76 +80,119 @@ struct DashboardView: View {
     private var hero: some View {
         let h = heroContent
         let score = model.securityScore
+        let isProtected: Bool = { if case .protected = model.overall { return true }; if case .recommendations = model.overall { return true }; return false }()
         return HStack(alignment: .center, spacing: Spacing.xl) {
-            VStack(alignment: .leading, spacing: Spacing.m) {
-                Image(systemName: h.symbol)
-                    .font(.system(size: 56))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(h.tint)
-                    .accessibilityHidden(true)
-                Text(h.title).font(.largeTitle).fontWeight(.semibold)
+            ShieldHero(symbol: h.symbol, tint: h.tint == .secondary ? .gray : h.tint, breathe: isProtected, size: 132)
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                Text(h.title)
+                    .font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(h.detail).font(.title3).foregroundStyle(.secondary)
-                Group {
-                    if h.prominent {
-                        Button(h.button, action: heroAction).buttonStyle(.borderedProminent)
-                    } else {
-                        Button(h.button, action: heroAction).buttonStyle(.bordered)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: Spacing.m) {
+                    Group {
+                        if h.prominent {
+                            Button(h.button, action: heroAction).buttonStyle(GlowButtonStyle())
+                        } else {
+                            Button(h.button, action: heroAction).buttonStyle(.bordered)
+                        }
                     }
+                    .controlSize(.large)
+                    Text("Definitions \(model.status.signatureVersion == "0" ? "" : model.status.signatureVersion + " · ")updated \(Fmt.ago(model.definitionsUpdated).lowercased())")
+                        .font(.callout).foregroundStyle(.secondary)
                 }
-                .controlSize(.large)
-                .padding(.top, Spacing.xs)
+                .padding(.top, Spacing.s)
             }
             .accessibilityElement(children: .contain)
             Spacer(minLength: Spacing.l)
             VStack(spacing: Spacing.s) {
-                ScoreRing(score: score)
+                ScoreRing(score: score, size: 136, lineWidth: 13)
                 HStack(spacing: 4) {
-                    Text("Security Score").font(.headline)
+                    Text("Security Score").font(.headline).fontDesign(.rounded)
                     Button { showScoreInfo = true } label: { Image(systemName: "info.circle") }
                         .buttonStyle(.borderless)
                         .accessibilityLabel("How is this calculated?")
                         .popover(isPresented: $showScoreInfo, arrowEdge: .bottom) { ScoreExplainer() }
                 }
-                Text(AppModel.scoreLabel(score)).foregroundStyle(.secondary)
+                Text(AppModel.scoreLabel(score)).font(.callout.weight(.medium)).foregroundStyle(.secondary)
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Security score \(score) out of 100, \(AppModel.scoreLabel(score)). \(model.recommendations.count) recommendations.")
             .accessibilityAction(named: "How is this calculated?") { showScoreInfo = true }
         }
-        .card(padding: Spacing.xl)
+        .card(padding: Spacing.xl, tint: h.tint == .secondary ? .gray : h.tint)
     }
 
     // MARK: Tiles
 
     private var tiles: some View {
         ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: Spacing.l) { tileViews }
+            HStack(alignment: .top, spacing: Spacing.l) { tileViews }.fixedSize(horizontal: false, vertical: true)
             VStack(spacing: Spacing.l) { tileViews }
         }
     }
 
     @ViewBuilder private var tileViews: some View {
-        @Bindable var model = model
-        StatusTile(symbol: model.status.realtimeOn && model.pausedUntil == nil ? "checkmark.shield" : "shield.slash",
-                   tint: model.status.realtimeOn && model.pausedUntil == nil ? .statusProtected : .statusAction,
+        let rtOn = model.status.realtimeOn && model.pausedUntil == nil
+        StatusTile(symbol: rtOn ? "checkmark.shield.fill" : "shield.slash", tint: rtOn ? .statusProtected : .statusAction,
                    title: "Real-time protection",
-                   value: model.pausedUntil != nil ? "Paused" : (model.status.realtimeOn ? "On" : "Off")) {
+                   value: model.pausedUntil != nil ? "Paused" : (rtOn ? "On" : "Off"),
+                   caption: model.daily.last.map { "\(Fmt.count($0.filesChecked)) files checked today" }) {
             Toggle("Real-time protection", isOn: Binding(
                 get: { model.status.realtimeOn && model.pausedUntil == nil },
                 set: { on in if on { model.setRealtime(true) } else { confirmOff = true } }))
                 .toggleStyle(.switch).labelsHidden().controlSize(.small)
                 .disabled(model.mode == .live)
                 .help(model.mode == .live ? "Real-time protection is managed by the background service." : "")
+        } chart: {
+            if model.filesLast14.contains(where: { $0 > 0 }) { Sparkline(values: model.filesLast14, tint: .statusProtected) }
         }
-        StatusTile(symbol: "magnifyingglass", tint: .statusInfo, title: "Last scan",
-                   value: lastScanText) {
+        StatusTile(symbol: "magnifyingglass", tint: .rampartTeal, title: "Last scan", value: lastScanText,
+                   caption: model.scanHistory.first.map { "\(Fmt.count($0.scanned)) files in \(Fmt.duration($0.seconds))" }) {
             Button("Scan Now") { model.selection = .scan; model.startScan(.quick) }
                 .buttonStyle(.link).disabled(model.isScanning)
+        } chart: {
+            if !model.scanHistory.isEmpty {
+                // One pill per recent scan, oldest to newest: green = clean, grey = items found and contained.
+                HStack(spacing: 5) {
+                    ForEach(Array(model.scanHistory.prefix(8).reversed())) { r in
+                        Capsule().fill(r.found == 0 ? Color.statusProtected.opacity(0.85) : Color.gray.opacity(0.6))
+                            .frame(height: 10)
+                    }
+                }
+                .frame(maxHeight: .infinity, alignment: .bottom)
+                .accessibilityHidden(true)
+            }
         }
-        StatusTile(symbol: "arrow.triangle.2.circlepath", tint: .statusInfo, title: "Definitions",
-                   value: "Up to date · \(Fmt.ago(model.definitionsUpdated))") {
-            if model.isUpdatingDefinitions { ProgressView().controlSize(.small) }
-            else { Button("Check Now") { Task { await model.updateDefinitions() } }.buttonStyle(.link) }
+        StatusTile(symbol: "globe", tint: .statusInfo, title: "Web protection",
+                   value: model.status.webProtectionOn ? "\(model.blockedThisMonth) blocked this month" : "Off",
+                   caption: model.status.webProtectionOn ? "\(model.blockedToday) today" : nil) {
+            Button("Details") { model.selection = .network }.buttonStyle(.link)
+        } chart: {
+            if model.blockedLast7.contains(where: { $0 > 0 }) { MiniBars(values: model.blockedLast7, tint: .statusInfo) }
+        }
+    }
+
+    private var weekChart: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            SectionHeader("Last 14 days")
+            VStack(alignment: .leading, spacing: Spacing.m) {
+                Chart {
+                    ForEach(model.daily) { d in
+                        BarMark(x: .value("Day", d.day, unit: .day), y: .value("Count", d.sitesBlocked))
+                            .foregroundStyle(by: .value("Kind", "Dangerous sites blocked"))
+                        BarMark(x: .value("Day", d.day, unit: .day), y: .value("Count", d.threats))
+                            .foregroundStyle(by: .value("Kind", "Threats stopped"))
+                    }
+                }
+                .chartForegroundStyleScale(["Dangerous sites blocked": Color.rampartTeal, "Threats stopped": Palette.amber])
+                .chartLegend(position: .top, alignment: .leading)
+                .chartXAxis { AxisMarks(values: .stride(by: .day, count: 2)) { _ in AxisValueLabel(format: .dateTime.weekday(.abbreviated)) } }
+                .chartYAxis { AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) }
+                .frame(height: 150)
+                .accessibilityLabel("Chart of dangerous sites blocked and threats stopped over the last 14 days")
+            }
+            .card()
         }
     }
 
@@ -196,26 +241,33 @@ struct DashboardView: View {
     }
 }
 
-struct StatusTile<Accessory: View>: View {
+struct StatusTile<Accessory: View, ChartContent: View>: View {
     let symbol: String
     let tint: Color
     let title: String
     let value: String
+    var caption: String? = nil
     @ViewBuilder var accessory: Accessory
+    @ViewBuilder var chart: ChartContent
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
             HStack {
-                Image(systemName: symbol).foregroundStyle(tint).symbolRenderingMode(.hierarchical).font(.title2)
+                IconBadge(symbol: symbol, tint: tint, size: 34)
                 Spacer()
                 accessory
             }
-            Text(title).font(.callout).foregroundStyle(.secondary)
-            Text(value).font(.title3.weight(.medium)).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            Text(title).font(.callout.weight(.medium)).foregroundStyle(.secondary).padding(.top, 2)
+            Text(value).font(.title3.weight(.semibold)).fontDesign(.rounded)
+                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            if let caption { Text(caption).font(.caption).foregroundStyle(.secondary).monospacedDigit() }
+            Spacer(minLength: 0)
+            chart.frame(height: 34)
         }
-        .frame(minWidth: 200, maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
+        .frame(minWidth: 200, maxWidth: .infinity, minHeight: 150, alignment: .topLeading)
         .card()
+        .hoverLift()
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(title): \(value)")
+        .accessibilityLabel("\(title): \(value)\(caption.map { ". " + $0 } ?? "")")
     }
 }
 

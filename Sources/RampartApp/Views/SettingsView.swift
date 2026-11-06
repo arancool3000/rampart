@@ -22,7 +22,7 @@ struct SettingsView: View {
         if standalone {
             TabView(selection: $tab) {
                 ForEach(SettingsTab.allCases) { t in
-                    SettingsPane(tab: t).tabItem { Label(t.rawValue, systemImage: t.symbol) }.tag(t)
+                    SettingsPane(tab: t).background(AppBackdrop()).tabItem { Label(t.rawValue, systemImage: t.symbol) }.tag(t)
                 }
             }
         } else {
@@ -30,8 +30,9 @@ struct SettingsView: View {
                 List(SettingsTab.allCases, selection: Binding(get: { Optional(tab) }, set: { if let t = $0 { tab = t } })) { t in
                     Label(t.rawValue, systemImage: t.symbol).tag(t)
                 }
-                .listStyle(.inset)
-                .frame(width: 190)
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
+                .frame(width: 200)
                 Divider()
                 SettingsPane(tab: tab).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -56,19 +57,20 @@ struct SettingsPane: View {
             }
         }
         .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 }
 
 struct GeneralSettings: View {
     @AppStorage("general.launchAtLogin") private var launchAtLogin = true
-    @AppStorage("general.showMenuBar") private var showMenuBar = true
     @AppStorage("general.showDock") private var showDock = true
     @AppStorage("general.textSize") private var textSize = "default"
     var body: some View {
         Form {
             Section {
                 Toggle("Launch Rampart at login", isOn: $launchAtLogin)
-                Toggle("Show in menu bar", isOn: $showMenuBar)
+                Toggle("Show in menu bar", isOn: Binding(get: { ChromeState.shared.menuBarInserted },
+                                                          set: { ChromeState.shared.setMenuBarInserted($0) }))
                 Toggle("Show Dock icon", isOn: $showDock)
                     .onChange(of: showDock) { _, v in NSApp.setActivationPolicy(v ? .regular : .accessory) }
             } footer: {

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Charts
 
 struct ActivityView: View {
     @Environment(AppModel.self) private var model
@@ -34,6 +35,17 @@ struct ActivityView: View {
                     .pickerStyle(.menu).fixedSize()
                     Spacer()
                     Text("\(items.count) events · kept for 90 days").font(.callout).foregroundStyle(.secondary)
+                }
+                if !model.daily.isEmpty && filter == nil && search.isEmpty {
+                    HStack(spacing: Spacing.l) {
+                        ActivityStat(title: "Files checked", value: model.daily.reduce(0) { $0 + $1.filesChecked }, symbol: "doc.text.magnifyingglass", tint: .rampartTeal,
+                                     values: model.daily.map { Double($0.filesChecked) })
+                        ActivityStat(title: "Sites blocked", value: model.daily.reduce(0) { $0 + $1.sitesBlocked }, symbol: "hand.raised.fill", tint: .statusInfo,
+                                     values: model.daily.map { Double($0.sitesBlocked) })
+                        ActivityStat(title: "Threats stopped", value: model.daily.reduce(0) { $0 + $1.threats }, symbol: "ladybug.fill", tint: Palette.amber,
+                                     values: model.daily.map { Double($0.threats) })
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 if items.isEmpty {
                     EmptyStateView(symbol: "clock.arrow.circlepath", title: "No activity", detail: "Scans, blocked connections and changes you make will appear here.")
@@ -115,5 +127,28 @@ struct TimelineRow: View {
         }
         .padding(.bottom, isLast ? 0 : 2)
         .accessibilityElement(children: .combine)
+    }
+}
+
+struct ActivityStat: View {
+    let title: String
+    let value: Int
+    let symbol: String
+    let tint: Color
+    let values: [Double]
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            HStack {
+                IconBadge(symbol: symbol, tint: tint, size: 28)
+                Text(title).font(.callout.weight(.medium)).foregroundStyle(.secondary)
+                Spacer()
+            }
+            Text(Fmt.count(value)).font(.title.weight(.bold)).fontDesign(.rounded).monospacedDigit()
+            Text("Last 14 days").font(.caption).foregroundStyle(.secondary)
+            Sparkline(values: values, tint: tint).frame(height: 36)
+        }
+        .card()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(title): \(value) in the last 14 days")
     }
 }

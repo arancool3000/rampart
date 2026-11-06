@@ -124,6 +124,15 @@ enum DemoData {
         m.blockedThisMonth = 14
         m.blockedToday = 3
 
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        let files = [16_900, 18_204, 17_350, 21_480, 19_020, 8_410, 7_960, 18_640, 20_110, 19_870, 22_340, 18_990, 9_120, 14_380]
+        let blocked = [1, 0, 2, 1, 0, 0, 1, 3, 1, 0, 2, 1, 2, 3]
+        let threats = [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 1]
+        m.daily = (0..<14).map { i in
+            DayStat(day: cal.date(byAdding: .day, value: i - 13, to: today)!, filesChecked: files[i], sitesBlocked: blocked[i], threats: threats[i])
+        }
+
         m.allowRules = [
             AllowRule(name: "build-tools", scope: .folder, value: home + "/Developer/build", created: ago(60 * 9), expires: nil),
             AllowRule(name: "Homebrew", scope: .developer, value: "Homebrew (team 927JGANW46)", created: ago(60 * 24 * 12), expires: nil),
@@ -152,6 +161,7 @@ enum DemoData {
                 let base = kind == .custom ? (paths.first ?? home) : sample[(tick / 4) % sample.count]
                 p.current = base + "/" + names[tick % names.count]
                 m.scanPhase = .running(p)
+                m.noteScanPath(p.current)
                 if scanned >= total {
                     timer.invalidate()
                     m.finishScan(kind: kind, scanned: total, found: [], seconds: Date().timeIntervalSince(p.started), skipped: kind == .full ? 312 : 0)

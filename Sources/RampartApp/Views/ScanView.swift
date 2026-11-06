@@ -40,7 +40,7 @@ struct ScanView: View {
                     Button { start() } label: {
                         Label("Start \(choice.title)", systemImage: "play.fill").frame(minWidth: 160)
                     }
-                    .buttonStyle(.borderedProminent).controlSize(.large)
+                    .buttonStyle(GlowButtonStyle()).controlSize(.large)
                     .keyboardShortcut(.defaultAction)
                     .disabled(choice == .custom && customPaths.isEmpty)
                     if choice == .custom {
@@ -111,9 +111,13 @@ struct ScanChoiceCard: View {
     var subtitle: String?
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
-            Image(systemName: kind.symbol).font(.title).foregroundStyle(selected ? Color.rampartTeal : .secondary)
-                .frame(height: 34)
-            Text(kind.title).font(.title3.weight(.medium))
+            HStack {
+                IconBadge(symbol: kind.symbol, tint: selected ? .rampartTeal : .gray, size: 42)
+                Spacer()
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3).foregroundStyle(selected ? Color.rampartTeal : Color.secondary.opacity(0.5))
+            }
+            Text(kind.title).font(.title3.weight(.semibold)).fontDesign(.rounded).padding(.top, 4)
             Text(kind.detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let subtitle {
                 Text(subtitle).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
@@ -122,12 +126,13 @@ struct ScanChoiceCard: View {
             }
             Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, minHeight: 150, alignment: .topLeading)
-        .card()
+        .frame(maxWidth: .infinity, minHeight: 170, alignment: .topLeading)
+        .card(tint: selected ? .rampartTeal : nil)
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(selected || targeted ? Color.rampartTeal : Color.clear, lineWidth: 2)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(selected || targeted ? Color.rampartTeal.opacity(0.9) : Color.clear, lineWidth: 1.5)
         )
+        .hoverLift()
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
@@ -154,59 +159,120 @@ struct ScanHistoryRow: View {
     }
 }
 
+/// Radar sweep: concentric rings, a rotating conic sweep and blips that light up as the sweep passes.
+/// Animates only while visible and not paused; under Reduce Motion it is a static determinate ring.
+struct RadarView: View {
+    let fraction: Double?
+    let paused: Bool
+    var size: CGFloat = 280
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private let gate = AnimationGate.shared
+
+    var body: some View {
+        let tint = Color.rampartTeal
+        let animate = !paused && !reduceMotion && gate.live
+        ZStack {
+            Circle().fill(RadialGradient(colors: [tint.opacity(0.16), tint.opacity(0.02)], center: .center, startRadius: 0, endRadius: size / 2))
+            ForEach(1..<5) { i in
+                Circle().strokeBorder(tint.opacity(0.18), lineWidth: 1).frame(width: size * CGFloat(i) / 4.4, height: size * CGFloat(i) / 4.4)
+            }
+            Rectangle().fill(tint.opacity(0.12)).frame(width: 1, height: size * 0.9)
+            Rectangle().fill(tint.opacity(0.12)).frame(width: size * 0.9, height: 1)
+            if !reduceMotion {
+                if Headless.renderDir != nil {
+                    // Offscreen still: a fixed sweep wedge.
+                    Circle()
+                        .fill(AngularGradient(gradient: Gradient(stops: [
+                            .init(color: tint.opacity(0), location: 0), .init(color: tint.opacity(0), location: 0.72),
+                            .init(color: tint.opacity(0.5), location: 1)]), center: .center))
+                        .frame(width: size * 0.9, height: size * 0.9)
+                        .rotationEffect(.degrees(130))
+                } else {
+                    RadarSweep(color: NSColor(tint), blipColor: NSColor(Palette.mint), animate: animate)
+                        .frame(width: size * 0.9, height: size * 0.9)
+                }
+            }
+            Circle().stroke(tint.opacity(0.15), lineWidth: 6).frame(width: size, height: size)
+            if let f = fraction {
+                Circle().trim(from: 0, to: f)
+                    .stroke(LinearGradient(colors: [Palette.teal, Palette.mint], startPoint: .top, endPoint: .bottom),
+                            style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: size, height: size)
+            }
+            VStack(spacing: 0) {
+                if let f = fraction {
+                    Text("\(Int(f * 100))%")
+                        .font(.system(size: size * 0.17, weight: .bold, design: .rounded)).monospacedDigit()
+                        .contentTransition(.numericText())
+                } else {
+                    Image(systemName: "magnifyingglass").font(.system(size: size * 0.12, weight: .semibold))
+                }
+                if size >= 120 {
+                    Text(paused ? "Paused" : (fraction == nil ? "Estimating" : "Scanning"))
+                        .font(.caption.weight(.medium)).foregroundStyle(.secondary).textCase(.uppercase).tracking(1.2)
+                }
+            }
+            .padding(Spacing.m)
+            .background(Circle().fill(.background.opacity(0.55)).blur(radius: 8))
+        }
+        .frame(width: size, height: size)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Scan progress")
+        .accessibilityValue(fraction.map { "\(Int($0 * 10) * 10) percent" } ?? "Estimating")
+    }
+}
+
 struct RunningScanView: View {
     let progress: ScanProgress
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("scan.lowImpact") private var lowImpact = false
-    @StateVar private var spin = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            VStack(spacing: Spacing.l) {
-                Spacer()
-                ZStack {
-                    Circle().stroke(Color.secondary.opacity(0.15), lineWidth: 14)
-                    if let f = progress.fraction {
-                        Circle().trim(from: 0, to: f)
-                            .stroke(Color.rampartTeal, style: StrokeStyle(lineWidth: 14, lineCap: .round))
-                            .rotationEffect(.degrees(-90))
-                            .animation(reduceMotion ? nil : .linear(duration: 0.1), value: f)
-                        Text("\(Int(f * 100))%")
-                            .font(.system(size: 44, weight: .semibold, design: .rounded)).monospacedDigit()
+            HStack(alignment: .center, spacing: 48) {
+                RadarView(fraction: progress.fraction, paused: progress.paused)
+                VStack(alignment: .leading, spacing: Spacing.m) {
+                    Label(progress.kind.title, systemImage: progress.kind.symbol)
+                        .font(.headline).foregroundStyle(Color.rampartTeal)
+                    if progress.total > 0 {
+                        (Text(Fmt.count(progress.scanned)).foregroundStyle(.primary) + Text(" of \(Fmt.count(progress.total)) files").foregroundStyle(.secondary))
+                            .font(.title.weight(.bold)).fontDesign(.rounded).monospacedDigit()
                             .contentTransition(.numericText())
                     } else {
-                        Circle().trim(from: 0, to: 0.25)
-                            .stroke(AngularGradient(colors: [Color.rampartTeal.opacity(0), Color.rampartTeal], center: .center),
-                                    style: StrokeStyle(lineWidth: 14, lineCap: .round))
-                            .rotationEffect(.degrees(spin ? 360 : 0))
-                            .animation(reduceMotion ? nil : .linear(duration: 1.2).repeatForever(autoreverses: false), value: spin)
-                            .onAppear { spin = true }
-                        Image(systemName: "magnifyingglass").font(.largeTitle).foregroundStyle(.secondary)
+                        Text("Estimating files…").font(.title.weight(.bold)).fontDesign(.rounded)
                     }
-                }
-                .frame(width: 200, height: 200)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(progress.kind.title) progress")
-                .accessibilityValue(progress.fraction.map { "\(Int($0 * 10) * 10) percent" } ?? "Estimating")
+                    HStack(spacing: Spacing.l) {
+                        Label(Fmt.duration(Date().timeIntervalSince(progress.started)), systemImage: "timer")
+                        if let eta = progress.etaSeconds { Label("About \(Fmt.duration(eta)) left", systemImage: "hourglass") }
+                        Label("\(progress.found) item\(progress.found == 1 ? "" : "s") found", systemImage: "ladybug")
+                    }
+                    .font(.callout).foregroundStyle(.secondary).monospacedDigit()
 
-                Text(progress.paused ? "Paused" : (progress.total > 0
-                     ? "Scanning… \(Fmt.count(progress.scanned)) of \(Fmt.count(progress.total)) files"
-                     : "Estimating files…"))
-                    .font(.title3.weight(.medium)).monospacedDigit()
-                Text(progress.current)
-                    .font(.callout.monospaced()).foregroundStyle(.secondary)
-                    .lineLimit(1).truncationMode(.middle).frame(maxWidth: 520)
-                HStack(spacing: Spacing.l) {
-                    Text("Elapsed \(Fmt.duration(Date().timeIntervalSince(progress.started)))")
-                    if let eta = progress.etaSeconds { Text("About \(Fmt.duration(eta)) left") }
-                    Text("\(progress.found) item\(progress.found == 1 ? "" : "s") found")
+                    VStack(alignment: .leading, spacing: 5) {
+                        ForEach(Array(model.recentScanPaths.enumerated()), id: \.element) { i, p in
+                            HStack(spacing: 6) {
+                                Image(systemName: i == 0 ? "doc.text.magnifyingglass" : "checkmark")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(i == 0 ? Color.rampartTeal : Color.statusProtected)
+                                    .frame(width: 14)
+                                Text(p.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                                    .font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
+                            }
+                            .opacity(1 - Double(i) * 0.13)
+                            .transition(reduceMotion ? .identity : .move(edge: .top).combined(with: .opacity))
+                        }
+                    }
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: model.recentScanPaths)
+                    .frame(maxWidth: 420, minHeight: 150, alignment: .topLeading)
+                    .card(padding: Spacing.m)
+                    .accessibilityHidden(true)
                 }
-                .font(.callout).foregroundStyle(.secondary).monospacedDigit()
-                Spacer()
-                Spacer().frame(height: 60)
+                .frame(maxWidth: 440, alignment: .leading)
             }
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.bottom, 70)
 
             HStack(spacing: Spacing.l) {
                 if model.mode != .live {
@@ -246,16 +312,15 @@ struct ScanResultView: View {
             VStack(spacing: Spacing.l) {
                 Spacer(minLength: Spacing.xxl)
                 if found.isEmpty {
-                    Image(systemName: "checkmark.shield.fill").font(.system(size: 72))
-                        .foregroundStyle(Color.statusProtected).symbolRenderingMode(.hierarchical)
+                    ShieldHero(symbol: "checkmark.shield.fill", tint: .statusProtected, size: 150)
                         .symbolEffect(.bounce, value: bounce)
                         .onAppear { bounce += 1 }
-                    Text("No threats found").font(.largeTitle.weight(.semibold))
+                    Text("No threats found").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
                     Text("Scanned \(Fmt.count(record.scanned)) files in \(Fmt.duration(record.seconds)).")
                         .font(.title3).foregroundStyle(.secondary)
                 } else {
                     Image(systemName: "archivebox.fill").font(.system(size: 64)).foregroundStyle(.secondary)
-                    Text(found.count == 1 ? "Found 1 item" : "Found \(found.count) items").font(.largeTitle.weight(.semibold))
+                    Text(found.count == 1 ? "Found 1 item" : "Found \(found.count) items").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
                     Text("They've been moved to quarantine and can't run.").font(.title3).foregroundStyle(.secondary)
                     VStack(spacing: 0) {
                         ForEach(found) { d in DetectionRowSummary(detection: d).padding(Spacing.s) }
@@ -273,10 +338,10 @@ struct ScanResultView: View {
                 }
                 HStack {
                     if found.isEmpty {
-                        Button("Done") { model.scanPhase = .idle }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                        Button("Done") { model.scanPhase = .idle }.buttonStyle(GlowButtonStyle()).keyboardShortcut(.defaultAction)
                         Button("View Activity") { model.scanPhase = .idle; model.selection = .activity }
                     } else {
-                        Button("Review Items") { model.scanPhase = .idle; model.selection = .threats }.buttonStyle(.borderedProminent)
+                        Button("Review Items") { model.scanPhase = .idle; model.selection = .threats }.buttonStyle(GlowButtonStyle())
                         Button("Done") { model.scanPhase = .idle }
                     }
                 }

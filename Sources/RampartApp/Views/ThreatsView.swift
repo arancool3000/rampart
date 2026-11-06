@@ -84,6 +84,7 @@ struct ThreatsView: View {
                 TableColumn("Status") { d in DetectionStatus(detection: d, quarantined: record(for: d) != nil) }.width(min: 110, ideal: 130)
                 TableColumn("Detected", value: \.date) { d in Text(Fmt.ago(d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
             }
+            .scrollContentBackground(.hidden)
             .contextMenu(forSelectionType: Detection.ID.self) { ids in
                 if let id = ids.first, let d = model.detections.first(where: { $0.id == id }), let p = d.path {
                     Button("Copy Path") { copy(p) }
@@ -121,6 +122,7 @@ struct ThreatsView: View {
                     }
                     .width(min: 90, ideal: 100)
                 }
+                .scrollContentBackground(.hidden)
                 HStack {
                     Image(systemName: "info.circle").foregroundStyle(.secondary)
                     Text("Deleted automatically after 30 days.").foregroundStyle(.secondary)
@@ -152,6 +154,7 @@ struct ThreatsView: View {
                 }
                 .width(80)
             }
+            .scrollContentBackground(.hidden)
         }
     }
 
@@ -341,7 +344,7 @@ struct DetectionInspector: View {
                 Button { showRestore = true } label: { Label("Restore…", systemImage: "arrow.uturn.backward") }
             } else if let d = detection, !d.resolved {
                 Button { Task { await model.quarantine(d) } } label: { Label("Quarantine", systemImage: "archivebox") }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(GlowButtonStyle())
                 Button { showAllow = true } label: { Label("Allow…", systemImage: "checkmark.seal") }
             } else if let p = detection?.path {
                 Button { NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "") } label: { Label("Show in Finder", systemImage: "folder") }

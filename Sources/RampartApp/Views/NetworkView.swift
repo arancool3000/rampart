@@ -33,8 +33,8 @@ struct NetworkView: View {
     @ViewBuilder private var wifiCard: some View {
         HStack(spacing: Spacing.m) {
             if let w = model.wifi {
-                Image(systemName: w.encrypted && !w.gatewayChanged ? "wifi" : "wifi.exclamationmark")
-                    .font(.title).foregroundStyle(w.encrypted && !w.gatewayChanged ? Color.statusProtected : Color.statusAttention)
+                IconBadge(symbol: w.encrypted && !w.gatewayChanged ? "wifi" : "wifi.exclamationmark",
+                          tint: w.encrypted && !w.gatewayChanged ? .statusProtected : .statusAttention, size: 44)
                 VStack(alignment: .leading, spacing: 2) {
                     (Text("Connected to ") + Text(w.ssid).bold() + Text(" · \(w.security)"))
                     if !w.encrypted {
@@ -63,7 +63,7 @@ struct NetworkView: View {
             SectionHeader("Web protection")
             VStack(alignment: .leading, spacing: Spacing.m) {
                 HStack(spacing: Spacing.m) {
-                    Image(systemName: "globe").font(.title2).foregroundStyle(model.status.webProtectionOn ? Color.rampartTeal : .secondary)
+                    IconBadge(symbol: "globe", tint: model.status.webProtectionOn ? .rampartTeal : .gray, size: 34)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Block known malicious and phishing sites").font(.body.weight(.medium))
                         Text("Checks every website and app connection against threat lists. Your browsing isn't recorded.")
@@ -76,7 +76,7 @@ struct NetworkView: View {
                 }
                 Divider()
                 HStack(spacing: Spacing.m) {
-                    Image(systemName: "eye.slash").font(.title2).foregroundStyle(.secondary)
+                    IconBadge(symbol: "eye.slash", tint: .gray, size: 34)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Block trackers").font(.body.weight(.medium))
                         Text("Privacy, not security. Some sites may not work as expected.").font(.callout).foregroundStyle(.secondary)
@@ -85,9 +85,12 @@ struct NetworkView: View {
                     Toggle("Block trackers", isOn: $blockTrackers).toggleStyle(.switch).labelsHidden()
                 }
                 Divider()
-                HStack(spacing: Spacing.xxl) {
+                HStack(alignment: .bottom, spacing: Spacing.xxl) {
                     Stat(value: model.blockedThisMonth, label: "dangerous sites blocked this month")
                     Stat(value: model.blockedToday, label: "blocked today")
+                    if model.blockedLast7.contains(where: { $0 > 0 }) {
+                        MiniBars(values: model.blockedLast7, tint: .rampartTeal).frame(width: 120, height: 40)
+                    }
                     Spacer()
                     Picker("Firewall mode", selection: $firewallMode) {
                         Text("Silent (recommended)").tag("silent")
@@ -127,7 +130,7 @@ struct Stat: View {
     let label: String
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("\(value)").font(.title.weight(.semibold)).monospacedDigit().contentTransition(.numericText())
+            Text("\(value)").font(.largeTitle.weight(.bold)).fontDesign(.rounded).monospacedDigit().contentTransition(.numericText())
             Text(label).font(.callout).foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .combine)

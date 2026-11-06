@@ -8,29 +8,30 @@ struct MenuBarView: View {
     @StateVar private var showQuitInfo = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            top.padding(Spacing.l)
-            Divider()
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            top
             if !model.isScanning {
                 HStack(spacing: Spacing.s) {
-                    Button { model.startScan(.quick) } label: { Label("Quick Scan", systemImage: "bolt").frame(maxWidth: .infinity) }
-                        .primaryActionStyle()
+                    Button { model.startScan(.quick) } label: { Label("Quick Scan", systemImage: "bolt.fill").frame(maxWidth: .infinity) }
+                        .buttonStyle(GlowButtonStyle())
                     Button { openMain() } label: { Text("Open Rampart").frame(maxWidth: .infinity) }
                         .secondaryActionStyle()
                 }
                 .controlSize(.large)
-                .padding(Spacing.m)
-                Divider()
             }
-            VStack(alignment: .leading, spacing: 6) {
-                infoRow("Last scan", lastScan)
-                infoRow("Definitions", Fmt.ago(model.definitionsUpdated))
-                infoRow("Network", "\(model.blockedToday) blocked today")
-                if model.isDemo { infoRow("Mode", "Demo · sample data") }
+            VStack(spacing: 0) {
+                infoRow("magnifyingglass", "Last scan", lastScan)
+                Divider().padding(.leading, 34)
+                infoRow("arrow.triangle.2.circlepath", "Definitions", Fmt.ago(model.definitionsUpdated))
+                Divider().padding(.leading, 34)
+                infoRow("hand.raised.fill", "Network", "\(model.blockedToday) blocked today")
+                if model.isDemo {
+                    Divider().padding(.leading, 34)
+                    infoRow("sparkles.rectangle.stack", "Mode", "Demo · sample data")
+                }
             }
             .font(.callout)
-            .padding(Spacing.l)
-            Divider()
+            .card(padding: Spacing.s)
             VStack(alignment: .leading, spacing: 2) {
                 Menu("Pause Protection") {
                     Button("For 15 minutes") { model.setRealtime(false, pauseFor: 15) }
@@ -39,7 +40,7 @@ struct MenuBarView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .disabled(model.mode == .live)
-                .padding(.horizontal, 6).padding(.vertical, 4)
+                .padding(.horizontal, 8).padding(.vertical, 4)
                 MenuRowButton(title: "Settings…", shortcut: "⌘,") { NSApp.activate(ignoringOtherApps: true); openSettings() }
                 MenuRowButton(title: "Quit Rampart", shortcut: "⌘Q") { showQuitInfo = true }
                 if showQuitInfo {
@@ -51,13 +52,18 @@ struct MenuBarView: View {
                     .padding(Spacing.s)
                 }
             }
-            .padding(Spacing.s)
         }
-        .frame(width: 320)
+        .padding(Spacing.m)
+        .frame(width: 330)
+        .background(AppBackdrop())
+        .onAppear { if !Headless.active { AnimationGate.shared.popoverVisible = true } }
+        .onDisappear { AnimationGate.shared.popoverVisible = false }
     }
 
     @ViewBuilder private var top: some View {
         if let p = model.scanProgress {
+            HStack(spacing: Spacing.m) {
+            RadarView(fraction: p.fraction, paused: p.paused, size: 74)
             VStack(alignment: .leading, spacing: Spacing.s) {
                 Text("\(p.kind.title) · \(p.fraction.map { "\(Int($0 * 100))%" } ?? "Starting")").font(.headline).monospacedDigit()
                 ProgressView(value: p.fraction ?? 0).tint(Color.rampartTeal)
@@ -68,19 +74,27 @@ struct MenuBarView: View {
                 }
                 .controlSize(.small)
             }
+            }
+            .card(padding: Spacing.m)
         } else {
             let (sym, tint, title) = heroLine
-            HStack(spacing: Spacing.m) {
-                Image(systemName: sym).font(.system(size: 30)).foregroundStyle(tint).symbolRenderingMode(.hierarchical)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title).font(.headline)
-                    Text("Score \(model.securityScore) · \(AppModel.scoreLabel(model.securityScore))").font(.callout).foregroundStyle(.secondary)
+            let calm: Bool = { if case .protected = model.overall { return true }; if case .recommendations = model.overall { return true }; return false }()
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                HStack(spacing: Spacing.m) {
+                    ShieldHero(symbol: sym, tint: tint == .secondary ? .gray : tint, breathe: calm, size: 64)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title).font(.headline).fontDesign(.rounded).fixedSize(horizontal: false, vertical: true)
+                        Text("Score \(model.securityScore) · \(AppModel.scoreLabel(model.securityScore))").font(.callout).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 0)
+                    ScoreRing(score: model.securityScore, size: 46, lineWidth: 5)
                 }
-                Spacer()
                 if case .threat = model.overall {
-                    Button("Review") { model.selection = .threats; openMain() }.buttonStyle(.borderedProminent)
+                    Button { model.selection = .threats; openMain() } label: { Text("Review").frame(maxWidth: .infinity) }
+                        .buttonStyle(GlowButtonStyle()).controlSize(.large)
                 }
             }
+            .card(padding: Spacing.m, tint: tint == .secondary ? .gray : tint)
             .accessibilityElement(children: .combine)
         }
     }
@@ -100,8 +114,15 @@ struct MenuBarView: View {
         return model.status.lastScan.map(Fmt.dayTime) ?? "Not yet"
     }
 
-    private func infoRow(_ k: String, _ v: String) -> some View {
-        HStack { Text(k).foregroundStyle(.secondary); Spacer(); Text(v) }.accessibilityElement(children: .combine)
+    private func infoRow(_ symbol: String, _ k: String, _ v: String) -> some View {
+        HStack(spacing: Spacing.s) {
+            Image(systemName: symbol).foregroundStyle(Color.rampartTeal).frame(width: 22)
+            Text(k).foregroundStyle(.secondary)
+            Spacer()
+            Text(v).fontWeight(.medium)
+        }
+        .padding(.horizontal, 6).padding(.vertical, 7)
+        .accessibilityElement(children: .combine)
     }
 
     private func openMain() {

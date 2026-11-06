@@ -18,7 +18,8 @@ struct RootView: View {
                     .accessibilityHint("Command \(SidebarItem.allCases.firstIndex(of: item)! + 1)")
                 }
             }
-            .navigationSplitViewColumnWidth(min: 200, ideal: 230, max: 260)
+            .navigationSplitViewColumnWidth(min: 210, ideal: 236, max: 260)
+            .safeAreaInset(edge: .top) { SidebarBrand() }
             .safeAreaInset(edge: .bottom) { SidebarFooter() }
         } detail: {
             VStack(spacing: 0) {
@@ -27,6 +28,7 @@ struct RootView: View {
                 detail
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .background(AppBackdrop())
         }
         .sheet(isPresented: $showOnboarding) {
             OnboardingView { onboardingDone = true; showOnboarding = false }
@@ -36,10 +38,11 @@ struct RootView: View {
         .onAppear {
             let args = ProcessInfo.processInfo.arguments
             if args.contains("--onboarding") { showOnboarding = true }
-            else if !onboardingDone && !args.contains("--skip-onboarding") { showOnboarding = true }
+            else if !onboardingDone && !args.contains("--skip-onboarding") && !Headless.active { showOnboarding = true }
             if let i = args.firstIndex(of: "--section"), i + 1 < args.count, let s = SidebarItem(rawValue: args[i + 1]) { model.selection = s }
         }
         .onReceive(NotificationCenter.default.publisher(for: .rampartShowOnboarding)) { _ in showOnboarding = true }
+        .onAppear { AnimationGate.shared.start() }
     }
 
     @ViewBuilder private var detail: some View {
@@ -105,19 +108,37 @@ struct DemoBanner: View {
     @Environment(AppModel.self) private var model
     var body: some View {
         HStack(spacing: Spacing.s) {
-            Image(systemName: "theatermasks").foregroundStyle(Color.statusInfo)
-            Text("Demo mode").fontWeight(.semibold)
-            Text("Showing sample data. The Rampart background service isn't running, so nothing on this Mac is being changed.")
-                .foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            Label("Demo mode", systemImage: "sparkles.rectangle.stack")
+                .font(.callout.weight(.semibold))
+                .padding(.horizontal, 9).padding(.vertical, 3)
+                .background(Color.statusInfo.opacity(0.18), in: Capsule())
+                .foregroundStyle(.primary)
+            Text("Sample data. The Rampart background service isn't running, so nothing on this Mac is being changed.")
+                .font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
             Spacer()
             Button("Retry Connection") { Task { await model.connect() } }
                 .controlSize(.small)
         }
-        .font(.callout)
-        .padding(.horizontal, Spacing.l).padding(.vertical, Spacing.s)
-        .background(Color.statusInfo.opacity(0.08))
+        .padding(.horizontal, Spacing.l).padding(.vertical, 7)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Demo mode. Showing sample data because the background service isn't running.")
+    }
+}
+
+struct SidebarBrand: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            IconBadge(symbol: "shield.lefthalf.filled", tint: .rampartTeal, size: 30)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Rampart").font(.title3.weight(.bold)).fontDesign(.rounded)
+                Text("Mac security").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, Spacing.l).padding(.top, Spacing.xs).padding(.bottom, Spacing.s)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -136,31 +157,37 @@ struct ErrorBanner: View {
     }
 }
 
-/// Score ring: custom Circle().trim with the numeral; colour follows the label, label text always shown.
+/// Score ring: angular gradient with a soft glow; the label text always appears next to it.
 struct ScoreRing: View {
     let score: Int
     var size: CGFloat = 120
     var lineWidth: CGFloat = 12
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @StateVar private var shown: Double = 0
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @StateVar private var shown: Double = -1
 
     var body: some View {
+        let colors = Palette.gradient(for: score)
+        let value = shown < 0 ? (reduceMotion ? Double(score) : 0) : shown
         ZStack {
-            Circle().stroke(Color.secondary.opacity(0.18), lineWidth: lineWidth)
+            Circle().stroke(colors[0].opacity(0.14), lineWidth: lineWidth)
             Circle()
-                .trim(from: 0, to: shown / 100)
-                .stroke(AppModel.scoreColor(score), style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .trim(from: 0, to: max(0.001, value / 100))
+                .stroke(AngularGradient(gradient: Gradient(colors: [colors[0].opacity(0.7), colors[0], colors[1]]),
+                                        center: .center, startAngle: .degrees(0), endAngle: .degrees(360 * max(0.01, value / 100))),
+                        style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
                 .rotationEffect(.degrees(-90))
+                .shadow(color: reduceTransparency ? .clear : colors[1].opacity(0.45), radius: lineWidth * 0.8)
             VStack(spacing: 0) {
                 Text("\(score)")
-                    .font(.system(size: size * 0.36, weight: .semibold, design: .rounded))
+                    .font(.system(size: size * 0.34, weight: .bold, design: .rounded))
                     .monospacedDigit()
                     .contentTransition(.numericText())
-                Text("of 100").font(.caption).foregroundStyle(.secondary)
+                if size >= 80 { Text("of 100").font(.caption).foregroundStyle(.secondary) }
             }
         }
         .frame(width: size, height: size)
-        .onAppear { withAnimation(reduceMotion ? nil : .easeOut(duration: 0.8)) { shown = Double(score) } }
+        .onAppear { if reduceMotion || Headless.active { shown = Double(score) } else { withAnimation(.easeOut(duration: 0.9)) { shown = Double(score) } } }
         .onChange(of: score) { _, new in withAnimation(reduceMotion ? nil : .easeOut(duration: 0.5)) { shown = Double(new) } }
     }
 }
@@ -179,4 +206,8 @@ struct EmptyStateView: View {
         .padding(Spacing.xxl)
         .accessibilityElement(children: .combine)
     }
+}
+
+extension Notification.Name {
+    static let rampartOnboardingAdvance = Notification.Name("app.rampart.onboardingAdvance")
 }

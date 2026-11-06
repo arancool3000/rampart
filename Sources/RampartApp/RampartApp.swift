@@ -4,7 +4,21 @@ import RampartShared
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        if Headless.active {
+            NSApp.setActivationPolicy(.prohibited)
+            HeadlessRunner.installWindowGuard()
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if Headless.active {
+            NSApp.setActivationPolicy(.prohibited)
+            for w in NSApp.windows { HeadlessRunner.hide(w) }
+            AppModel.shared.start()
+            Task { await HeadlessRunner.run() }
+            return
+        }
         // The login LaunchAgent starts the app with --background: menu bar only, no window, no focus change.
         let background = CommandLine.arguments.contains("--background")
         let showDock = UserDefaults.standard.object(forKey: "general.showDock") as? Bool ?? true
@@ -20,7 +34,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             NSApp.activate(ignoringOtherApps: true)
         }
-        Snapshotter.runIfRequested()
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
@@ -36,19 +49,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct RampartApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    @AppStorage("general.showMenuBar") var showMenuBar = true
     let model = AppModel.shared
+    let chrome = ChromeState.shared
 
     var body: some Scene {
+        mainWindow
+        settingsAndMenuBar
+    }
+
+    private var mainWindow: some Scene {
         Window("Rampart", id: "main") {
             RootView()
+                .background(HeadlessWindowHider())
                 .environment(model)
                 .tint(.rampartTeal)
                 .frame(minWidth: 900, minHeight: 600)
         }
         .defaultSize(width: 1100, height: 740)
-        .commands { RampartCommands(model: model) }
+        .commands { RampartCommands() }
+    }
 
+    @SceneBuilder private var settingsAndMenuBar: some Scene {
         Settings {
             SettingsView(standalone: true)
                 .environment(model)
@@ -56,40 +77,43 @@ struct RampartApp: App {
                 .frame(width: 680, height: 560)
         }
 
-        MenuBarExtra(isInserted: $showMenuBar) {
+        MenuBarExtra(isInserted: chrome.menuBarBinding) {
             MenuBarView()
                 .environment(model)
                 .tint(.rampartTeal)
         } label: {
-            Image(systemName: model.openDetections.isEmpty ? "shield.lefthalf.filled" : "exclamationmark.shield")
-                .accessibilityLabel(model.openDetections.isEmpty ? "Rampart: protected" : "Rampart: item needs attention")
+            MenuBarLabel()
         }
         .menuBarExtraStyle(.window)
     }
 }
 
+/// Reads only ChromeState (changes on scan start/stop), never the full model, so menus aren't rebuilt per tick.
 struct RampartCommands: Commands {
-    let model: AppModel
+    let chrome = ChromeState.shared
     var body: some Commands {
         CommandGroup(after: .sidebar) {
-            ForEach(SidebarItem.allCases) { item in
-                Button(item.title) { model.selection = item }
-                    .keyboardShortcut(item.shortcut, modifiers: .command)
-            }
+            Button("Overview") { AppModel.shared.selection = .dashboard }.keyboardShortcut("1", modifiers: .command)
+            Button("Scan") { AppModel.shared.selection = .scan }.keyboardShortcut("2", modifiers: .command)
+            Button("Threats & Quarantine") { AppModel.shared.selection = .threats }.keyboardShortcut("3", modifiers: .command)
+            Button("Protection Activity") { AppModel.shared.selection = .activity }.keyboardShortcut("4", modifiers: .command)
+            Button("Network") { AppModel.shared.selection = .network }.keyboardShortcut("5", modifiers: .command)
+            Button("Privacy & Posture") { AppModel.shared.selection = .posture }.keyboardShortcut("6", modifiers: .command)
+            Button("Settings") { AppModel.shared.selection = .settings }.keyboardShortcut("7", modifiers: .command)
         }
         CommandMenu("Scan") {
-            Button("Quick Scan") { model.selection = .scan; model.startScan(.quick) }
+            Button("Quick Scan") { AppModel.shared.selection = .scan; AppModel.shared.startScan(.quick) }
                 .keyboardShortcut("r", modifiers: .command)
-                .disabled(model.isScanning)
-            Button("Full Scan") { model.selection = .scan; model.startScan(.full) }
+                .disabled(chrome.isScanning)
+            Button("Full Scan") { AppModel.shared.selection = .scan; AppModel.shared.startScan(.full) }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(model.isScanning)
+                .disabled(chrome.isScanning)
             Divider()
-            Button("Stop Scan") { model.stopScan() }
+            Button("Stop Scan") { AppModel.shared.stopScan() }
                 .keyboardShortcut(".", modifiers: .command)
-                .disabled(!model.isScanning)
+                .disabled(!chrome.isScanning)
             Divider()
-            Button("Update Definitions") { Task { await model.updateDefinitions() } }
+            Button("Update Definitions") { Task { await AppModel.shared.updateDefinitions() } }
         }
     }
 }

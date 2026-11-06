@@ -5,6 +5,10 @@ import Combine
 struct OnboardingView: View {
     enum Step: Int, CaseIterable { case welcome, fullDisk, notifications, firstScan }
     var onFinish: () -> Void
+    init(onFinish: @escaping () -> Void, initialStep: Step = .welcome) {
+        self.onFinish = onFinish
+        _step = StateVar(initialValue: initialStep)
+    }
     @Environment(AppModel.self) private var model
     @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -51,6 +55,7 @@ struct OnboardingView: View {
             .accessibilityLabel("Step \(step.rawValue + 1) of \(Step.allCases.count)")
         }
         .frame(width: 640, height: 520)
+        .background(AppBackdrop())
         .onReceive(NotificationCenter.default.publisher(for: .rampartOnboardingAdvance)) { _ in advance() }
         .onReceive(poll) { _ in
             if step == .fullDisk && !fdaGranted && FDAProbe.check() {
@@ -70,9 +75,8 @@ struct OnboardingView: View {
     private func page<Content: View>(symbol: String, tint: Color = .rampartTeal, title: String, body: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(spacing: Spacing.l) {
             Spacer()
-            Image(systemName: symbol).font(.system(size: 60)).foregroundStyle(tint).symbolRenderingMode(.hierarchical)
-                .accessibilityHidden(true)
-            Text(title).font(.largeTitle.weight(.semibold)).multilineTextAlignment(.center)
+            ShieldHero(symbol: symbol, tint: tint, breathe: step == .welcome, size: 112)
+            Text(title).font(.largeTitle.weight(.bold)).fontDesign(.rounded).multilineTextAlignment(.center)
             Text(body).font(.title3).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             content()
             Spacer()
@@ -82,7 +86,7 @@ struct OnboardingView: View {
     private var welcome: some View {
         page(symbol: "shield.lefthalf.filled", title: "Welcome to Rampart",
              body: "Rampart protects your Mac quietly in the background. We'll set up two permissions, then run a quick check. It takes about 2 minutes.") {
-            Button("Get Started") { advance() }.buttonStyle(.borderedProminent).controlSize(.large).keyboardShortcut(.defaultAction)
+            Button("Get Started") { advance() }.buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
                 .padding(.top, Spacing.s)
             Text("No ads. No upsells. Your files stay on your Mac.").font(.callout).foregroundStyle(.secondary)
         }
@@ -96,7 +100,7 @@ struct OnboardingView: View {
                 StatusLabel(text: "Full Disk Access is on", symbol: "checkmark.circle.fill", tint: .statusProtected).font(.headline)
             } else {
                 Button("Open Privacy Settings") { openURL(FDAProbe.settingsURL) }
-                    .buttonStyle(.borderedProminent).controlSize(.large).keyboardShortcut(.defaultAction)
+                    .buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
                 VStack(alignment: .leading, spacing: 6) {
                     Label("In System Settings, find **Rampart** in the list", systemImage: "1.circle")
                     Label("Turn its switch on and enter your password", systemImage: "2.circle")
@@ -132,7 +136,7 @@ struct OnboardingView: View {
                 Button("Allow Notifications") {
                     Task { notifState = await Notifier.shared.requestAuthorization(); advance() }
                 }
-                .buttonStyle(.borderedProminent).controlSize(.large).keyboardShortcut(.defaultAction)
+                .buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
             }
         }
     }
@@ -148,7 +152,7 @@ struct OnboardingView: View {
                     if !found.isEmpty { model.selection = .threats }
                     onFinish()
                 }
-                .buttonStyle(.borderedProminent).controlSize(.large).keyboardShortcut(.defaultAction)
+                .buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
             }
         } else {
             page(symbol: "magnifyingglass", title: "Let's do a quick check",

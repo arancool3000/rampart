@@ -24,30 +24,20 @@ enum Spacing {
     static let xs: CGFloat = 4, s: CGFloat = 8, m: CGFloat = 12, l: CGFloat = 16, xl: CGFloat = 24, xxl: CGFloat = 32
 }
 
-struct CardModifier: ViewModifier {
-    var padding: CGFloat = Spacing.l
-    func body(content: Content) -> some View {
-        content
-            .padding(padding)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-}
-
 extension View {
-    func card(padding: CGFloat = Spacing.l) -> some View { modifier(CardModifier(padding: padding)) }
 
     /// Primary action: glass prominent on macOS 26+, bordered prominent before.
     @ViewBuilder func primaryActionStyle() -> some View {
-        if #available(macOS 26, *) { self.buttonStyle(.glassProminent) } else { self.buttonStyle(.borderedProminent) }
+        if #available(macOS 26, *), !Headless.active { self.buttonStyle(.glassProminent) } else { self.buttonStyle(.borderedProminent) }
     }
     /// Secondary toolbar/chrome action.
     @ViewBuilder func secondaryActionStyle() -> some View {
-        if #available(macOS 26, *) { self.buttonStyle(.glass) } else { self.buttonStyle(.bordered) }
+        // Offscreen (headless) rendering can't rasterise Liquid Glass backdrops; use bordered there.
+        if #available(macOS 26, *), !Headless.active { self.buttonStyle(.glass) } else { self.buttonStyle(.bordered) }
     }
     /// Floating control bar (navigation/control layer only, never content).
     @ViewBuilder func floatingGlassBar() -> some View {
-        if #available(macOS 26, *) {
+        if #available(macOS 26, *), !Headless.active {
             self.glassEffect(.regular.interactive(), in: Capsule())
         } else {
             self.background(.regularMaterial, in: Capsule())
@@ -67,7 +57,7 @@ struct SectionHeader: View {
     init(_ title: String, trailing: AnyView? = nil) { self.title = title; self.trailing = trailing }
     var body: some View {
         HStack {
-            Text(title).font(.headline)
+            Text(title).font(.title3.weight(.semibold)).fontDesign(.rounded)
             Spacer()
             if let trailing { trailing }
         }
