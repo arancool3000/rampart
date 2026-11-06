@@ -5,7 +5,7 @@ import RampartShared
 /// File-level FSEvents on configurable trees. No pid (FSEvents doesn't carry one): the behaviour engine
 /// attributes by correlation. The last event ID is persisted so a restart replays what happened while
 /// the daemon was down (only when the volume UUID is unchanged).
-public final class FSEventsSource: EventSource {
+public final class FSEventsSource: EventSource, CPUReporting {
     public struct State: Codable, Equatable {
         public var lastEventID: UInt64
         public var deviceUUID: String?
@@ -13,6 +13,7 @@ public final class FSEventsSource: EventSource {
     }
 
     public let name = "fsevents"
+    public let cpu = CPUMeter()
     public let paths: [String]
     public let latency: CFTimeInterval
     /// Where the last event ID is stored. nil disables persistence.
@@ -145,11 +146,13 @@ public final class FSEventsSource: EventSource {
         guard let info else { return }
         let me = Unmanaged<FSEventsSource>.fromOpaque(info).takeUnretainedValue()
         let arr = unsafeBitCast(pathsPtr, to: NSArray.self)
-        for i in 0..<count {
-            guard let path = arr[i] as? String else { continue }
-            me.handle(path: path, flags: flagsPtr[i], id: idsPtr[i])
+        me.cpu.measure {
+            for i in 0..<count {
+                guard let path = arr[i] as? String else { continue }
+                me.handle(path: path, flags: flagsPtr[i], id: idsPtr[i])
+            }
+            me.persistLocked(force: false)
         }
-        me.persistLocked(force: false)
     }
 
     /// Runs on `queue`.

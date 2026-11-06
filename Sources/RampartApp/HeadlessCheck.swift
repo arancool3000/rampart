@@ -12,6 +12,11 @@ enum Headless {
         if let i = a.firstIndex(of: "--headless-check"), i + 1 < a.count, let s = Double(a[i + 1]) { return s }
         return 30
     }
+    static var scanPath: String? {
+        let a = CommandLine.arguments
+        guard let i = a.firstIndex(of: "--scan-path"), i + 1 < a.count else { return nil }
+        return a[i + 1]
+    }
     static var renderDir: URL? {
         let a = CommandLine.arguments
         guard let i = a.firstIndex(of: "--render-ui"), i + 1 < a.count else { return nil }
@@ -106,17 +111,34 @@ enum HeadlessRunner {
         var samples: [(t: Double, cpu: Double, mb: Double)] = []
         var scanDone = false
         var scanEndedAt: Double?
+        var lastHarnessActionAt: Double = 0
         var lastC = ProcStats.cpuSeconds(), lastT = Date()
         while Date().timeIntervalSince(t0) < total {
             await sleep(1)
             let el = Date().timeIntervalSince(t0)
             if el >= 3, !scanDone, !model.isScanning, model.scanHistory.count < 50 {
-                if case .idle = model.scanPhase { log("headless-check: starting simulated Quick Scan at \(Int(el)) s"); model.selection = .scan; model.startScan(.quick) }
+                if case .idle = model.scanPhase {
+                    if model.mode == .live {
+                        // Live: only ever scan an explicit scratch folder, never the user's real folders.
+                        if let p = Headless.scanPath {
+                            log("headless-check: live mode (\(model.source)), scanning \(p) at \(Int(el)) s")
+                            model.selection = .scan; model.startScan(.custom, paths: [p])
+                        } else { log("headless-check: live mode (\(model.source)), no --scan-path, skipping scan") }
+                    } else if model.mode == .demo {
+                        log("headless-check: starting simulated Quick Scan at \(Int(el)) s"); model.selection = .scan; model.startScan(.quick)
+                    } else {
+                        log("headless-check: mode=\(model.mode), no scan (\(model.lastError ?? "no error"))")
+                    }
+                }
                 scanDone = true
             }
-            if scanEndedAt == nil, scanDone, !model.isScanning { scanEndedAt = el }
+            if scanEndedAt == nil, scanDone, !model.isScanning {
+                scanEndedAt = el
+                log("headless-check: data counts: detections=\(model.detections.count) quarantine=\(model.quarantine.count) activity=\(model.activity.count) posture=\(model.posture.count) startup=\(model.persistence.count) connections=\(model.connections.reduce(0) { $0 + $1.destinations.count }) rules=\(model.allowRules.count) health=\(model.health.map { "\($0.mode) cpu \(String(format: "%.1f", $0.cpuPercent))% mem \(Int($0.residentMB)) MB" } ?? "none")")
+            }
             if case .finished = model.scanPhase, el > 12 {
                 model.scanPhase = .idle; model.selection = .dashboard
+                lastHarnessActionAt = el
                 // Worst-case run: resolve the demo threat so the hero shows its calm, breathing state.
                 if AnimationGate.shared.forced { for i in model.detections.indices { model.detections[i].resolved = true } }
             }
@@ -129,12 +151,15 @@ enum HeadlessRunner {
         }
         let elapsed = Date().timeIntervalSince(t0)
         let cpuTotal = ProcStats.cpuSeconds() - c0
-        let idle = samples.filter { $0.t >= min(14, total * 0.5) }
+        // Idle = after the scan has ended and its follow-up refresh has settled (8 s), or from 14 s with no scan.
+        let idleStart = max(min(14, total * 0.5), (scanEndedAt ?? 0) + 8, lastHarnessActionAt + 2)
+        let idle = samples.filter { $0.t >= idleStart }
         let idleCPU = idle.isEmpty ? 0 : idle.map(\.cpu).reduce(0, +) / Double(idle.count)
         func median(_ v: [Double]) -> Double { let s = v.sorted(); return s.isEmpty ? 0 : s[s.count / 2] }
         // Memory: settled footprint (median of the last 5 s) vs the median just after the demo scan ends
         // (5 s window), so scan churn and its release don't count as growth.
-        let end = scanEndedAt ?? 0
+        // Baseline starts after the scan and after the harness's own last UI change (navigation), +1 s.
+        let end = max(scanEndedAt ?? 0, lastHarnessActionAt > 0 ? lastHarnessActionAt + 1 : 0)
         let mbFirst = median(samples.filter { $0.t >= end && $0.t < end + 5 }.map(\.mb))
         let mbLast = median(samples.filter { $0.t > (samples.last?.t ?? 0) - 5 }.map(\.mb))
         let settledGrowth = mbLast - mbFirst

@@ -42,7 +42,7 @@ struct ThreatsView: View {
                 } else if segment == .quarantine, let id = selectedQuarantine, let r = model.quarantine.first(where: { $0.id == id }) {
                     DetectionInspector(detection: detection(for: r), record: r)
                 } else {
-                    EmptyStateView(symbol: "info.circle", title: "Select an item", detail: "You'll see why Rampart flagged it and what you can do.")
+                    EmptyStateView(symbol: "info.circle", title: "Select an item", detail: "You'll see why \(Product.name) flagged it and what you can do.")
                 }
             }
             .inspectorColumnWidth(min: 320, ideal: 380, max: 480)
@@ -67,8 +67,8 @@ struct ThreatsView: View {
         if model.detections.isEmpty {
             EmptyStateView(symbol: "checkmark.shield", title: "No threats found",
                            detail: model.mode == .live
-                               ? "Rampart checks new and changed files as they arrive. If it ever finds something, it will appear here with a plain explanation of why."
-                               : "When Rampart finds something, it will appear here with an explanation.")
+                               ? "\(Product.name) checks new and changed files as they arrive. If it ever finds something, it will appear here with a plain explanation of why."
+                               : "When \(Product.name) finds something, it will appear here with an explanation.", brand: true)
         } else {
             Table(sortedDetections, selection: $selectedDetection, sortOrder: $sortOrder) {
                 TableColumn("Item", value: \.name) { d in
@@ -103,7 +103,7 @@ struct ThreatsView: View {
     @ViewBuilder private var quarantineTable: some View {
         if model.quarantine.isEmpty {
             EmptyStateView(symbol: "archivebox", title: "Quarantine is empty",
-                           detail: "Files Rampart isolates will appear here. They can't run while they're here.")
+                           detail: "Files \(Product.name) isolates will appear here. They can't run while they're here.")
         } else {
             VStack(spacing: 0) {
                 Table(model.quarantine, selection: $selectedQuarantine) {
@@ -222,7 +222,11 @@ struct DetectionInspector: View {
 
     private var header: some View {
         HStack(spacing: Spacing.m) {
-            FileIcon(path: detection?.path).frame(width: 40, height: 40).scaleEffect(1.5)
+            if let d = detection, !d.resolved {
+                ShieldLockAnimation(size: 52, trigger: d.id)
+            } else {
+                FileIcon(path: detection?.path).frame(width: 40, height: 40).scaleEffect(1.5)
+            }
             VStack(alignment: .leading, spacing: 4) {
                 Text(displayName).font(.title3.weight(.semibold)).lineLimit(2)
                 HStack(spacing: 6) {
@@ -237,9 +241,9 @@ struct DetectionInspector: View {
         let primary = d.evidence.max { $0.score < $1.score }
         return DisclosureGroup(isExpanded: $whyExpanded) {
             VStack(alignment: .leading, spacing: Spacing.m) {
-                (Text("Detected as ") + Text(d.name).bold() + Text(" by ") + Text(primary?.source.label ?? "Rampart").bold() + Text("."))
+                (Text("Detected as ") + Text(d.name).bold() + Text(" by ") + Text(primary?.source.label ?? "\(Product.name)").bold() + Text("."))
                     .fixedSize(horizontal: false, vertical: true)
-                ForEach(d.evidence.sorted { $0.score > $1.score }, id: \.self) { e in
+                ForEach(Array(d.evidence.sorted { $0.score > $1.score }.enumerated()), id: \.element) { idx, e in
                     HStack(alignment: .top, spacing: Spacing.s) {
                         Image(systemName: e.source.symbol).foregroundStyle(Color.rampartTeal).frame(width: 20)
                         VStack(alignment: .leading, spacing: 2) {
@@ -249,6 +253,7 @@ struct DetectionInspector: View {
                         }
                     }
                     .accessibilityElement(children: .combine)
+                    .modifier(Cascade(index: idx, trigger: d.id))
                 }
                 confidence(d.confidence)
             }
@@ -276,13 +281,13 @@ struct DetectionInspector: View {
 
     @ViewBuilder private var whatWeDid: some View {
         VStack(alignment: .leading, spacing: Spacing.xs) {
-            Text("What Rampart did").font(.headline)
+            Text("What \(Product.name) did").font(.headline)
             if let r = record {
                 Text("Moved to quarantine on \(r.date.formatted(date: .abbreviated, time: .shortened)). The file is encrypted and can't run.")
             } else if detection?.resolved == true {
                 Text("This item was resolved and is no longer flagged.")
             } else {
-                Text("Rampart stopped the process. The file is still in place. Choose what to do next.")
+                Text("\(Product.name) stopped the process. The file is still in place. Choose what to do next.")
             }
         }
         .font(.callout)
@@ -315,6 +320,10 @@ struct DetectionInspector: View {
                     .help("Opens your browser with the file's fingerprint only. Nothing is uploaded.")
             }
             Button("Copy Details") { copyDetails() }.buttonStyle(.link)
+            if let d = detection {
+                Button { AppFeatures.explain(d) } label: { Label("Explain", systemImage: "sparkles") }.buttonStyle(.link)
+                    .help("Ask the AI Assistant to explain this in plain language")
+            }
         }
         .font(.callout)
     }
@@ -338,7 +347,7 @@ struct DetectionInspector: View {
     }
 
     private func copyDetails() {
-        var s = "Rampart detection\nName: \(detection?.name ?? record?.detectionName ?? "")\n"
+        var s = "\(Product.name) detection\nName: \(detection?.name ?? record?.detectionName ?? "")\n"
         if let p = detection?.path ?? record?.originalPath { s += "Path: \(p)\n" }
         if let sha { s += "SHA-256: \(sha)\n" }
         if let d = detection {
@@ -362,7 +371,7 @@ struct RestoreSheet: View {
         let conf = (detection?.confidence ?? 0) >= 90 ? "high" : "medium"
         VStack(alignment: .leading, spacing: Spacing.l) {
             Text("Restore \"\(name)\"?").font(.title2.weight(.semibold))
-            Text("Rampart flagged this as \(detection?.category.label ?? record.detectionName) (\(conf) confidence). Restore it only if you trust where it came from.")
+            Text("\(Product.name) flagged this as \(detection?.category.label ?? record.detectionName) (\(conf) confidence). Restore it only if you trust where it came from.")
                 .fixedSize(horizontal: false, vertical: true)
             Picker("", selection: $choice) {
                 Text("Restore and always allow this file").tag(Choice.allowFile)
@@ -396,7 +405,7 @@ struct AllowSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
             Text("Allow \"\(detection.path.map { ($0 as NSString).lastPathComponent } ?? detection.name)\"?").font(.title2.weight(.semibold))
-            Text("Rampart won't flag it again. You can remove this rule anytime in Rules.")
+            Text("\(Product.name) won't flag it again. You can remove this rule anytime in Rules.")
                 .foregroundStyle(.secondary)
             Picker("", selection: $scope) {
                 Text("This file only (by fingerprint)").tag(AllowRuleSpec.Scope.fileHash)
@@ -429,7 +438,7 @@ struct ReportSheet: View {
                     .foregroundStyle(.primary)
                 HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
             } else {
-                Text("We'll send the file's fingerprint and detection details to the Rampart lab. We won't send the file itself unless you choose to.")
+                Text("We'll send the file's fingerprint and detection details to the \(Product.name) lab. We won't send the file itself unless you choose to.")
                     .fixedSize(horizontal: false, vertical: true)
                 Toggle("Include the file to help us review it faster", isOn: $includeFile)
                 TextField("Anything we should know? (optional)", text: $note, axis: .vertical).lineLimit(3...5)
@@ -441,5 +450,24 @@ struct ReportSheet: View {
             }
         }
         .padding(Spacing.xl).frame(width: 460)
+    }
+}
+
+/// Evidence rows cascade in, 60 ms apart (fade only under Reduce Motion).
+struct Cascade: ViewModifier {
+    let index: Int
+    let trigger: UUID
+    @StateVar private var shown = Headless.active
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    func body(content: Content) -> some View {
+        content
+            .opacity(shown ? 1 : 0)
+            .offset(y: shown || reduceMotion ? 0 : 10)
+            .onAppear { play() }
+            .onChange(of: trigger) { _, _ in shown = false; play() }
+    }
+    private func play() {
+        guard !Headless.active else { shown = true; return }
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.85).delay(0.15 + Double(index) * 0.06)) { shown = true }
     }
 }

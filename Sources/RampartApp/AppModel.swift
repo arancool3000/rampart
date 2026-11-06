@@ -6,6 +6,11 @@ import RampartShared
 
 enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
     case dashboard, scan, threats, activity, network, posture, rules, settings
+    // Tools (owned by feature agents; their screens live in Features/<Name>/). One case per feature.
+    case scamCheck, passwords, networkScan, aiAssistant, remoteAccess
+
+    static let core: [SidebarItem] = [.dashboard, .scan, .threats, .activity, .network, .posture, .rules, .settings]
+    static let tools: [SidebarItem] = [.scamCheck, .passwords, .networkScan, .aiAssistant, .remoteAccess]
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -17,6 +22,11 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .posture: return "Privacy & Posture"
         case .rules: return "Rules"
         case .settings: return "Settings"
+        case .scamCheck: return "Scam Check"
+        case .passwords: return "Passwords"
+        case .networkScan: return "Network Scan"
+        case .aiAssistant: return "AI Assistant"
+        case .remoteAccess: return "Remote Access"
         }
     }
     var symbol: String {
@@ -29,9 +39,13 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .posture: return "hand.raised.square"
         case .rules: return "list.bullet.rectangle"
         case .settings: return "gearshape"
+        case .scamCheck: return "exclamationmark.bubble"
+        case .passwords: return "key.horizontal"
+        case .networkScan: return "wifi.router"
+        case .aiAssistant: return "sparkles"
+        case .remoteAccess: return "rectangle.connected.to.line.below"
         }
     }
-    var shortcut: KeyEquivalent { KeyEquivalent(Character(String((SidebarItem.allCases.firstIndex(of: self) ?? 0) + 1))) }
 }
 
 enum ScanKind: String, CaseIterable, Identifiable {
@@ -161,7 +175,9 @@ enum ProtectionSource: Equatable {
     case basic                  // `rampartd --user` (no install)
 }
 
-enum ConnectionMode: Equatable { case connecting, live, demo }
+/// `offline`: the protection service couldn't be reached or started. Shown honestly, never with sample numbers.
+/// `demo`: developer-only sample data (`--demo`).
+enum ConnectionMode: Equatable { case connecting, live, offline, demo }
 
 // MARK: - Store
 
@@ -199,7 +215,7 @@ final class AppModel {
     var definitionsUpdated: Date?
     var isUpdatingDefinitions = false
     var fixingChecks: Set<String> = []
-    var hasFullDiskAccess = FDAProbe.check()
+    var hasFullDiskAccess = Headless.active ? false : FDAProbe.check()
     /// Last 14 days, oldest first (charts).
     var daily: [DayStat] = []
     @ObservationIgnored var liveBlockedByDay: [Int] = []
@@ -214,8 +230,16 @@ final class AppModel {
     @ObservationIgnored private var pollTimer: Timer?
     @ObservationIgnored private var started = false
     @ObservationIgnored private var pauseTimer: Timer?
+    @ObservationIgnored private var lastHeavyRefresh = Date.distantPast
+    @ObservationIgnored private var lastNetworkStats: NetworkStats?
+    @ObservationIgnored private var lastActivity: [ActivityEntry] = []
+    @ObservationIgnored private var lastConnections: [ConnectionInfo] = []
 
     var isDemo: Bool { mode == .demo }
+    var isOffline: Bool { mode == .offline }
+    /// True when the numbers on screen are real (or explicit developer demo data).
+    var hasData: Bool { mode == .live || mode == .demo }
+    static let demoRequested = CommandLine.arguments.contains("--demo")
     var openDetections: [Detection] { detections.filter { !$0.resolved } }
     var isScanning: Bool { if case .running = scanPhase { return true }; return false }
     var scanProgress: ScanProgress? { if case .running(let p) = scanPhase { return p }; return nil }
@@ -269,14 +293,30 @@ final class AppModel {
     }
 
     private func periodic() async {
-        hasFullDiskAccess = FDAProbe.check()
-        if mode == .demo, ProcessInfo.processInfo.arguments.contains("--demo") { return }
+        if !Headless.active { hasFullDiskAccess = FDAProbe.check() }
+        if Self.demoRequested { return }
         if await client.isReachable() {
-            if mode != .live { await connect(autoLaunch: false) } else { await refresh() }
-        } else if mode == .live {
-            // The service went away: try to bring basic protection back, else fall back.
+            if mode != .live { await connect(autoLaunch: false) }
+            else {
+                let heavy = Date().timeIntervalSince(lastHeavyRefresh) > 600
+                let c0 = ProcStats.cpuSeconds(), t0 = Date()
+                await refresh(heavy: heavy)
+                if Headless.active {
+                    HeadlessRunner.log(String(format: "headless-check: periodic refresh%@ took %.2f s wall, %.3f s CPU; activity=%d",
+                                              heavy ? " (heavy)" : "", Date().timeIntervalSince(t0), ProcStats.cpuSeconds() - c0, activity.count))
+                }
+            }
+        } else if mode == .live || mode == .offline {
+            // The service went away (or never came up): try to bring basic protection back.
             await connect(autoLaunch: true)
         }
+    }
+
+    /// User-initiated retry from the offline state.
+    func retry() async {
+        mode = .connecting
+        lastError = nil
+        await connect(autoLaunch: true)
     }
 
     func connect(autoLaunch: Bool = true) async {
@@ -290,9 +330,12 @@ final class AppModel {
             demoTimer?.invalidate()
             await refresh()
             subscribe()
-        } else if DaemonLauncher.shared.helperURL == nil || mode != .live {
-            // Demo only when there is no helper binary (dev builds) or it could not start.
-            enterDemo()
+        } else {
+            // No sample data: show the honest "service isn't running" state with a Retry button.
+            if mode == .live || mode == .demo { clearDemo() }
+            mode = .offline
+            if case .failed(let why) = launchState { lastError = why }
+            else if DaemonLauncher.shared.helperURL == nil { lastError = "This build doesn't include the \(Product.name) protection service." }
         }
     }
 
@@ -302,7 +345,9 @@ final class AppModel {
         recentBlocks = []; definitionsUpdated = nil
     }
 
-    func refresh() async {
+    /// Light refresh (every 15 s): status, detections, quarantine, activity, network stats, settings.
+    /// Heavy refresh adds posture and startup items (on connect, on demand, every 10 minutes).
+    func refresh(heavy: Bool = true) async {
         guard mode == .live else { return }
         do {
             if case .status(let s) = try await client.request(.status) { status = s }
@@ -312,26 +357,45 @@ final class AppModel {
             return
         }
         // Each v2 request is optional: an older daemon answers .error and that screen keeps its empty state.
-        if case .health(let h)? = try? await client.request(.health) {
-            health = h
-            source = h.mode == "user" ? .basic : .systemService
-        } else {
-            source = .systemService
+        if heavy || health == nil {
+            if case .health(let h)? = try? await client.request(.health) {
+                if h != health { health = h }
+                let src: ProtectionSource = h.mode == "user" ? .basic : .systemService
+                if src != source { source = src }
+            } else if source != .systemService {
+                source = .systemService
+            }
         }
-        if case .detections(let d)? = try? await client.request(.listDetections) { detections = d.sorted { $0.date > $1.date } }
-        if case .quarantine(let q)? = try? await client.request(.listQuarantine) { quarantine = q.sorted { $0.date > $1.date } }
-        if case .settings(let st)? = try? await client.request(.getSettings) { settings = st }
-        if case .allowRules(let r)? = try? await client.request(.listAllowRules) { allowRules = r.sorted { $0.created > $1.created } }
-        if case .networkStats(let n)? = try? await client.request(.networkStats) { apply(n) }
+        if case .detections(let d)? = try? await client.request(.listDetections) { set(\.detections, d.sorted { $0.date > $1.date }) }
+        if case .quarantine(let q)? = try? await client.request(.listQuarantine) { set(\.quarantine, q.sorted { $0.date > $1.date }) }
+        if case .settings(let st)? = try? await client.request(.getSettings) { set(\.settings, st) }
+        if case .allowRules(let r)? = try? await client.request(.listAllowRules) { set(\.allowRules, r.sorted { $0.created > $1.created }) }
+        if case .networkStats(let n)? = try? await client.request(.networkStats), n != lastNetworkStats { lastNetworkStats = n; apply(n) }
         if case .wifi(let w)? = try? await client.request(.wifi) {
-            wifi = w.connected ? WiFiInfo(ssid: w.ssid, security: w.security ?? "Unknown security", encrypted: !w.weakSecurity,
-                                          gatewayChanged: w.gatewayMACChanged, note: w.note) : nil
+            set(\.wifi, w.connected ? WiFiInfo(ssid: w.ssid, security: w.security ?? "Unknown security", encrypted: !w.weakSecurity,
+                                               gatewayChanged: w.gatewayMACChanged, note: w.note) : nil)
         }
-        if case .connections(let c)? = try? await client.request(.connections) { apply(c) }
-        if case .activity(let a)? = try? await client.request(.activity(limit: 500)) { apply(a) } else { rebuildLiveActivity() }
-        if case .posture(let p)? = try? await client.request(.posture, timeout: 30) { posture = p }
-        if case .persistence(let p)? = try? await client.request(.persistence, timeout: 30) { persistence = p }
-        definitionsUpdated = status.lastScan ?? definitionsUpdated
+        if case .activity(let a)? = try? await client.request(.activity(limit: 300)) {
+            if a != lastActivity { lastActivity = a; apply(a) }
+        } else { rebuildLiveActivity() }
+        if heavy {
+            lastHeavyRefresh = Date()
+            if case .connections(let c)? = try? await client.request(.connections) { apply(c) }
+            await refreshPosture()
+        }
+        let defs = status.lastScan ?? definitionsUpdated
+        if defs != definitionsUpdated { definitionsUpdated = defs }
+    }
+
+    func refreshPosture() async {
+        guard mode == .live else { return }
+        if case .posture(let p)? = try? await client.request(.posture, timeout: 30) { set(\.posture, p) }
+        if case .persistence(let p)? = try? await client.request(.persistence, timeout: 30) { set(\.persistence, p) }
+    }
+
+    /// Assigns only when the value changed, so unchanged data doesn't re-render views.
+    private func set<T: Equatable>(_ kp: ReferenceWritableKeyPath<AppModel, T>, _ v: T) {
+        if self[keyPath: kp] != v { self[keyPath: kp] = v }
     }
 
     private func apply(_ n: NetworkStats) {
@@ -345,6 +409,8 @@ final class AppModel {
     }
 
     private func apply(_ c: [ConnectionInfo]) {
+        guard c != lastConnections else { return }
+        lastConnections = c
         let groups = Dictionary(grouping: c) { $0.processName }
         connections = groups.map { name, rows in
             AppConnections(app: name, bundlePath: rows.first?.processPath.flatMap(Self.bundlePath(forExecutable:)), signing: rows.first?.signing, sentKB: 0, receivedKB: 0,
@@ -451,8 +517,10 @@ final class AppModel {
 
     // MARK: Overall state for hero / menu bar
 
-    enum Overall { case protected, recommendations(Int), threat(Int), off, limited, paused(Date) }
+    enum Overall { case protected, recommendations(Int), threat(Int), off, limited, paused(Date), starting, serviceDown }
     var overall: Overall {
+        if mode == .connecting { return .starting }
+        if mode == .offline { return .serviceDown }
         if !openDetections.isEmpty { return .threat(openDetections.count) }
         if let p = pausedUntil, p > Date() { return .paused(p) }
         if !status.realtimeOn { return .off }
@@ -481,6 +549,7 @@ final class AppModel {
                 let m = AppModel.shared
                 switch resp {
                 case .scanProgress(let scanned, let total, let current):
+                    if Headless.active && scanned <= 1 { HeadlessRunner.log("headless-check: scan progress \(scanned)/\(total) \(current)") }
                     guard case .running(var p) = m.scanPhase else { return true }
                     let now = Date()
                     if now.timeIntervalSince(lastUI) < 0.1 { return true }   // throttle to 10 Hz
@@ -490,6 +559,7 @@ final class AppModel {
                     m.noteScanPath(current)
                     return true
                 case .scanFinished(let scanned, let found, let seconds):
+                    if Headless.active { HeadlessRunner.log("headless-check: scan finished: \(scanned) files, \(found.count) found (\(found.map(\.name).joined(separator: ", "))) in \(String(format: "%.2f", seconds)) s") }
                     m.finishScan(kind: kind, scanned: scanned, found: found, seconds: seconds, skipped: 0)
                     return false
                 case .event(let d):
@@ -500,6 +570,7 @@ final class AppModel {
                 }
             }, onEnd: { err in
                 let m = AppModel.shared
+                if Headless.active { HeadlessRunner.log("headless-check: scan stream ended \(err.map { "with error: \($0.localizedDescription)" } ?? "cleanly")") }
                 if let err, m.isScanning { m.lastError = err.localizedDescription; m.scanPhase = .idle }
             })
         } else {
@@ -637,7 +708,7 @@ final class AppModel {
     func previewRemediation(_ item: PersistenceItem) async -> Result<RemediationPreview, Error> {
         if mode != .live {
             return .success(RemediationPreview(persistenceID: item.id, title: "Turn off \(item.label)",
-                steps: ["Stop \(item.label) if it is running", "Turn it off so it doesn't start at login", "Move \((item.location as NSString).lastPathComponent) to Rampart's quarantine so you can undo this"],
+                steps: ["Stop \(item.label) if it is running", "Turn it off so it doesn't start at login", "Move \((item.location as NSString).lastPathComponent) to \(Product.name)'s quarantine so you can undo this"],
                 commands: ["launchctl bootout gui/501 \(item.location)", "launchctl disable gui/501/\(item.label)", "mv \(item.location) ~/Library/Application Support/Rampart/Quarantine/"],
                 undoable: true, requiresRoot: item.kind == .launchDaemon))
         }
@@ -680,7 +751,7 @@ final class AppModel {
             do { _ = try await client.request(.fixPosture(checkID: c.id), timeout: 60); await refresh() } catch { lastError = error.localizedDescription; return }
         } else {
             try? await Task.sleep(nanoseconds: 700_000_000)
-            if let i = posture.firstIndex(where: { $0.id == c.id }) { posture[i].state = .pass; posture[i].detail = "Turned on by Rampart just now." }
+            if let i = posture.firstIndex(where: { $0.id == c.id }) { posture[i].state = .pass; posture[i].detail = "Turned on by \(Product.name) just now." }
         }
         activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Fixed: \(c.title)", outcome: "Done"), at: 0)
     }

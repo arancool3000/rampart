@@ -116,7 +116,7 @@ enum DefaultRules {
      "matchers": [
        {"kinds": ["exec"], "process": ["defaults"], "args": ["write", "com\\.apple\\.loginwindow", "(LoginHook|LogoutHook)"]}
      ]},
-    {"id": "R19", "name": "Dock tile hijack", "type": "strong", "category": "malware", "score": 75, "stage": "persistence", "subject": "target", "builtin": true,
+    {"id": "R19", "name": "Dock tile hijack", "type": "strong", "category": "malware", "score": 75, "stage": "persistence", "subject": "none", "builtin": true,
      "why": "A Dock icon opens an app outside /Applications, ~/Applications and /System, or an app whose bundle ID differs from the one the tile claims: a look-alike launcher."},
     {"id": "R20", "name": "Browser extension sideloaded or force-installed", "type": "strong", "category": "adware", "score": 70, "stage": "persistence", "subject": "lineage", "builtin": true,
      "why": "A browser extension was installed outside the web store, or a force-install policy was written outside MDM.",
@@ -184,13 +184,13 @@ enum DefaultRules {
     {"id": "M01", "name": "Risky clipboard copied from a browser", "type": "marker", "category": "suspicious", "score": 0,
      "why": "Session agent classified a clipboard copy from a browser as a risky command.",
      "matchers": [
-       {"kinds": ["other"], "detail": {"type": "^clipboard$", "class": "^risky$", "source_app": "(?i)(chrome|safari|firefox|brave|edge|arc|opera|vivaldi|chromium|orion|webkit)"}, "detailNot": {"clip_tokens": ".+"}, "setMark": {"name": "riskyClipboard", "from": "global", "window": 120}}
+       {"kinds": ["other"], "detail": {"type": "^clipboard$", "class": "^risky$", "source_app": "(?i)(chrome|safari|firefox|brave|edge|arc|opera|vivaldi|chromium|orion|webkit)"}, "detailNot": {"clip_tokens": ".+"}, "setMark": {"name": "riskyClipboard", "from": "global", "window": 600}}
      ]},
     {"id": "R31", "name": "ClickFix: browser copy pasted into Terminal", "type": "sequence", "category": "malware", "score": 70, "stage": "entry", "subject": "lineage",
-     "why": "A command classified as risky was copied from a web page and, within two minutes, a Terminal shell ran a matching download/decode/script command.",
+     "why": "A command classified as risky was copied from a web page and, within ten minutes, a Terminal shell ran a matching download/decode/script command.",
      "matchers": [
        {"kinds": ["exec"], "ancestor": ["@terminals"], "clipboardOverlap": 0.6, "argsNot": ["@installerHosts"], "setMark": {"name": "pasteEntry", "from": "global", "window": 600}},
-       {"kinds": ["exec"], "ancestor": ["@terminals"], "argsAny": ["\\b(curl|wget)\\b", "base64\\s+(-d|--decode|-D)", "\\bosascript\\b", "\\bopenssl\\s+(enc|base64)\\b"], "argsNot": ["@installerHosts"], "requireMark": {"name": "riskyClipboard", "scope": "global", "window": 120}, "setMark": {"name": "pasteEntry", "from": "global", "window": 600}}
+       {"kinds": ["exec"], "ancestor": ["@terminals"], "argsAny": ["\\b(curl|wget)\\b", "base64\\s+(-d|--decode|-D)", "\\bosascript\\b", "\\bopenssl\\s+(enc|base64)\\b"], "argsNot": ["@installerHosts"], "requireMark": {"name": "riskyClipboard", "scope": "global", "window": 600}, "setMark": {"name": "pasteEntry", "from": "global", "window": 600}}
      ]},
     {"id": "R32", "name": "Apple paste warning overridden", "type": "strong", "category": "malware", "score": 65, "stage": "entry", "subject": "lineage",
      "why": "The user bypassed macOS's 'Possible malware, paste blocked' warning in Terminal.",

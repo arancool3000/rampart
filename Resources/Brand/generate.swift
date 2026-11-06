@@ -41,25 +41,35 @@ enum Brand {
     static let white = RGB(hex: 0xFFFFFF)
 }
 
-// MARK: - Mark geometry (hand-written SVG path data, 1024 canvas, y-down)
+// MARK: - Mark geometry (1024 canvas, y-down, same as SVG)
 //
-// The "Keep R": an R whose stem is a tower (it rises above the bowl and is crowned with a crenel,
-// two merlons), whose bowl is a solid rampart block, and whose leg is a teal stride.
-// The three pieces sit 22 units apart like dressed stones, which also gives the animation its parts.
+// "Two-Part Shield". First read: a clean, curved, two-tone shield. Look again:
+//   the seam where the white half meets the teal half is a keyhole. Two parts, one lock: Ram + Part.
+// The shield outline is three curves (a shallow crown and two flanks meeting at the point). The halves
+// are that outline split at the centre line, minus the keyhole.
 
 enum MarkGeometry {
     // Body of the macOS icon grid: 824 x 824 at (100,100) on a 1024 canvas.
     static let tileRect = CGRect(x: 100, y: 100, width: 824, height: 824)
-    static let stem = "M300 222H340V276H388V222H428V802H300Z"
-    static let bowl = "M450 254H550A174 174 0 0 1 550 602H450V482H550A54 54 0 0 0 550 374H450Z"
-    static let leg = "M508 624H640L734 802H580Z"
-    /// Assembly order for animation (part-1 ... part-3); the tile is part-0.
+    /// Hand-written outline: crown from (262,248) over (512,214) to (762,248); flanks meet at (512,814).
+    static let shieldD = "M262 248Q512 180 762 248C762 550 642 742 512 814C382 742 262 550 262 248Z"
+    /// Keyhole: bow centred at (512,436) r 58; slot flares from 26 to 60 wide down through the point.
+    static let keyholeD = "M512 378A58 58 0 0 1 512 494A58 58 0 0 1 512 378Z" + "M499 470H525L542 840H482Z"
+    static let shieldCenter = CGPoint(x: 512, y: 436)
+    static let glintPoint = CGPoint(x: 756, y: 250)
+    static let keyhole: CGPath = parseSVGPath(keyholeD).union(CGPath(rect: .zero, transform: nil))
+    static let shield: CGPath = parseSVGPath(shieldD)
+    static let left: CGPath = shield.subtracting(keyhole).intersection(CGPath(rect: CGRect(x: 0, y: 0, width: 512, height: 1024), transform: nil))
+    static let right: CGPath = shield.subtracting(keyhole).intersection(CGPath(rect: CGRect(x: 512, y: 0, width: 512, height: 1024), transform: nil))
+    /// Keyhole clipped to the shield: the plug that fills it during the reveal animation.
+    static let plug: CGPath = keyhole.intersection(shield)
     static let parts: [(id: String, name: String, d: String)] = [
-        ("part-1", "stem (tower)", stem), ("part-2", "bowl (rampart block)", bowl), ("part-3", "leg (stride)", leg)]
-    static let markBox = CGRect(x: 300, y: 222, width: 434, height: 580)
+        ("part-1", "left half (Ram), white", svgD(left)), ("part-2", "right half (Part), teal", svgD(right))]
+    static let plugD = svgD(plug)
+    static let markBox = CGRect(x: 262, y: 214, width: 500, height: 600)
 }
 
-// MARK: - Minimal SVG path parser (M L H V Z, and A for semicircles only, which is all the mark uses)
+// MARK: - Minimal SVG path parser (M L H V Q C Z, and A for semicircles only, which is all the mark uses)
 
 func parseSVGPath(_ d: String) -> CGPath {
     var tokens: [String] = []; var cur = ""
@@ -70,16 +80,21 @@ func parseSVGPath(_ d: String) -> CGPath {
         else { cur.append(ch) }
     }
     if !cur.isEmpty { tokens.append(cur) }
-    let p = CGMutablePath(); var i = 0; var pt = CGPoint.zero; var cmd = ""
+    let p = CGMutablePath(); var i = 0; var pt = CGPoint.zero; var start = CGPoint.zero; var cmd = ""
     func num() -> CGFloat { defer { i += 1 }; return CGFloat(Double(tokens[i])!) }
     while i < tokens.count {
         if tokens[i].first!.isLetter { cmd = tokens[i]; i += 1 }
         switch cmd {
-        case "M": pt = CGPoint(x: num(), y: num()); p.move(to: pt); cmd = "L"
+        case "M": pt = CGPoint(x: num(), y: num()); p.move(to: pt); start = pt; cmd = "L"
         case "L": pt = CGPoint(x: num(), y: num()); p.addLine(to: pt)
         case "H": pt.x = num(); p.addLine(to: pt)
         case "V": pt.y = num(); p.addLine(to: pt)
-        case "Z": p.closeSubpath()
+        case "Z": p.closeSubpath(); pt = start; if i < tokens.count, !tokens[i].first!.isLetter { fatalError("number after Z") }
+        case "Q":
+            let c = CGPoint(x: num(), y: num()); pt = CGPoint(x: num(), y: num()); p.addQuadCurve(to: pt, control: c)
+        case "C":
+            let c1 = CGPoint(x: num(), y: num()), c2 = CGPoint(x: num(), y: num()); pt = CGPoint(x: num(), y: num())
+            p.addCurve(to: pt, control1: c1, control2: c2)
         case "A":
             let r = num(); _ = num(); _ = num(); _ = num(); let sweep = num()
             let end = CGPoint(x: num(), y: num())
@@ -154,7 +169,8 @@ func shadow(_ ctx: CGContext, dy: CGFloat, blur: CGFloat, alpha: CGFloat, scale:
 // MARK: - Icon drawing
 
 struct PartState { var alpha: CGFloat = 1; var transform: CGAffineTransform = .identity }
-struct IconState { var tile = PartState(); var parts = [PartState(), PartState(), PartState()]; var glow: CGFloat = 1 }
+struct IconState { var tile = PartState(); var parts = [PartState(), PartState()]; var glow: CGFloat = 1
+    var plug = PartState(alpha: 0); var glint: CGFloat = 0 }
 
 /// Draws the icon into a 1024-unit space. `px` is the final pixel size (for small-size tuning).
 func drawIcon(_ ctx: CGContext, px: CGFloat, state: IconState = IconState(), tile: Bool = true) {
@@ -178,17 +194,41 @@ func drawIcon(_ ctx: CGContext, px: CGFloat, state: IconState = IconState(), til
         ctx.restoreGState()
         ctx.restoreGState()
     }
-    let fills: [(RGB, RGB)] = [(Brand.white, Brand.frost), (Brand.white, Brand.frost), (Brand.mint, Brand.teal)]
+    let fills: [(RGB, RGB)] = [(Brand.white, Brand.frost), (Brand.mint, Brand.accentLight)]
     for (i, part) in MarkGeometry.parts.enumerated() {
         let st = state.parts[i]; if st.alpha <= 0 { continue }
         let path = parseSVGPath(part.d)
         ctx.saveGState(); ctx.setAlpha(st.alpha); ctx.concatenate(st.transform)
         ctx.saveGState(); shadow(ctx, dy: 8, blur: small ? 6 : 18, alpha: 0.38, scale: s)
-        ctx.addPath(path); ctx.setFillColor(fills[i].0.cg); ctx.fillPath(); ctx.restoreGState()
-        ctx.saveGState(); ctx.addPath(path); ctx.clip()
-        ctx.drawLinearGradient(gradient([fills[i].0, fills[i].1]), start: CGPoint(x: 0, y: 222), end: CGPoint(x: 0, y: 802), options: [])
+        ctx.addPath(path); ctx.setFillColor(fills[i].0.cg); ctx.fillPath(using: .evenOdd); ctx.restoreGState()
+        ctx.saveGState(); ctx.addPath(path); ctx.clip(using: .evenOdd)
+        ctx.drawLinearGradient(gradient([fills[i].0, fills[i].1]), start: CGPoint(x: 0, y: 214), end: CGPoint(x: 0, y: 814), options: [])
         ctx.restoreGState()
         ctx.restoreGState()
+    }
+    // Animation only: the plug fills the keyhole until the reveal.
+    // Each half carries its own half of the plug, so the halves arrive solid and the keyhole opens only at the reveal.
+    if state.plug.alpha > 0 {
+        for (i, half) in [CGRect(x: 0, y: 0, width: 512, height: 1024), CGRect(x: 512, y: 0, width: 512, height: 1024)].enumerated() {
+            let st = state.parts[i]; if st.alpha <= 0 { continue }
+            ctx.saveGState(); ctx.setAlpha(state.plug.alpha * st.alpha); ctx.concatenate(st.transform)
+            ctx.clip(to: half); ctx.concatenate(state.plug.transform)
+            ctx.addPath(MarkGeometry.plug); ctx.clip()
+            let f = fills[i]
+            ctx.drawLinearGradient(gradient([f.0, f.1]), start: CGPoint(x: 0, y: 214), end: CGPoint(x: 0, y: 814), options: [])
+            ctx.restoreGState()
+        }
+    }
+    // Animation only: a four-point glint on the shield's shoulder as the keyhole opens.
+    if state.glint > 0 {
+        let c = MarkGeometry.glintPoint, r = 70 * state.glint, w = 9 * state.glint
+        let star = CGMutablePath()
+        star.move(to: CGPoint(x: c.x, y: c.y - r)); star.addQuadCurve(to: CGPoint(x: c.x + r, y: c.y), control: CGPoint(x: c.x + w, y: c.y - w))
+        star.addQuadCurve(to: CGPoint(x: c.x, y: c.y + r), control: CGPoint(x: c.x + w, y: c.y + w))
+        star.addQuadCurve(to: CGPoint(x: c.x - r, y: c.y), control: CGPoint(x: c.x - w, y: c.y + w))
+        star.addQuadCurve(to: CGPoint(x: c.x, y: c.y - r), control: CGPoint(x: c.x - w, y: c.y - w)); star.closeSubpath()
+        ctx.saveGState(); ctx.setShadow(offset: .zero, blur: 30 * s * state.glint, color: Brand.accentDark.a(0.9).cg)
+        ctx.addPath(star); ctx.setFillColor(Brand.white.a(state.glint).cg); ctx.fillPath(); ctx.restoreGState()
     }
 }
 
@@ -252,7 +292,7 @@ func writeText(_ s: String, _ name: String) { try! s.write(to: url(name), atomic
 func markSVG() -> String {
     """
     <?xml version="1.0" encoding="UTF-8"?>
-    <!-- RamPart mark ("Keep R"): crenellated tower stem, rampart bowl, teal stride leg. 1024 grid, macOS icon body 824 @ 100. -->
+    <!-- RamPart mark ("Two-Part Shield"): a curved shield in two halves; the seam between them is a keyhole. 1024 grid, macOS icon body 824 @ 100. -->
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
       <title>RamPart</title>
       <defs>
@@ -262,11 +302,11 @@ func markSVG() -> String {
         <radialGradient id="glow" cx="512" cy="470" r="470" gradientUnits="userSpaceOnUse">
           <stop offset="0" stop-color="\(Brand.teal.css)" stop-opacity="0.30"/><stop offset="1" stop-color="\(Brand.teal.css)" stop-opacity="0"/>
         </radialGradient>
-        <linearGradient id="stone" x1="0" y1="222" x2="0" y2="802" gradientUnits="userSpaceOnUse">
+        <linearGradient id="stone" x1="0" y1="214" x2="0" y2="814" gradientUnits="userSpaceOnUse">
           <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="\(Brand.frost.css)"/>
         </linearGradient>
-        <linearGradient id="stride" x1="0" y1="624" x2="0" y2="802" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stop-color="\(Brand.mint.css)"/><stop offset="1" stop-color="\(Brand.teal.css)"/>
+        <linearGradient id="teal" x1="0" y1="214" x2="0" y2="814" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="\(Brand.mint.css)"/><stop offset="1" stop-color="\(Brand.accentLight.css)"/>
         </linearGradient>
         <filter id="lift" x="-20%" y="-20%" width="140%" height="140%">
           <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#000" flood-opacity="0.38"/>
@@ -277,25 +317,25 @@ func markSVG() -> String {
         <path d="\(squircleSVG(MarkGeometry.tileRect))" fill="url(#glow)"/>
       </g>
       <g filter="url(#lift)">
-        <path id="part-1" data-name="stem" d="\(MarkGeometry.stem)" fill="url(#stone)"/>
-        <path id="part-2" data-name="bowl" d="\(MarkGeometry.bowl)" fill="url(#stone)"/>
-        <path id="part-3" data-name="leg" d="\(MarkGeometry.leg)" fill="url(#stride)"/>
+        <path id="part-1" data-name="left-half-ram" d="\(MarkGeometry.parts[0].d)" fill="url(#stone)"/>
+        <path id="part-2" data-name="right-half-part" d="\(MarkGeometry.parts[1].d)" fill="url(#teal)"/>
       </g>
+      <!-- Animation helper: fills the keyhole until the reveal. Invisible at rest. -->
+      <path id="part-3" data-name="keyhole-plug" data-role="reveal" d="\(MarkGeometry.plugD)" fill="url(#stone)" opacity="0"/>
     </svg>
 
     """
 }
 
 func glyphOnlySVG(color: String, accent: String) -> String {
-    // The bare R (no tile), cropped to the mark with 1/4 stem clear space. For use on any background.
+    // The bare mark (no tile), cropped with a small margin. For use on any background.
     let pad: CGFloat = 32, b = MarkGeometry.markBox
     return """
     <?xml version="1.0" encoding="UTF-8"?>
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="\(Int(b.minX - pad)) \(Int(b.minY - pad)) \(Int(b.width + 2 * pad)) \(Int(b.height + 2 * pad))">
       <title>RamPart</title>
-      <path id="part-1" d="\(MarkGeometry.stem)" fill="\(color)"/>
-      <path id="part-2" d="\(MarkGeometry.bowl)" fill="\(color)"/>
-      <path id="part-3" d="\(MarkGeometry.leg)" fill="\(accent)"/>
+      <path id="part-1" d="\(MarkGeometry.parts[0].d)" fill="\(color)"/>
+      <path id="part-2" d="\(MarkGeometry.parts[1].d)" fill="\(accent)"/>
     </svg>
 
     """
@@ -321,11 +361,14 @@ func wordmarkSVG(dark: Bool) -> String {
 struct Anim { let id: String; let delay: Double; let duration: Double; let from: [String: Double]; let easing: String }
 let markAnims: [Anim] = [
     Anim(id: "part-0", delay: 0.00, duration: 0.35, from: ["opacity": 0, "scale": 0.86], easing: "spring(response:0.45,damping:0.8)"),
-    Anim(id: "part-1", delay: 0.15, duration: 0.35, from: ["opacity": 0, "scaleY": 0, "anchorY": 802], easing: "easeOut"),
-    Anim(id: "part-2", delay: 0.38, duration: 0.35, from: ["opacity": 0, "translateX": 120], easing: "spring(response:0.4,damping:0.75)"),
-    Anim(id: "part-3", delay: 0.58, duration: 0.32, from: ["opacity": 0, "translateY": -90, "translateX": -40], easing: "spring(response:0.35,damping:0.7)")]
-let letterStart = 0.45, letterStagger = 0.06, letterDuration = 0.30
-let totalDuration = 1.2
+    // The two halves glide in from either side and meet at the centre line (the keyhole is still filled).
+    Anim(id: "part-1", delay: 0.18, duration: 0.45, from: ["opacity": 0, "translateX": -150], easing: "spring(response:0.45,damping:0.82)"),
+    Anim(id: "part-2", delay: 0.24, duration: 0.45, from: ["opacity": 0, "translateX": 150], easing: "spring(response:0.45,damping:0.82)"),
+    // The reveal: the plug fills the keyhole once the halves meet, then shrinks into the bow and fades, opening the keyhole.
+    Anim(id: "part-3", delay: 0.95, duration: 0.35, from: ["opacity": 1, "scale": 1, "anchorX": 512, "anchorY": 436], easing: "easeIn")]
+let glintDelay = 1.10, glintDuration = 0.45
+let letterStart = 0.50, letterStagger = 0.06, letterDuration = 0.30
+let totalDuration = 1.6
 
 func ease(_ t: Double) -> CGFloat { let x = min(max(t, 0), 1); return CGFloat(1 - pow(1 - x, 3)) }
 func easeBack(_ t: Double) -> CGFloat { let x = min(max(t, 0), 1); let c1 = 1.70158, c3 = c1 + 1; return CGFloat(1 + c3 * pow(x - 1, 3) + c1 * pow(x - 1, 2)) }
@@ -339,15 +382,19 @@ func iconState(at time: Double) -> IconState {
     st.tile.alpha = ease(p(0) * 1.5)
     st.tile.transform = CGAffineTransform(translationX: 512, y: 512).scaledBy(x: sc, y: sc).translatedBy(x: -512, y: -512)
     st.glow = ease((time - 0.7) / 0.5) * 0.6 + 0.4
-    // stem grows from baseline
-    let t1 = ease(p(1)); st.parts[0].alpha = ease(p(1) * 2)
-    st.parts[0].transform = CGAffineTransform(translationX: 0, y: 802).scaledBy(x: 1, y: max(t1, 0.001)).translatedBy(x: 0, y: -802)
-    // bowl slides in from the right
+    // halves slide in from the sides
+    let t1 = easeBack(p(1)); st.parts[0].alpha = ease(p(1) * 2)
+    st.parts[0].transform = CGAffineTransform(translationX: -150 * (1 - t1), y: 0)
     let t2 = easeBack(p(2)); st.parts[1].alpha = ease(p(2) * 2)
-    st.parts[1].transform = CGAffineTransform(translationX: 120 * (1 - t2), y: 0)
-    // leg strides down into place
-    let t3 = easeBack(p(3)); st.parts[2].alpha = ease(p(3) * 2)
-    st.parts[2].transform = CGAffineTransform(translationX: -40 * (1 - t3), y: -90 * (1 - t3))
+    st.parts[1].transform = CGAffineTransform(translationX: 150 * (1 - t2), y: 0)
+    // plug: present once both halves have landed, then shrinks into the bow
+    let t3 = ease(p(3))
+    st.plug.alpha = 1 - t3
+    let k = 1 - 0.85 * t3, c = MarkGeometry.shieldCenter
+    st.plug.transform = CGAffineTransform(translationX: c.x, y: c.y).scaledBy(x: k, y: k).translatedBy(x: -c.x, y: -c.y)
+    // glint on the shoulder
+    let g = (time - glintDelay) / glintDuration
+    st.glint = (g > 0 && g < 1) ? CGFloat(sin(.pi * g)) : 0
     return st
 }
 
@@ -355,9 +402,9 @@ func animationJSON() -> String {
     func esc(_ s: String) -> String { s.replacingOccurrences(of: "\"", with: "\\\"") }
     func from(_ d: [String: Double]) -> String { "{" + d.sorted { $0.key < $1.key }.map { "\"\($0.key)\": \($0.value)" }.joined(separator: ", ") + "}" }
     var mark: [String] = []
-    let markD = [squircleSVG(MarkGeometry.tileRect), MarkGeometry.stem, MarkGeometry.bowl, MarkGeometry.leg]
-    let markNames = ["tile", "stem", "bowl", "leg"]
-    let markFill = ["linear \(Brand.deepTeal.css) -> \(Brand.midnight.css) -> \(Brand.navy.css) (top-left to bottom-right)", "linear #FFFFFF -> \(Brand.frost.css) (top to bottom)", "linear #FFFFFF -> \(Brand.frost.css) (top to bottom)", "linear \(Brand.mint.css) -> \(Brand.teal.css) (top to bottom)"]
+    let markD = [squircleSVG(MarkGeometry.tileRect), MarkGeometry.parts[0].d, MarkGeometry.parts[1].d, MarkGeometry.plugD]
+    let markNames = ["tile", "left half (Ram)", "right half (Part)", "keyhole plug (reveal: animates OUT)"]
+    let markFill = ["linear \(Brand.deepTeal.css) -> \(Brand.midnight.css) -> \(Brand.navy.css) (top-left to bottom-right)", "linear #FFFFFF -> \(Brand.frost.css) (top to bottom)", "linear \(Brand.mint.css) -> \(Brand.accentLight.css) (top to bottom)", "linear #FFFFFF -> \(Brand.mint.css) (left to right)"]
     for (i, a) in markAnims.enumerated() {
         mark.append("""
               {"id": "\(a.id)", "name": "\(markNames[i])", "order": \(i), "d": "\(esc(markD[i]))", "fill": "\(markFill[i])", "delay": \(a.delay), "duration": \(a.duration), "from": \(from(a.from)), "easing": "\(a.easing)"}
@@ -374,9 +421,10 @@ func animationJSON() -> String {
     {
       "name": "RamPart brand assembly",
       "totalDuration": \(totalDuration),
-      "notes": "Times in seconds. 'from' gives the starting value of each property; animate to identity (opacity 1, scale 1, translate 0, blur 0). Mark coordinates are a 1024x1024 y-down canvas (same as logo-mark.svg). Letter coordinates match logo-wordmark-*.svg viewBox. scaleY on the stem is anchored at its baseline (anchorY). Under Reduce Motion, skip transforms and cross-fade everything in 0.2 s.",
+      "notes": "Times in seconds. 'from' gives the starting value of each property; animate to identity (opacity 1, scale 1, translate 0, blur 0). Mark coordinates are a 1024x1024 y-down canvas (same as logo-mark.svg). Letter coordinates match logo-wordmark-*.svg viewBox. part-3 is the keyhole plug: it appears when the halves land (~0.62 s) and its 'from' is its visible state; animate it to opacity 0, scale 0.15 about (anchorX, anchorY) to open the keyhole. Then play the glint. Under Reduce Motion, skip transforms and cross-fade everything in 0.2 s.",
       "mark": {
         "viewBox": "0 0 1024 1024",
+        "glint": {"delay": \(glintDelay), "duration": \(glintDuration), "x": \(Int(MarkGeometry.glintPoint.x)), "y": \(Int(MarkGeometry.glintPoint.y)), "shape": "four-point star, radius 70, white with \(Brand.accentDark.css) glow, opacity sin(pi*t)"},
         "parts": [
     \(mark.joined(separator: ",\n"))
         ]
@@ -437,13 +485,13 @@ func renderStoryboard(time: Double, to u: URL) {
 // MARK: - Menu bar template (monochrome R, black + alpha)
 
 func drawTemplate(_ ctx: CGContext, pt: CGFloat, scale: CGFloat) {
-    // Fit the mark box into an 18 pt square with 1 pt padding; snap scale so the stem is a whole pixel count.
+    // Fit the mark box into an 18 pt square with 1 pt padding.
     let b = MarkGeometry.markBox, avail = (pt - 2) * scale
     let k = avail / b.height
     ctx.translateBy(x: (pt * scale - b.width * k) / 2 - b.minX * k, y: (pt * scale - b.height * k) / 2 - b.minY * k)
     ctx.scaleBy(x: k, y: k)
     ctx.setFillColor(CGColor(gray: 0, alpha: 1))
-    for part in MarkGeometry.parts { ctx.addPath(parseSVGPath(part.d)) }
+    ctx.addPath(MarkGeometry.left); ctx.addPath(MarkGeometry.right)
     ctx.fillPath()
 }
 

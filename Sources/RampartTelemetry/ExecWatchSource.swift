@@ -135,7 +135,7 @@ public final class ExecWatchSource: EventSource, CPUReporting {
 
     private func arm(_ pid: Int32) -> Bool {
         var ev = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ENABLE),
-                        fflags: UInt32(bitPattern: Int32(NOTE_FORK)) | UInt32(NOTE_EXEC) | UInt32(bitPattern: Int32(NOTE_EXIT)), data: 0, udata: nil)
+                        fflags: UInt32(truncatingIfNeeded: NOTE_FORK) | UInt32(truncatingIfNeeded: NOTE_EXEC) | UInt32(truncatingIfNeeded: NOTE_EXIT), data: 0, udata: nil)
         var ts = timespec(tv_sec: 0, tv_nsec: 0)
         return kevent(kq, &ev, 1, nil, 0, &ts) == 0
     }
@@ -166,9 +166,9 @@ public final class ExecWatchSource: EventSource, CPUReporting {
                     let e = events[i]
                     let pid = Int32(e.ident)
                     if e.flags & UInt16(EV_ERROR) != 0 { watched[pid] = nil; continue }
-                    if e.fflags & UInt32(NOTE_EXEC) != 0 { onExec(pid) }
-                    if e.fflags & UInt32(bitPattern: Int32(NOTE_FORK)) != 0 { onFork(pid) }
-                    if e.fflags & UInt32(bitPattern: Int32(NOTE_EXIT)) != 0 { watched[pid] = nil }
+                    if e.fflags & UInt32(truncatingIfNeeded: NOTE_EXEC) != 0 { onExec(pid) }
+                    if e.fflags & UInt32(truncatingIfNeeded: NOTE_FORK) != 0 { onFork(pid) }
+                    if e.fflags & UInt32(truncatingIfNeeded: NOTE_EXIT) != 0 { watched[pid] = nil }
                 }
                 if n < Int32(cap) { break }
             }

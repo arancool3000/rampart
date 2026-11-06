@@ -86,7 +86,7 @@ struct NetworkView: View {
                                                                set: { v in model.updateSettings { $0.webProtection = v }; Task { await model.setWebProtection(v) } }))
                             .toggleStyle(.switch).labelsHidden()
                     } else {
-                        Button("Install Full Protection…") { showInstall = true }
+                        Button("Enable Full Protection…") { showInstall = true }.buttonStyle(GlowButtonStyle())
                     }
                 }
                 Divider()
@@ -264,7 +264,7 @@ struct BreachCheckCard: View {
             do {
                 var req = URLRequest(url: URL(string: "https://api.pwnedpasswords.com/range/\(prefix)")!)
                 req.setValue("true", forHTTPHeaderField: "Add-Padding")
-                req.setValue("Rampart-macOS", forHTTPHeaderField: "User-Agent")
+                req.setValue("\(Product.name)-macOS", forHTTPHeaderField: "User-Agent")
                 req.timeoutInterval = 10
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 guard (resp as? HTTPURLResponse)?.statusCode == 200, let body = String(data: data, encoding: .utf8),

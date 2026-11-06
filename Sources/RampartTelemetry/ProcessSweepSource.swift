@@ -125,8 +125,9 @@ public enum ProcInspector {
 /// since the previous sweep. Catches what eslogger misses and is the only exec source when not root.
 /// Per sweep: one `proc_listallpids` + one `PROC_PIDTBSDINFO` per pid. Only new pids are enriched
 /// (path, argv, signing); signing is cached by (path, inode, mtime).
-public final class ProcessSweepSource: EventSource {
+public final class ProcessSweepSource: EventSource, CPUReporting {
     public let name = "procsweep"
+    public let cpu = CPUMeter()
     public let interval: TimeInterval
     /// Emit events for processes already running at start.
     public var emitExisting: Bool
@@ -214,7 +215,9 @@ public final class ProcessSweepSource: EventSource {
     }
 
     /// Runs on `queue`.
-    private func sweep() {
+    private func sweep() { cpu.measure { sweepBody() } }
+
+    private func sweepBody() {
         let t0 = DispatchTime.now().uptimeNanoseconds
         defer {
             let dt = DispatchTime.now().uptimeNanoseconds - t0

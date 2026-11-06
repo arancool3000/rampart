@@ -1,4 +1,5 @@
 import SwiftUI
+import RampartShared
 import AppKit
 import UniformTypeIdentifiers
 import Charts
@@ -79,7 +80,7 @@ struct ActivityView: View {
 
     private func export(csv: Bool) {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "Rampart Activity.\(csv ? "csv" : "json")"
+        panel.nameFieldStringValue = "\(Product.name) Activity.\(csv ? "csv" : "json")"
         panel.allowedContentTypes = [csv ? .commaSeparatedText : .json]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let iso = ISO8601DateFormatter()

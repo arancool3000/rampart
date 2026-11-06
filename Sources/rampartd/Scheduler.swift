@@ -40,21 +40,31 @@ final class Scheduler {
 
     private func tick() {
         let cfg = p.runtime.config, st = p.state.value
-        if due("quickScan", every: cfg.scheduledQuickScanHours * 3600, last: st.lastQuickScan, initialDelay: 600), !p.isScanning {
+        if cfg.scheduledQuickScan, !busy.contains("quickScan"), !p.isScanning,
+           Date().timeIntervalSince(started) > 600, Self.dailyDue(hour: cfg.scheduledScanHour, last: st.lastQuickScan) {
             run("quickScan") { [p] in _ = p.scan(paths: [], quick: true, progress: { _, _, _ in }) }
         }
-        if allowNetworkUpdates, due("update", every: cfg.signatureUpdateHours * 3600, last: st.lastUpdate, initialDelay: 120) {
+        if allowNetworkUpdates, cfg.autoUpdate, due("update", every: cfg.signatureUpdateHours * 3600, last: st.lastUpdate, initialDelay: 120) {
             run("update") { [p] in _ = p.updateSignatures() }
         }
         if due("persistence", every: cfg.persistenceCheckMinutes * 60, last: nil, initialDelay: 60) {
             run("persistence") { [p] in _ = try? p.persistence() }
         }
-        if p.services.posture != nil, due("posture", every: cfg.postureCheckHours * 3600, last: st.lastPostureCheck, initialDelay: 90) {
+        // Posture checks shell out to system tools; as non-root they run only when the user asks.
+        if getuid() == 0, !p.runtime.userMode, p.services.posture != nil, due("posture", every: cfg.postureCheckHours * 3600, last: st.lastPostureCheck, initialDelay: 90) {
             run("posture") { [p] in _ = try? p.posture() }
         }
         if due("purge", every: 86400, last: nil, initialDelay: 300) {
             run("purge") { [p] in p.services.quarantine.purgeExpired() }
         }
+    }
+
+    /// True when the most recent occurrence of `hour`:00 is after `last` (missed runs catch up once).
+    static func dailyDue(hour: Int, last: Date?, now: Date = Date()) -> Bool {
+        let cal = Calendar.current
+        var mark = cal.date(bySettingHour: hour, minute: 0, second: 0, of: now)!
+        if mark > now { mark = cal.date(byAdding: .day, value: -1, to: mark)! }
+        return (last ?? .distantPast) < mark
     }
 
     /// Triggered by a real-time persistence event: re-diff soon (coalesced).

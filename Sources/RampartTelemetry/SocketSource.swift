@@ -55,29 +55,20 @@ extension ProcInspector {
             }
             let v4 = ini.insi_vflag & UInt8(INI_IPV4) != 0
             out.append(SocketTuple(proto: proto, family: fam,
-                                   localIP: addr(ini.insi_laddr, v4: v4), localPort: port(ini.insi_lport),
-                                   remoteIP: addr(ini.insi_faddr, v4: v4), remotePort: port(ini.insi_fport), state: state))
+                                   localIP: addr(v4: v4, ini.insi_laddr.ina_46.i46a_addr4, ini.insi_laddr.ina_6), localPort: port(ini.insi_lport),
+                                   remoteIP: addr(v4: v4, ini.insi_faddr.ina_46.i46a_addr4, ini.insi_faddr.ina_6), remotePort: port(ini.insi_fport), state: state))
         }
         return out
     }
 
     static func port(_ p: Int32) -> UInt16 { UInt16(bigEndian: UInt16(truncatingIfNeeded: p)) }
 
-    static func addr(_ a: in4in6_addr, v4: Bool) -> String {
-        var a = a
+    static func addr(v4: Bool, _ a4: in_addr, _ a6: in6_addr) -> String {
         var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-        if v4 {
-            var v = a.i46a_addr4
-            guard inet_ntop(AF_INET, &v, &buf, socklen_t(buf.count)) != nil else { return "" }
-        } else {
-            let ok = withUnsafeBytes(of: &a) { raw -> Bool in
-                // in4in6_addr overlays an in6_addr for IPv6 sockets.
-                var v6 = raw.loadUnaligned(as: in6_addr.self)
-                return inet_ntop(AF_INET6, &v6, &buf, socklen_t(buf.count)) != nil
-            }
-            guard ok else { return "" }
-        }
-        return String(cString: buf)
+        var ok: Bool
+        if v4 { var v = a4; ok = inet_ntop(AF_INET, &v, &buf, socklen_t(buf.count)) != nil }
+        else { var v = a6; ok = inet_ntop(AF_INET6, &v, &buf, socklen_t(buf.count)) != nil }
+        return ok ? String(cString: buf) : ""
     }
 }
 
@@ -85,7 +76,7 @@ extension ProcInspector {
 /// event for each new connection (`remote_ip`, `remote_port`, `local_ip`, `local_port`, `proto`, `state`,
 /// `listen=0`) and for each new listening socket (`listen=1`, `local_ip` `0.0.0.0`/`::` when bound to all
 /// interfaces). Attributed to the pid. Apple platform binaries are skipped entirely (except the
-/// `EventHub.neverMute` LOLBins) to keep CPU low; DNS names come separately from the DNS filter.
+/// `EventHub.neverMute` LOLBins); signing is resolved only for processes with a new socket; DNS names come separately from the DNS filter.
 /// Short connections that open and close between sweeps are missed. Unprivileged: own processes only.
 public final class SocketSource: EventSource, CPUReporting {
     public let name = "sockets"
@@ -111,6 +102,7 @@ public final class SocketSource: EventSource, CPUReporting {
     private var sweepNo = 0
     private var fdBuffer: [proc_fdinfo] = []
     public private(set) var emitted = 0
+    public var sweeps: Int { queue.sync { sweepNo } }
     public private(set) var processesInspected = 0
 
     public init(interval: TimeInterval = 2, identities: CodeIdentityCache = .shared) {
@@ -157,18 +149,12 @@ public final class SocketSource: EventSource, CPUReporting {
             for pid in ProcInspector.allPids() where !(excludeSelf && pid == me) && pid > 0 {
                 guard let info = ProcInspector.bsdInfo(pid) else { continue }
                 let pk = ProcKey(pid: pid, sec: info.startSec, usec: info.startUsec)
-                var entry: ProcEntry
-                if let e = procs[pk] { entry = e } else {
-                    let path = ProcInspector.path(pid) ?? ""
-                    let id = identities.identity(for: path)
-                    let skip = skipPlatformBinaries && (id?.isPlatformBinary ?? false) && !EventHub.neverMute.contains(path)
-                    entry = ProcEntry(path: path, identity: id, skip: skip, ppid: info.ppid, uid: info.uid, lastSeenSweep: sweepNo)
-                }
-                entry.lastSeenSweep = sweepNo
-                procs[pk] = entry
-                if entry.skip { continue }
+                if var e = procs[pk], e.skip { e.lastSeenSweep = sweepNo; procs[pk] = e; continue }
+                // Sockets first (cheap syscalls); signing identity only for processes that have a new
+                // interesting socket, so the baseline doesn't code-check every process on the machine.
                 guard let socks = ProcInspector.sockets(pid, fdBuffer: &fdBuffer) else { continue }
                 inspected += 1
+                var fresh: [SocketTuple] = []
                 for t in socks {
                     let interesting: Bool
                     if t.isListen { interesting = true }
@@ -178,9 +164,20 @@ public final class SocketSource: EventSource, CPUReporting {
                     let ck = ConnKey(proc: pk, tuple: t)
                     let isNew = known[ck] == nil
                     known[ck] = sweepNo
-                    guard isNew, !baseline || (t.isListen && reportExistingListeners) else { continue }
-                    emit(pid: pid, entry: entry, t: t, existing: baseline)
+                    if isNew && (!baseline || (t.isListen && reportExistingListeners)) { fresh.append(t) }
                 }
+                if var e = procs[pk] { e.lastSeenSweep = sweepNo; procs[pk] = e }
+                guard !fresh.isEmpty else { continue }
+                var entry: ProcEntry
+                if let e = procs[pk] { entry = e } else {
+                    let path = ProcInspector.path(pid) ?? ""
+                    let id = identities.identity(for: path)
+                    let skip = skipPlatformBinaries && (id?.isPlatformBinary ?? false) && !EventHub.neverMute.contains(path)
+                    entry = ProcEntry(path: path, identity: id, skip: skip, ppid: info.ppid, uid: info.uid, lastSeenSweep: sweepNo)
+                    procs[pk] = entry
+                }
+                if entry.skip { continue }
+                for t in fresh { emit(pid: pid, entry: entry, t: t, existing: baseline) }
             }
             processesInspected = inspected
             // Forget closed sockets and exited processes.

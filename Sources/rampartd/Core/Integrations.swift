@@ -61,7 +61,7 @@ enum Integrations {
             s.quarantine = VaultQuarantine(vault: vault)
             s.wiring.append("quarantine: RampartRemediation.QuarantineVault (AES-GCM)")
             let journal = try ActionJournal(directory: runtime.journalDir)
-            s.persistenceRemediation = PersistenceRemediator(runtime: runtime, executor: RemediationExecutor(vault: vault, journal: journal))
+            s.persistenceRemediation = PersistenceRemediator(runtime: runtime, executor: RemediationExecutor(vault: vault, journal: journal, runner: GuardedRemediationRunner()))
             s.wiring.append("persistence cleanup: RampartRemediation.RemediationExecutor + ActionJournal\(runtime.userMode ? " (user-domain items only)" : "")")
         } catch {
             s.wiring.append("quarantine: builtin vault (QuarantineVault failed: \(error))")
@@ -82,6 +82,7 @@ enum Integrations {
         s.web = web
         s.network = web
         web.onBlock = { [weak s] d, l in s?.onWebBlock?(d, l) }
+        web.onQuery = { [weak s] e in s?.onDNSEvent?(e) }
         s.signingLookup = { path in SigningInspector.inspectCached(path: path).info }
         s.wiring.append("web protection: RampartNetwork.DNSFilterServer on 127.0.0.1:\(runtime.dnsPort) (\(runtime.config.webProtection ? "on" : "off"))")
         updaters.append(("blocklists", {
@@ -91,7 +92,11 @@ enum Integrations {
         }))
 
         s.updater = CompositeUpdater(updaters)
-        if daemon { daemonHook?(s, runtime) }
+        if daemon {
+            s.guardian = GuardService(runtime: runtime)
+            s.wiring.append("guard: RampartGuard tamper detection + remote-access monitor (\(s.guardian!.enforce ? "enforcing" : "monitor only"))")
+            daemonHook?(s, runtime)
+        }
     }
 
     // MARK: modules that may still be placeholders
@@ -203,7 +208,7 @@ final class KillerResponder: ProcessResponder {
 final class PostureAdapter: PostureService {
     let runtime: Runtime
     init(runtime: Runtime) { self.runtime = runtime }
-    func checks() -> [PostureCheck] { PostureScanner().checks() }
+    func checks() -> [PostureCheck] { PostureScanner(runner: GuardedPostureRunner()).checks() }
     func score(_ checks: [PostureCheck]) -> Int? { SecurityScore.compute(checks).value }
     func fix(checkID: String, dryRun: Bool) throws -> String {
         guard let fix = PostureFixer.fix(for: checkID, dryRun: dryRun) else {
@@ -214,6 +219,7 @@ final class PostureAdapter: PostureService {
         }
         var out: [String] = []
         for cmd in fix.commands {
+            if let why = Privileged.refusal(cmd[0]) { throw ServiceError.denied(why) }
             let p = Process()
             p.executableURL = URL(fileURLWithPath: cmd[0]); p.arguments = Array(cmd.dropFirst())
             p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
@@ -222,7 +228,7 @@ final class PostureAdapter: PostureService {
             if p.terminationStatus != 0 { throw ServiceError.failed("fix failed: \(out.joined(separator: "; "))") }
         }
         // Re-scan to verify the fix took effect.
-        let after = PostureScanner().checks().first { $0.id == checkID }
+        let after = PostureScanner(runner: GuardedPostureRunner()).checks().first { $0.id == checkID }
         out.append("re-check: \(after?.state.rawValue ?? "unknown")")
         if after?.state == .fail { throw ServiceError.failed("fix ran but the check still fails: \(out.joined(separator: "; "))") }
         return out.joined(separator: "; ")
@@ -234,6 +240,7 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
     let runtime: Runtime
     let lists: BlocklistUpdater
     var onBlock: ((String, String?) -> Void)?
+    var onQuery: ((SecurityEvent) -> Void)?
     private var server: DNSFilterServer?
     private var switcher: DNSSwitcher?
     private let lock = NSLock()
@@ -315,6 +322,7 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
         if dirty { saveStatsLocked() }
         lock.unlock()
         if let (d, l) = notify { onBlock?(d, l) }
+        if !e.name.isEmpty { onQuery?(e.securityEvent) }
     }
 
     private func saveStatsLocked() {
@@ -353,7 +361,7 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
         let alerts = wifiGuard.check()
         let gw = wifiGuard.defaultGateway()
         var note: String?
-        if st.associated && st.ssid == nil { note = "The network name is hidden by macOS until Rampart has Location access." }
+        if st.associated && st.ssid == nil { note = "The network name is hidden by macOS until \(Product.name) has Location access." }
         if let a = alerts.first(where: { $0.kind == .gatewayMACChanged }) { note = a.message }
         return WiFiStatus(connected: st.associated, ssid: st.ssid, security: st.security, weakSecurity: st.isWeak,
                           gatewayIP: gw, gatewayMACChanged: alerts.contains { $0.kind == .gatewayMACChanged }, note: note)

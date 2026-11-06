@@ -11,7 +11,11 @@ extension SelfTest {
         let reqs: [IPCRequest] = [.status, .scan(paths: ["/tmp"], quick: true), .listDetections, .listQuarantine,
                                   .quarantine(detectionID: UUID()), .restore(id: UUID(), allow: true), .deleteQuarantined(id: UUID()),
                                   .allow(sha256: String(repeating: "a", count: 64)), .posture, .fixPosture(checkID: "firewall"),
-                                  .persistence, .setWebProtection(on: false), .updateSignatures, .subscribeEvents]
+                                  .persistence, .setWebProtection(on: false), .updateSignatures, .subscribeEvents,
+                                  .activity(limit: 5), .connections, .wifi, .networkStats, .getSettings, .setSettings(RampartSettings()),
+                                  .pauseScan(paused: true), .cancelScan, .setRealtime(on: false), .previewRemediation(persistenceID: "x"),
+                                  .remediate(persistenceID: "x"), .listAllowRules,
+                                  .addAllowRule(AllowRuleSpec(scope: .folder, value: "/tmp/a", name: "a")), .removeAllowRule(id: UUID()), .health]
         var roundTrips = 0
         for r in reqs {
             guard let d = try? IPC.encode(r), IPC.writeFrame(fd: fds[0], d), let back = IPC.readFrame(fd: fds[1]),
@@ -95,6 +99,63 @@ extension SelfTest {
         if case .error? = call(.allow(sha256: "nothex")).last { check(true, "daemon: rejects bad sha256") }
         else { check(false, "daemon: rejects bad sha256") }
         if case .persistence? = call(.persistence).last { check(true, "daemon: persistence") } else { check(false, "daemon: persistence") }
+
+        // v2 requests.
+        if case .activity(let es)? = call(.activity(limit: 50)).last {
+            check(es.contains { $0.kind == .scan } && es.contains { $0.kind == .quarantine } && es.contains { $0.kind == .restore },
+                  "daemon: activity has scan, quarantine and restore rows (\(es.count))")
+        } else { check(false, "daemon: activity") }
+        if case .health(let h)? = call(.health).last {
+            check(h.mode == "user" && h.version == Product.version && h.residentMB > 1 && h.uptimeSeconds > 0, "daemon: health (\(h.residentMB) MB)")
+        } else { check(false, "daemon: health") }
+        if case .settings(var st)? = call(.getSettings).last {
+            st.autoQuarantine = false; st.scheduledScanHour = 7; st.webProtection = true
+            if case .settings(let saved)? = call(.setSettings(st)).last {
+                check(!saved.autoQuarantine && saved.scheduledScanHour == 7, "daemon: settings round-trip")
+                check(!saved.webProtection, "daemon: web protection refused in user mode")
+            } else { check(false, "daemon: setSettings") }
+            let cfg = (try? Data(contentsOf: root.appendingPathComponent("config.json"))).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            check(cfg.contains("\"scheduledScanHour\" : 7"), "daemon: settings persisted")
+        } else { check(false, "daemon: getSettings") }
+        // With auto-quarantine off a new EICAR stays put but is still detected.
+        let fx2 = files.appendingPathComponent("com.rampart.test.eicar2.com")
+        try? Data(eicar.utf8).write(to: fx2)
+        if case .scanFinished(_, let ds, _)? = call(.scan(paths: [fx2.path], quick: false)).last {
+            check(ds.count == 1 && !ds[0].resolved && FileManager.default.fileExists(atPath: fx2.path), "daemon: autoQuarantine=false is applied live")
+        } else { check(false, "daemon: scan 2") }
+        // Folder allow rule suppresses detections inside it.
+        if case .allowRules(let rules)? = call(.addAllowRule(AllowRuleSpec(scope: .folder, value: files.path, name: "fixtures"))).last,
+           let rule = rules.first {
+            if case .scanFinished(_, let ds, _)? = call(.scan(paths: [fx2.path], quick: false)).last {
+                check(ds.isEmpty, "daemon: folder allow rule applied")
+            } else { check(false, "daemon: scan 3") }
+            if case .allowRules(let left)? = call(.removeAllowRule(id: rule.id)).last { check(left.isEmpty, "daemon: allow rule removed") }
+            else { check(false, "daemon: removeAllowRule") }
+        } else { check(false, "daemon: addAllowRule") }
+        if case .error? = call(.addAllowRule(AllowRuleSpec(scope: .folder, value: "/", name: "everything"))).last { check(true, "daemon: refuses allow-listing /") }
+        else { check(false, "daemon: refuses allow-listing /") }
+        if case .error? = call(.pauseScan(paused: true)).last { check(true, "daemon: pause with no scan is an error") }
+        else { check(false, "daemon: pause with no scan is an error") }
+        if case .error? = call(.previewRemediation(persistenceID: "launchDaemon:/nonexistent.plist")).last { check(true, "daemon: preview of unknown item is an error") }
+        else { check(false, "daemon: preview of unknown item is an error") }
+        if case .networkStats(let n)? = call(.networkStats).last {
+            check(!n.webProtectionAvailable && !n.webProtectionOn && n.blockedByDay.count == 14, "daemon: network stats in user mode")
+        } else { check(false, "daemon: networkStats") }
+        if case .wifi? = call(.wifi).last { check(true, "daemon: wifi") } else { check(false, "daemon: wifi") }
+        if case .ok? = call(.setRealtime(on: false)).last { check(true, "daemon: setRealtime") } else { check(false, "daemon: setRealtime") }
+        try? FileManager.default.removeItem(at: fx2)
+        // v3 (RampartGuard).
+        if case .tamper(let data)? = call(.tamperStatus).last { check(!data.isEmpty, "daemon: tamper status") } else { check(false, "daemon: tamper status") }
+        if case .remoteAccess(let data)? = call(.remoteAccessReport).last { check(!data.isEmpty, "daemon: remote-access report") }
+        else { check(false, "daemon: remote-access report") }
+        if case .disableToken(let tok)? = call(.requestDisableProtection(authorization: nil, reason: "selftest")).last {
+            if case .ok? = call(.disableProtection(token: tok, minutes: 1)).last { check(true, "daemon: disable-protection flow") }
+            else { check(false, "daemon: disable-protection flow (redeem)") }
+            if case .error? = call(.disableProtection(token: tok, minutes: 1)).last { check(true, "daemon: disable token is single-use") }
+            else { check(false, "daemon: disable token is single-use") }
+        } else { check(false, "daemon: disable-protection flow (token)") }
+        if case .ok? = call(.forwardEvents([SecurityEvent(kind: .other, detail: ["type": "selftest"], source: "selftest")])).last {
+            check(true, "daemon: forwardEvents") } else { check(false, "daemon: forwardEvents") }
 
         p.terminate(); p.waitUntilExit()
         check(!FileManager.default.fileExists(atPath: sock), "daemon: socket removed on SIGTERM")

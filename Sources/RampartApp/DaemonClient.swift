@@ -10,7 +10,7 @@ final class DaemonClient: @unchecked Sendable {
         case notRunning, closed, daemon(String), unexpected
         var errorDescription: String? {
             switch self {
-            case .notRunning: return "The Rampart background service isn't running."
+            case .notRunning: return "The \(Product.name) background service isn't running."
             case .closed: return "The connection to the background service closed."
             case .daemon(let m): return m
             case .unexpected: return "The background service sent an unexpected reply."

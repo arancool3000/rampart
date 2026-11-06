@@ -1,4 +1,5 @@
 import SwiftUI
+import RampartShared
 import AppKit
 
 struct MenuBarView: View {
@@ -14,7 +15,7 @@ struct MenuBarView: View {
                 HStack(spacing: Spacing.s) {
                     Button { model.startScan(.quick) } label: { Label("Quick Scan", systemImage: "bolt.fill").frame(maxWidth: .infinity) }
                         .buttonStyle(GlowButtonStyle())
-                    Button { openMain() } label: { Text("Open Rampart").frame(maxWidth: .infinity) }
+                    Button { openMain() } label: { Text("Open \(Product.name)").frame(maxWidth: .infinity) }
                         .secondaryActionStyle()
                 }
                 .controlSize(.large)
@@ -25,10 +26,8 @@ struct MenuBarView: View {
                 infoRow("arrow.triangle.2.circlepath", "Definitions", Fmt.ago(model.definitionsUpdated))
                 Divider().padding(.leading, 34)
                 infoRow("hand.raised.fill", "Network", "\(model.blockedToday) blocked today")
-                if model.isDemo {
-                    Divider().padding(.leading, 34)
-                    infoRow("sparkles.rectangle.stack", "Mode", "Demo · sample data")
-                }
+                Divider().padding(.leading, 34)
+                infoRow("shield.lefthalf.filled", "Protection", model.mode == .live ? (model.source == .basic ? "Basic (no install)" : "System service") : (model.isDemo ? "Developer demo" : "Not running"))
             }
             .font(.callout)
             .card(padding: Spacing.s)
@@ -42,7 +41,7 @@ struct MenuBarView: View {
                 .disabled(model.mode == .live)
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 MenuRowButton(title: "Settings…", shortcut: "⌘,") { NSApp.activate(ignoringOtherApps: true); openSettings() }
-                MenuRowButton(title: "Quit Rampart", shortcut: "⌘Q") { showQuitInfo = true }
+                MenuRowButton(title: "Quit \(Product.name)", shortcut: "⌘Q") { showQuitInfo = true }
                 if showQuitInfo {
                     VStack(alignment: .leading, spacing: Spacing.s) {
                         Text("Real-time protection keeps running in the background. To stop it, turn off protection in Settings.")
@@ -81,13 +80,28 @@ struct MenuBarView: View {
             let calm: Bool = { if case .protected = model.overall { return true }; if case .recommendations = model.overall { return true }; return false }()
             VStack(alignment: .leading, spacing: Spacing.s) {
                 HStack(spacing: Spacing.m) {
-                    ShieldHero(symbol: sym, tint: tint == .secondary ? .gray : tint, breathe: calm, size: 64)
+                    if calm {
+                        StatusMark(size: 56, badge: "checkmark.circle.fill", tint: .statusProtected)
+                    } else if model.isOffline {
+                        StatusMark(size: 56, badge: "xmark.circle.fill", tint: .statusAction, dimmed: true)
+                    } else if model.mode == .connecting {
+                        RamPartMark(size: 56)
+                    } else {
+                        ShieldHero(symbol: sym, tint: tint == .secondary ? .gray : tint, breathe: false, size: 64)
+                    }
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title).font(.headline).fontDesign(.rounded).fixedSize(horizontal: false, vertical: true)
-                        Text("Score \(model.securityScore) · \(AppModel.scoreLabel(model.securityScore))").font(.callout).foregroundStyle(.secondary)
+                            .revealText(on: title, typewriter: true, duration: 0.5)
+                            if model.hasData {
+                            Text("Score \(model.securityScore) · \(AppModel.scoreLabel(model.securityScore))").font(.callout).foregroundStyle(.secondary)
+                        }
                     }
                     Spacer(minLength: 0)
-                    ScoreRing(score: model.securityScore, size: 46, lineWidth: 5)
+                    if model.hasData { ScoreRing(score: model.securityScore, size: 46, lineWidth: 5) }
+                }
+                if model.isOffline {
+                    Button { Task { await model.retry() } } label: { Text("Retry").frame(maxWidth: .infinity) }
+                        .buttonStyle(GlowButtonStyle()).controlSize(.large)
                 }
                 if case .threat = model.overall {
                     Button { model.selection = .threats; openMain() } label: { Text("Review").frame(maxWidth: .infinity) }
@@ -103,6 +117,8 @@ struct MenuBarView: View {
         switch model.overall {
         case .threat(let n): return ("xmark.shield.fill", .statusAction, n == 1 ? "1 item needs your attention" : "\(n) items need your attention")
         case .off: return ("shield.slash", .statusAction, "Real-time protection is off")
+        case .serviceDown: return ("shield.slash", .statusAction, "Protection service isn't running")
+        case .starting: return ("shield.lefthalf.filled", .secondary, "Starting protection…")
         case .paused: return ("pause.circle.fill", .secondary, "Protection paused")
         case .limited: return ("exclamationmark.shield.fill", .statusAttention, "Protection is limited")
         default: return ("checkmark.shield.fill", .statusProtected, "Your Mac is protected")

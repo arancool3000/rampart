@@ -7,7 +7,7 @@ setvbuf(stdout, nil, _IOLBF, 0)
 signal(SIGPIPE, SIG_IGN)
 
 let usage = """
-rampart \(Product.version) — Rampart antivirus command line
+rampart \(Product.version) — \(Product.name) antivirus command line
 
 usage: rampart [--json] [--local [--root DIR] [--report-only]] [--user | --socket PATH] <command>
 
@@ -27,6 +27,24 @@ commands:
   update                              update signatures / rules / blocklists
   eicar [PATH]                        write the harmless EICAR test file (default ./com.rampart.test.eicar.com)
   events                              stream live detections from the daemon
+  activity [N]                        protection activity log (newest first, default 30)
+  connections                         live network connections with process, signing and host
+  wifi                                Wi-Fi security and gateway check
+  net                                 web protection statistics
+  settings get                        daemon settings
+  settings set key=value ...          change settings (e.g. realtimeOn=false exclusions=/a,/b)
+  realtime on|off                     real-time protection
+  scan-control pause|resume|cancel    control the running scan
+  fix <persistence-id> [--apply]      preview (default) or apply removal of a persistence item
+  rules [list]                        allow rules
+  rules add hash|developer|folder|signing <value> [name]
+  rules remove <id>
+  health                              daemon mode, uptime, CPU, memory, event sources, recent errors
+  remote [report|allow <id> [min]|revoke <id>|lockdown on|off]   remote-access lockdown
+  tamper                              tamper-protection status
+  install --gui-auth [--app PATH]     "Enable full protection": one admin password dialog installs the
+                                      root daemon (without --gui-auth or with --dry-run: print the command)
+  uninstall --gui-auth [--keep-data]  remove everything (one admin dialog), verified clean
   version
 
 options:
@@ -66,8 +84,67 @@ let dateFmt: DateFormatter = { let f = DateFormatter(); f.dateStyle = .short; f.
 func fmt(_ d: Date?) -> String { d.map { dateFmt.string(from: $0) } ?? "never" }
 func pad(_ s: String, _ n: Int) -> String { s.count >= n ? String(s.prefix(n)) : s + String(repeating: " ", count: n - s.count) }
 
+/// Shell single-quote.
+func shq(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+/// AppleScript string literal body.
+func asq(_ s: String) -> String { s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") }
+
+/// The app bundle this CLI belongs to (Contents/Helpers/rampart), else /Applications/Rampart.app.
+func locateApp(_ explicit: String?) -> String? {
+    if let e = explicit { return (e as NSString).expandingTildeInPath }
+    let me = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    let bundle = me.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    if bundle.pathExtension == "app", FileManager.default.fileExists(atPath: bundle.appendingPathComponent("Contents/Resources/rampart-setup.sh").path) {
+        return bundle.path
+    }
+    for c in ["/Applications/Rampart.app", "/Applications/\(Product.name).app"]
+    where FileManager.default.fileExists(atPath: c + "/Contents/Resources/rampart-setup.sh") { return c }
+    return nil
+}
+
 // Commands that don't need a transport.
 switch command {
+case "install", "uninstall":
+    // One administrator authorization; afterwards the root daemon does every privileged task without prompts.
+    let guiAuth = flag("--gui-auth"), dry = flag("--dry-run"), keepData = flag("--keep-data")
+    let appArg = option("--app")
+    guard let src = locateApp(appArg) else { fail("can't find Rampart.app (pass --app /path/to/Rampart.app)") }
+    let dest = "/Applications/Rampart.app"
+    var script: String
+    if command == "install" {
+        script = ""
+        if (src as NSString).standardizingPath != dest {
+            script += "/bin/launchctl bootout system/app.rampart.daemon 2>/dev/null; /bin/rm -rf \(shq(dest)) && /usr/bin/ditto \(shq(src)) \(shq(dest)) && /usr/sbin/chown -R root:wheel \(shq(dest)) && /usr/bin/xattr -dr com.apple.quarantine \(shq(dest)) 2>/dev/null; "
+        }
+        script += "RAMPART_APP=\(shq(dest)) /bin/bash \(shq(dest + "/Contents/Resources/rampart-setup.sh")) install"
+    } else {
+        let setup = FileManager.default.fileExists(atPath: dest + "/Contents/Resources/rampart-setup.sh") ? dest + "/Contents/Resources/rampart-setup.sh" : src + "/Contents/Resources/rampart-setup.sh"
+        script = "/bin/bash \(shq(setup)) uninstall\(keepData ? " --keep-data" : "")"
+    }
+    let prompt = command == "install"
+        ? "\(Product.name) needs your permission once to install its protection service."
+        : "\(Product.name) needs your permission to remove its protection service."
+    let apple = "do shell script \"\(asq(script))\" with administrator privileges with prompt \"\(asq(prompt))\""
+    if !dry && guiAuth && Privileged.noPrivilegedTools { fail("refusing to show an administrator dialog (RAMPART_NO_PRIVILEGED_TOOLS=1); use --dry-run") }
+    if dry || !guiAuth {
+        if json { emitJSON(["shell": script, "osascript": apple]); exit(0) }
+        print(guiAuth ? "Would run (one administrator prompt):" : "Run this with sudo, or pass --gui-auth for a password dialog:")
+        print(guiAuth ? "  /usr/bin/osascript -e \(shq(apple))" : "  sudo /bin/sh -c \(shq(script))")
+        exit(0)
+    }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    p.arguments = ["-e", apple]
+    let errPipe = Pipe(); p.standardError = errPipe
+    do { try p.run() } catch { fail("couldn't start osascript: \(error.localizedDescription)") }
+    p.waitUntilExit()
+    let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    if p.terminationStatus != 0 {
+        if errText.contains("-128") { fail("cancelled", code: 3) }
+        fail("\(command) failed: \(errText.trimmingCharacters(in: .whitespacesAndNewlines))")
+    }
+    if json { emitJSON(["ok": true]) } else { print(command == "install" ? "\(Product.name) system protection is installed." : "\(Product.name) was removed.") }
+    exit(0)
 case "version", "--version":
     print("rampart \(Product.version)"); exit(0)
 case "eicar":
@@ -131,7 +208,7 @@ switch command {
 case "status":
     guard case .status(let s) = call(.status) else { fail("unexpected response") }
     if json { emitJSON(s); break }
-    print("Rampart \(Product.version)\(local ? " (local)" : "")")
+    print("\(Product.name) \(Product.version)\(local ? " (local)" : "")")
     print("  Real-time protection: \(s.realtimeOn ? "on" : "off")")
     for (k, v) in s.sources.sorted(by: { $0.key < $1.key }) { print("    \(pad(k, 16)) \(v ? "running" : "not running")") }
     print("  Web protection:       \(s.webProtectionOn ? "on" : "off")")
@@ -200,6 +277,7 @@ case "persistence":
     for i in items.sorted(by: { ($0.kind.rawValue, $0.label) < ($1.kind.rawValue, $1.label) }) {
         let sig = i.signing.map { " [\($0.status.rawValue)\($0.teamID.map { " " + $0 } ?? "")]" } ?? ""
         print("  \(pad(i.kind.rawValue, 16)) \(i.label)\(sig)")
+        print("  \(pad("", 16)) id: \(i.id)")
         print("  \(pad("", 16)) \(i.location)\(i.target.map { " -> " + $0 } ?? "")")
     }
 
@@ -240,6 +318,164 @@ case "events":
             return true
         }
     } catch { fail(error.localizedDescription) }
+
+case "activity":
+    let n = args.first.flatMap { Int($0) } ?? 30
+    guard case .activity(let es) = call(.activity(limit: n)) else { fail("unexpected response") }
+    if json { emitJSON(es); break }
+    if es.isEmpty { print("No activity yet.") }
+    for e in es {
+        print("\(fmt(e.date))  \(pad(e.kind.rawValue, 11)) \(e.title)\(e.outcome.isEmpty ? "" : "  [\(e.outcome)]")")
+        if !e.detail.isEmpty { print("    \(e.detail)") }
+    }
+
+case "connections":
+    guard case .connections(let cs) = call(.connections) else { fail("unexpected response") }
+    if json { emitJSON(cs); break }
+    print("\(cs.count) connections\(cs.contains { $0.flagged } ? " (\(cs.filter(\.flagged).count) flagged)" : "")")
+    for c in cs {
+        let host = c.remoteHost.map { " (\($0))" } ?? ""
+        print("\(c.flagged ? "!" : " ") \(pad(c.processName, 22)) \(pad(String(c.pid), 6)) \(c.proto) \(c.remoteAddress):\(c.remotePort)\(host)  \(c.state ?? "")  \(c.signing?.rawValue ?? "")")
+    }
+
+case "wifi":
+    guard case .wifi(let w) = call(.wifi) else { fail("unexpected response") }
+    if json { emitJSON(w); break }
+    print("Wi-Fi: \(w.connected ? "connected" : "not connected")\(w.ssid.map { " to \($0)" } ?? "")")
+    if let sec = w.security { print("  Security: \(sec)\(w.weakSecurity ? " (WEAK)" : "")") }
+    if let g = w.gatewayIP { print("  Gateway:  \(g)\(w.gatewayMACChanged ? "  — gateway hardware address CHANGED" : "")") }
+    if let n = w.note { print("  Note: \(n)") }
+
+case "net":
+    guard case .networkStats(let n) = call(.networkStats) else { fail("unexpected response") }
+    if json { emitJSON(n); break }
+    print("Web protection: \(n.webProtectionOn ? "on" : "off")\(n.webProtectionAvailable ? "" : " (needs the \(Product.name) system service)")")
+    print("  Blocked today: \(n.blockedToday), this month: \(n.blockedThisMonth)")
+    print("  Last 14 days: \(n.blockedByDay.map(String.init).joined(separator: " "))")
+    print("  Blocklist domains: \(n.blocklistDomains), updated \(fmt(n.blocklistsUpdated))")
+    if !n.recentBlocks.isEmpty { print("  Recent: \(n.recentBlocks.prefix(10).joined(separator: ", "))") }
+
+case "settings":
+    let sub = args.first ?? "get"
+    if !args.isEmpty { args.removeFirst() }
+    guard case .settings(var cur) = call(.getSettings) else { fail("unexpected response") }
+    if sub == "set" {
+        guard !args.isEmpty else { fail("usage: rampart settings set key=value ...") }
+        // Round-trip through JSON so every RampartSettings key is settable by name.
+        var dict = (try? JSONSerialization.jsonObject(with: JSONEncoder.rampart.encode(cur))) as? [String: Any] ?? [:]
+        for kv in args {
+            let parts = kv.split(separator: "=", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let old = dict[parts[0]] else { fail("unknown setting '\(kv)'. Keys: \(dict.keys.sorted().joined(separator: ", "))") }
+            let v = parts[1]
+            switch old {
+            case is [Any]: dict[parts[0]] = v.isEmpty ? [] : v.split(separator: ",").map(String.init)
+            case let n as NSNumber where CFGetTypeID(n) == CFBooleanGetTypeID():
+                guard ["true", "false", "on", "off", "1", "0"].contains(v) else { fail("\(parts[0]) needs true/false") }
+                dict[parts[0]] = ["true", "on", "1"].contains(v)
+            case is NSNumber: guard let i = Int(v) else { fail("\(parts[0]) needs a number") }; dict[parts[0]] = i
+            default: dict[parts[0]] = v
+            }
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: dict),
+              let new = try? JSONDecoder.rampart.decode(RampartSettings.self, from: data) else { fail("invalid settings") }
+        guard case .settings(let saved) = call(.setSettings(new)) else { fail("unexpected response") }
+        cur = saved
+    } else if sub != "get" { fail("usage: rampart settings get | set key=value ...") }
+    if json { emitJSON(cur); break }
+    let dict = (try? JSONSerialization.jsonObject(with: JSONEncoder.rampart.encode(cur))) as? [String: Any] ?? [:]
+    for k in dict.keys.sorted() {
+        let v = dict[k]!
+        let shown: String
+        if let a = v as? [Any] { shown = a.map { "\($0)" }.joined(separator: ",") }
+        else if let n = v as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() { shown = n.boolValue ? "true" : "false" }
+        else { shown = "\(v)" }
+        print("  \(pad(k, 20)) \(shown)")
+    }
+
+case "realtime":
+    guard let v = args.first, v == "on" || v == "off" else { fail("usage: rampart realtime on|off") }
+    expectOK(.setRealtime(on: v == "on"), "Real-time protection \(v).")
+
+case "scan-control":
+    switch args.first {
+    case "pause": expectOK(.pauseScan(paused: true), "Scan paused.")
+    case "resume": expectOK(.pauseScan(paused: false), "Scan resumed.")
+    case "cancel": expectOK(.cancelScan, "Scan cancelled.")
+    default: fail("usage: rampart scan-control pause|resume|cancel")
+    }
+
+case "fix":
+    let apply = flag("--apply")
+    guard let id = args.first else { fail("usage: rampart fix <persistence-id> [--apply]  (ids: rampart persistence)") }
+    guard case .remediationPreview(let pv) = call(.previewRemediation(persistenceID: id)) else { fail("unexpected response") }
+    if json && !apply { emitJSON(pv); break }
+    if !json {
+        print(pv.title)
+        for st in pv.steps { print("  - \(st)") }
+        for c in pv.commands { print("    $ \(c)") }
+        print("  Undoable: \(pv.undoable ? "yes" : "no")\(pv.requiresRoot ? "; needs root" : "")")
+    }
+    if apply { expectOK(.remediate(persistenceID: id), "Removed.") }
+    else if !json { print("Preview only. Re-run with --apply to remove it.") }
+
+case "rules":
+    let sub = args.first ?? "list"
+    if !args.isEmpty { args.removeFirst() }
+    var resp: IPCResponse
+    switch sub {
+    case "list": resp = call(.listAllowRules)
+    case "add":
+        guard args.count >= 2 else { fail("usage: rampart rules add hash|developer|folder|signing <value> [name]") }
+        let scope: AllowRuleSpec.Scope
+        switch args[0] {
+        case "hash": scope = .fileHash; case "developer", "team": scope = .developer
+        case "folder": scope = .folder; case "signing", "signingID": scope = .signingID
+        default: fail("scope must be hash, developer, folder or signing")
+        }
+        var value = args[1]
+        if scope == .folder { value = (value as NSString).expandingTildeInPath; if !value.hasPrefix("/") { value = FileManager.default.currentDirectoryPath + "/" + value } }
+        resp = call(.addAllowRule(AllowRuleSpec(scope: scope, value: value, name: args.dropFirst(2).joined(separator: " "))))
+    case "remove": resp = call(.removeAllowRule(id: parseUUID(args.first)))
+    default: fail("usage: rampart rules [list|add|remove]")
+    }
+    guard case .allowRules(let rules) = resp else { fail("unexpected response") }
+    if json { emitJSON(rules); break }
+    if rules.isEmpty { print("No allow rules.") }
+    for r in rules { print("\(r.id.uuidString)  \(pad(r.scope.rawValue, 9)) \(r.value)\(r.name.isEmpty ? "" : "  (\(r.name))")") }
+
+case "remote":
+    switch args.first ?? "report" {
+    case "allow":
+        guard args.count >= 2 else { fail("usage: rampart remote allow <tool-id> [minutes]") }
+        expectOK(.allowRemoteTool(id: args[1], minutes: args.count > 2 ? Int(args[2]) : nil), "Allowed \(args[1]).")
+    case "revoke":
+        guard args.count >= 2 else { fail("usage: rampart remote revoke <tool-id>") }
+        expectOK(.revokeRemoteTool(id: args[1]), "Revoked \(args[1]).")
+    case "lockdown":
+        guard args.count >= 2, ["on", "off"].contains(args[1]) else { fail("usage: rampart remote lockdown on|off") }
+        expectOK(.setRemoteLockdown(on: args[1] == "on"), "Remote-access lockdown \(args[1]).")
+    default:
+        guard case .remoteAccess(let data) = call(.remoteAccessReport) else { fail("unexpected response") }
+        if json { print(String(data: data, encoding: .utf8) ?? "{}"); break }
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        print("Remote-access lockdown: \((obj["lockdownEnabled"] as? Bool) == true ? "on" : "off")")
+        for f in (obj["findings"] as? [[String: Any]]) ?? [] {
+            print("  \(f["name"] ?? "?") [\(f["toolID"] ?? "")]  active=\((f["active"] as? Bool) == true) allowed=\((f["allowed"] as? Bool) == true)")
+        }
+        if let n = obj["note"] as? String, !n.isEmpty { print("  \(n)") }
+    }
+
+case "tamper":
+    guard case .tamper(let data) = call(.tamperStatus) else { fail("unexpected response") }
+    print(String(data: data, encoding: .utf8) ?? "{}")
+
+case "health":
+    guard case .health(let h) = call(.health) else { fail("unexpected response") }
+    if json { emitJSON(h); break }
+    print("rampartd \(h.version), \(h.mode) mode, up \(Int(h.uptimeSeconds)) s")
+    print("  CPU \(h.cpuPercent)%, memory \(h.residentMB) MB")
+    for (k, v) in h.sources.sorted(by: { $0.key < $1.key }) { print("  \(pad(k, 12)) \(v ? "running" : "not running")") }
+    if !h.lastErrors.isEmpty { print("  Recent problems:"); for e in h.lastErrors.suffix(5) { print("    \(e)") } }
 
 default:
     fail("unknown command '\(command)'. Run `rampart --help`.")

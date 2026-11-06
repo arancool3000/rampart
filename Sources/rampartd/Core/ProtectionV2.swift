@@ -45,7 +45,8 @@ extension Protection {
         let rules = allowRules.all()
         guard !rules.isEmpty else { return false }
         if let h = d.sha256?.lowercased(), rules.contains(where: { $0.scope == .fileHash && $0.value == h }) { return true }
-        guard let path = d.path else { return false }
+        guard let raw = d.path else { return false }
+        let path = Util.realPath(raw)
         if rules.contains(where: { $0.scope == .folder && (path == $0.value || path.hasPrefix($0.value + "/")) }) { return true }
         let needsSigning = rules.contains { $0.scope == .developer || $0.scope == .signingID }
         if needsSigning, let info = services.signingLookup?(path) {
@@ -92,6 +93,14 @@ extension Protection {
     func setSettings(_ new: RampartSettings) -> RampartSettings {
         let old = runtime.config
         var s = new
+        if let g = services.guardian {
+            let bad = Set(g.exclusionsCoveringSelf(s.exclusions))
+            if !bad.isEmpty {
+                handle(g.detector.exclusionDetection(Array(bad), peerUID: getuid(), peerPID: getpid()))
+                s.exclusions.removeAll { bad.contains($0) }
+                logWarn("settings: refused exclusions covering \(Product.name) itself: \(bad.sorted())")
+            }
+        }
         if runtime.userMode && s.webProtection {
             s.webProtection = false
             logWarn("settings: web protection needs the system daemon; ignored in user mode")
@@ -203,5 +212,39 @@ extension Protection {
                             uptimeSeconds: now.timeIntervalSince(started), cpuPercent: pct,
                             residentMB: (Util.residentMB * 10).rounded() / 10,
                             sources: services.realtime?.sources ?? [:], lastErrors: DLog.shared.recentProblems)
+    }
+}
+
+/// Daemon-only hooks set by rampartd's wiring.
+enum DaemonHooks {
+    /// Forwarded clipboard events go into the EventHub (its ClipboardMemory), not straight to the engine.
+    static var ingestClipboard: ((SecurityEvent) -> Void)?
+}
+
+extension Protection {
+    /// Admin-authenticated pause: real-time off for `minutes`, then back on automatically.
+    func pauseProtection(minutes: Int) {
+        let m = max(1, min(minutes, 24 * 60))
+        setRealtime(false, record: false)
+        activity.add(.settings, "Protection paused for \(m) min", outcome: "paused", severity: .medium)
+        DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(m * 60)) { [weak self] in
+            guard let self, self.runtime.config.realtime else { return }
+            self.setRealtime(true, record: false)
+            self.activity.add(.settings, "Protection resumed", outcome: "on")
+        }
+    }
+
+    /// Authenticated uninstall: the root daemon runs the bundled setup script (which also stops this daemon).
+    func beginUninstall() throws {
+        guard !runtime.userMode, getuid() == 0, !Privileged.noPrivilegedTools else {
+            throw ServiceError.failed("uninstall runs from the \(Product.name) system service; in user mode just quit the app and delete it")
+        }
+        let script = ["/Applications/Rampart.app/Contents/Resources/rampart-setup.sh"].first { FileManager.default.fileExists(atPath: $0) }
+        guard let script else { throw ServiceError.notFound("rampart-setup.sh") }
+        activity.add(.system, "Uninstall requested", outcome: "uninstalling", severity: .medium)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash"); p.arguments = [script, "uninstall"]
+        p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+        try p.run()   // detached: the script boots this daemon out
     }
 }

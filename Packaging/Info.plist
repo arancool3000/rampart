@@ -6,8 +6,8 @@
     <key>CFBundleExecutable</key><string>Rampart</string>
     <key>CFBundleIdentifier</key><string>app.rampart.app</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleName</key><string>Rampart</string>
-    <key>CFBundleDisplayName</key><string>Rampart</string>
+    <key>CFBundleName</key><string>__DISPLAY_NAME__</string>
+    <key>CFBundleDisplayName</key><string>__DISPLAY_NAME__</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>__VERSION__</string>
     <key>CFBundleVersion</key><string>__BUILD__</string>
@@ -17,8 +17,8 @@
     <key>LSUIElement</key><false/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
-    <key>NSHumanReadableCopyright</key><string>Copyright 2026 Rampart</string>
-    <key>NSAppleEventsUsageDescription</key><string>Rampart uses Apple Events to ask for administrator approval when it installs or repairs its protection service.</string>
-    <key>NSUserNotificationsUsageDescription</key><string>Rampart tells you when it finds and contains a threat.</string>
+    <key>NSHumanReadableCopyright</key><string>Copyright 2026 __DISPLAY_NAME__</string>
+    <key>NSAppleEventsUsageDescription</key><string>__DISPLAY_NAME__ uses Apple Events to ask for administrator approval when it installs or repairs its protection service.</string>
+    <key>NSUserNotificationsUsageDescription</key><string>__DISPLAY_NAME__ tells you when it finds and contains a threat.</string>
 </dict>
 </plist>

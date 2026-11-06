@@ -58,3 +58,12 @@ No sample/demo data in shipping builds: the app auto-starts the bundled `rampart
 | Resources/Brand | L1 (Opus) | Logo and app icon. |
 
 Every new feature must also be explained honestly in the UI where macOS limits it (e.g. no pre-execution blocking without the Endpoint Security entitlement; Safari extension needs a signed app).
+
+## ZERO POP-UPS RULE (user complaint, 2026-11-06) — overrides everything
+During development nothing may cause any dialog on the user's screen. Banned while developing:
+- Running `rampartd` in any mode except with `--no-scheduler` AND `RAMPART_NO_PRIVILEGED_TOOLS=1` set in the environment, and killed within 60 s.
+- Running `sfltool`, `profiles`, `systemextensionsctl`, `tccutil`, `osascript`, `security` with a write or unlock, `sudo`, or anything using AuthorizationServices.
+- Reading the user's login keychain from a freshly built binary (it pops "wants to use your confidential information"). For the Gemini key in dev, read it only via `/usr/bin/security find-generic-password -s app.rampart.ai.gemini -a gemini-api-key -w` piped directly into the request, never printed.
+- LocalAuthentication evaluatePolicy, the general NSPasteboard (reading or writing), NSWorkspace open, Apple Events, Accessibility, Location, Bluetooth or Local Network prompts.
+- Launching dist/Rampart.app or any .app bundle.
+Code must make these impossible by default: `rampartd` must honour `RAMPART_NO_PRIVILEGED_TOOLS=1` by refusing to spawn any of the tools above.

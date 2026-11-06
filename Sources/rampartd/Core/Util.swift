@@ -21,6 +21,14 @@ enum Eicar {
 }
 
 enum Util {
+    /// Canonical path (/tmp -> /private/tmp, symlinks resolved) even when the leaf doesn't exist yet.
+    static func realPath(_ p: String) -> String {
+        if let r = realpath(p, nil) { defer { free(r) }; return String(cString: r) }
+        let parent = (p as NSString).deletingLastPathComponent
+        guard parent != p, !parent.isEmpty else { return p }
+        return (realPath(parent) as NSString).appendingPathComponent((p as NSString).lastPathComponent)
+    }
+
     /// Resident memory of this process in MB (task_info).
     static var residentMB: Double {
         var info = mach_task_basic_info()

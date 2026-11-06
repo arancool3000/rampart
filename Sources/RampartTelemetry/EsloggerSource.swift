@@ -6,7 +6,7 @@ import RampartShared
 /// Requires root and Full Disk Access for the responsible process (rampartd). As a normal user
 /// `isAvailable` is false and `start` throws. The child is restarted with backoff if it dies; a
 /// "not permitted" exit (missing FDA) is recorded in `lastError` and stops the restart loop.
-public final class EsloggerSource: EventSource {
+public final class EsloggerSource: EventSource, CPUReporting {
     public enum Failure: Error, CustomStringConvertible {
         case notRoot, missingBinary, noSupportedEvents, notPermitted(String)
         public var description: String {
@@ -28,6 +28,7 @@ public final class EsloggerSource: EventSource {
     ]
 
     public let name = "eslogger"
+    public let cpu = CPUMeter()
     public let events: [String]
     public let parser = EsloggerParser()
     public private(set) var lastError: String?
@@ -66,8 +67,8 @@ public final class EsloggerSource: EventSource {
         guard !subscribed.isEmpty else { throw Failure.noSupportedEvents }
         stop()
         let s = ChildLineStream(executable: Self.binary, arguments: subscribed, label: "eslogger")
-        let parser = self.parser
-        s.onLine = { line in if let ev = parser.parse(data: line) { handler(ev) } }
+        let parser = self.parser, cpu = self.cpu
+        s.onLine = { line in if let ev = cpu.measure({ parser.parse(data: line) }) { handler(ev) } }
         s.onExit = { [weak self, weak s] status, stderr in
             guard let self else { return }
             let lower = stderr.lowercased()

@@ -19,7 +19,7 @@ struct RulesView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Spacing.xl) {
-                Text("Every choice you've made about what Rampart allows or skips. Rules apply right away and you can change them anytime.")
+                Text("Every choice you've made about what \(Product.name) allows or skips. Rules apply right away and you can change them anytime.")
                     .foregroundStyle(.secondary)
 
                 VStack(alignment: .leading, spacing: Spacing.m) {
@@ -46,12 +46,12 @@ struct RulesView: View {
                         Button { addExclusion() } label: { Label("Add Folder…", systemImage: "plus") }))
                     VStack(spacing: 0) {
                         if exclusions.isEmpty {
-                            RuleEmptyRow(symbol: "folder", text: search.isEmpty ? "Rampart checks everything it can reach. Add a folder here only if you trust everything in it." : "No exclusions match \"\(search)\".")
+                            RuleEmptyRow(symbol: "folder", text: search.isEmpty ? "\(Product.name) checks everything it can reach. Add a folder here only if you trust everything in it." : "No exclusions match \"\(search)\".")
                         }
                         ForEach(Array(exclusions.enumerated()), id: \.element) { i, e in
                             if i > 0 { Divider().padding(.leading, 52) }
                             RuleRow(symbol: "folder.badge.minus", tint: .secondary,
-                                    sentence: "Rampart doesn't scan \((e as NSString).abbreviatingWithTildeInPath).",
+                                    sentence: "\(Product.name) doesn't scan \((e as NSString).abbreviatingWithTildeInPath).",
                                     meta: "Exclusion") {
                                 model.updateSettings { $0.exclusions.removeAll { $0 == e } }
                             }
@@ -70,7 +70,7 @@ struct RulesView: View {
         .confirmationDialog("Remove this rule?", isPresented: Binding(get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } }), presenting: pendingRemoval) { r in
             Button("Remove Rule", role: .destructive) { Task { await model.removeAllowRule(r) } }
         } message: { r in
-            Text("Rampart will check \(r.name) normally again.")
+            Text("\(Product.name) will check \(r.name) normally again.")
         }
     }
 
@@ -158,7 +158,7 @@ struct AddRuleSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
             Text("Add an allow rule").font(.title2.weight(.semibold))
-            Text("Rampart won't flag anything this rule covers. Allow only things you trust.").foregroundStyle(.secondary)
+            Text("\(Product.name) won't flag anything this rule covers. Allow only things you trust.").foregroundStyle(.secondary)
             Picker("Allow", selection: $scope) {
                 Text("A folder").tag(AllowRuleSpec.Scope.folder)
                 Text("A developer").tag(AllowRuleSpec.Scope.developer)

@@ -117,6 +117,9 @@ final class Services {
     var realtime: RealtimeService?
     var web: WebProtectionService?
     var network: NetworkInfoService?
+    var guardian: GuardService?
+    /// DNS query-log events (.dnsQuery, detail["name"]) for the behaviour engine; set by the daemon wiring.
+    var onDNSEvent: ((SecurityEvent) -> Void)?
     /// Set by Protection: (domain, list) for every DNS block (rate-limited by the network adapter).
     var onWebBlock: ((String, String?) -> Void)?
     var persistenceRemediation: PersistenceRemediationService?

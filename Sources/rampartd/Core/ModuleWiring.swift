@@ -112,14 +112,28 @@ final class BehaviourPersistence: PersistenceService {
         lock.lock(); defer { lock.unlock() }
         var records: [PersistenceRecord] = []
         var seen = Set<String>()
-        // As root, enumerate every user's home; otherwise just ours.
+        var incomplete = Set<PersistenceItem.Kind>()
+        // As root, enumerate every user's home; otherwise just ours. snapshot() records kinds whose
+        // enumeration timed out (e.g. a slow `sfltool dumpbtm`) so the differ doesn't report them removed.
         for (i, home) in Util.homeDirectories().enumerated() {
-            let cfg = PersistenceScanConfig(home: home, includeSystemLaunchd: false)
-            var c = cfg
+            var c = PersistenceScanConfig(home: home, includeSystemLaunchd: false)
+            // Never run anything that can show an authorization dialog without root: `sfltool dumpbtm`
+            // asks for an administrator password when not root. BTM items are enumerated by the root daemon.
+            // Without root (or with RAMPART_NO_PRIVILEGED_TOOLS) run no external tools at all:
+            // sfltool / profiles / systemextensionsctl can show dialogs. Files are still enumerated.
+            if getuid() != 0 || Privileged.noPrivilegedTools {
+                c.runCommands = false
+                c.kinds.subtract([.btm, .loginItem])
+                // Not enumerated, so never reported "removed" by the differ.
+                incomplete.formUnion([.btm, .loginItem, .profile, .systemExtension, .cron])
+            }
             if i > 0 { c.launchDaemonDirs = []; c.launchAgentDirs = [home + "/Library/LaunchAgents"] }  // system dirs once
-            for r in PersistenceScanner(config: c, signing: signing).scanRecords() where seen.insert(r.id).inserted { records.append(r) }
+            let snap = PersistenceScanner(config: c, signing: signing).snapshot()
+            incomplete.formUnion(snap.incompleteKinds ?? [])
+            for r in snap.records where seen.insert(r.id).inserted { records.append(r) }
         }
-        let current = PersistenceSnapshot(records: records)
+        var current = PersistenceSnapshot(records: records)
+        current.incompleteKinds = incomplete.isEmpty ? nil : Array(incomplete).sorted { $0.rawValue < $1.rawValue }
         var findings: [Detection] = []
         if let old = try? PersistenceSnapshot.load(from: snapshotURL) {
             let diff = PersistenceDiffer.diff(baseline: old, current: current)

@@ -67,6 +67,7 @@ final class AllowRuleStore {
     init(url: URL) {
         self.url = url
         rules = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder.rampart.decode([AllowRuleSpec].self, from: $0) } ?? []
+        for i in rules.indices where rules[i].scope == .folder { rules[i].value = Util.realPath(rules[i].value) }
     }
     /// Active (unexpired) rules.
     func all() -> [AllowRuleSpec] {
@@ -79,7 +80,7 @@ final class AllowRuleStore {
         lock.lock(); defer { lock.unlock() }
         var r = r
         if r.scope == .fileHash { r.value = r.value.lowercased() }
-        if r.scope == .folder { r.value = ((r.value as NSString).expandingTildeInPath as NSString).standardizingPath }
+        if r.scope == .folder { r.value = Util.realPath((r.value as NSString).expandingTildeInPath) }
         if let i = rules.firstIndex(where: { $0.scope == r.scope && $0.value == r.value }) { rules[i] = r } else { rules.append(r) }
         save(); return r
     }

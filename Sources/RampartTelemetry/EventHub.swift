@@ -15,13 +15,16 @@ public final class EventHub {
         /// Max undelivered events. When full, low-priority (file) events are dropped first.
         public var bufferCapacity: Int = 20_000
         public var mute: MutePolicy = .standard
+        /// Feed clipboard events received from another process (session agent) into `clipboardMemory`.
+        /// Leave false when the ClipboardSource runs in this process with the same memory.
+        public var ingestRemoteClipboard = false
         public init() {}
     }
 
     public enum MutePolicy {
         /// Deliver everything.
         case none
-        /// Drop file events from Apple platform binaries (except `neverMute` tools) and execs of Apple
+        /// Drop file and network events from Apple platform binaries (except `neverMute` tools) and execs of Apple
         /// system daemons (platform binary, launched by launchd, under /System, /usr/libexec, /usr/sbin).
         /// Platform shells/interpreters still produce exec events so lineage rules work.
         case standard
@@ -54,6 +57,10 @@ public final class EventHub {
     }
 
     public private(set) var config: Config
+    /// When set, exec events whose argv matches a recent risky/command clipboard copy are annotated with
+    /// `clipboard_match=1`, `clipboard_exact`, `clipboard_overlap`, `clipboard_class`, `clipboard_reasons`,
+    /// `clipboard_source_app`, `clipboard_age` (seconds).
+    public var clipboardMemory: ClipboardMemory?
     private let lock = NSLock()
     private var sources: [EventSource] = []
     private var running: [String: Bool] = [:]
@@ -104,6 +111,13 @@ public final class EventHub {
     /// Source name → running, for `ProtectionStatus.sources`.
     public var sourceStatus: [String: Bool] { lock.withLock { running } }
     public var sourceErrors: [String: String] { lock.withLock { errors } }
+    /// CPU seconds each source has spent in its own work (sources that implement `CPUReporting`).
+    public var cpuBySource: [String: Double] {
+        let list = lock.withLock { sources }
+        var out: [String: Double] = [:]
+        for s in list { if let r = s as? CPUReporting { out[s.name] = r.cpu.cpuSeconds } }
+        return out
+    }
     public var currentStats: Stats { lock.withLock { var s = stats; s.buffered = (high.count - highHead) + (low.count - lowHead); return s } }
 
     static func isHighPriority(_ k: SecurityEventKind) -> Bool {
@@ -124,7 +138,7 @@ public final class EventHub {
         case .none: return false
         case .allPlatform: return true
         case .standard:
-            if isFileEvent(ev.kind) { return true }
+            if isFileEvent(ev.kind) || ev.kind == .networkConnect { return true }
             if ev.kind == .exec {
                 let daemonDir = p.path.hasPrefix("/System/") || p.path.hasPrefix("/usr/libexec/") || p.path.hasPrefix("/usr/sbin/")
                 return daemonDir && p.ppid == 1
@@ -133,17 +147,42 @@ public final class EventHub {
         }
     }
 
+    static func dedupeExtra(_ ev: SecurityEvent) -> String {
+        let d = ev.detail
+        switch ev.kind {
+        case .networkConnect, .dnsQuery:
+            return [d["proto"], d["local_ip"], d["local_port"], d["remote_ip"], d["remote_port"], d["listen"], d["name"]]
+                .map { $0 ?? "" }.joined(separator: "|")
+        case .other:
+            if d["type"] == "clipboard" { return "clipboard|" + (d["text_fp"] ?? d["change_count"] ?? "") }
+            return d["es_event"] ?? d["fsevent"] ?? d["type"] ?? d["message"].map { String($0.prefix(120)) } ?? ""
+        default:
+            return ""
+        }
+    }
+
     /// Entry point for every source. Cheap; never calls the consumer synchronously.
-    public func ingest(_ ev: SecurityEvent) {
+    public func ingest(_ incoming: SecurityEvent) {
+        var ev = incoming
+        if let mem = clipboardMemory {
+            if ev.kind == .exec, let args = ev.process?.args, args.count > 0, let m = mem.match(args: args) {
+                ev.detail["clipboard_match"] = "1"
+                ev.detail["clipboard_exact"] = m.exact ? "1" : "0"
+                ev.detail["clipboard_overlap"] = String(format: "%.2f", m.overlap)
+                ev.detail["clipboard_class"] = m.entry.cls.rawValue
+                if !m.entry.reasons.isEmpty { ev.detail["clipboard_reasons"] = m.entry.reasons.joined(separator: ",") }
+                if let app = m.entry.sourceApp { ev.detail["clipboard_source_app"] = app }
+                ev.detail["clipboard_age"] = String(Int(Date().timeIntervalSince(m.entry.date)))
+            } else if config.ingestRemoteClipboard, ev.kind == .other, ev.detail["type"] == "clipboard" {
+                mem.ingest(ev)
+            }
+        }
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         stats.received += 1
         if Self.shouldMute(ev, policy: config.mute) { stats.muted += 1; lock.unlock(); return }
         // Dedupe (cross-source: eslogger exec + procsweep exec of the same pid collapse).
-        var extra = ""
-        if ev.kind == .other {
-            extra = ev.detail["es_event"] ?? ev.detail["fsevent"] ?? ev.detail["message"].map { String($0.prefix(120)) } ?? ""
-        }
+        let extra = Self.dedupeExtra(ev)
         let key = DedupeKey(kind: ev.kind, pid: ev.process?.pid ?? 0, path: ev.path ?? "", dest: ev.destPath ?? "", extra: extra)
         if let t = recent[key], now - t < config.dedupeWindow { stats.deduped += 1; lock.unlock(); return }
         recent[key] = now

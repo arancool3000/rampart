@@ -49,11 +49,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         recentThreatIDs[d.id] = Date()
         let name = d.path.map { ($0 as NSString).lastPathComponent } ?? d.name
         if d.category == .ransomware {
-            post(.threat, title: "Rampart stopped suspicious file changes", body: "\"\(name)\" started changing many files. It's been stopped.", critical: true)
+            post(.threat, title: "\(Product.name) stopped suspicious file changes", body: "\"\(name)\" started changing many files. It's been stopped.", critical: true)
         } else if d.resolved {
-            post(.threat, title: "Rampart blocked a threat", body: "\"\(name)\" was moved to quarantine. No action needed unless you recognize it.", critical: true)
+            post(.threat, title: "\(Product.name) blocked a threat", body: "\"\(name)\" was moved to quarantine. No action needed unless you recognize it.", critical: true)
         } else {
-            post(.threat, title: "1 item needs your attention", body: "Rampart stopped \"\(name)\". Open Rampart to choose what to do next.", critical: true)
+            post(.threat, title: "1 item needs your attention", body: "\(Product.name) stopped \"\(name)\". Open \(Product.name) to choose what to do next.", critical: true)
         }
     }
 

@@ -1,9 +1,10 @@
 import SwiftUI
+import RampartShared
 import AppKit
 import Combine
 
 struct OnboardingView: View {
-    enum Step: Int, CaseIterable { case welcome, fullDisk, notifications, firstScan }
+    enum Step: Int, CaseIterable { case welcome, permissions, firstScan }
     var onFinish: () -> Void
     init(onFinish: @escaping () -> Void, initialStep: Step = .welcome) {
         self.onFinish = onFinish
@@ -13,11 +14,9 @@ struct OnboardingView: View {
     @Environment(\.openURL) private var openURL
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateVar private var step: Step = .welcome
-    @StateVar private var fdaGranted = FDAProbe.check()
-    @StateVar private var notifState: Bool? = nil
     @StateVar private var scanStarted = false
     @StateVar private var drawn = false
-    private let poll = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    @StateVar private var showInstall = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,8 +35,7 @@ struct OnboardingView: View {
             Group {
                 switch step {
                 case .welcome: welcome
-                case .fullDisk: fullDisk
-                case .notifications: notifications
+                case .permissions: permissions
                 case .firstScan: firstScan
                 }
             }
@@ -54,16 +52,10 @@ struct OnboardingView: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Step \(step.rawValue + 1) of \(Step.allCases.count)")
         }
-        .frame(width: 640, height: 520)
+        .frame(width: 680, height: 600)
         .background(AppBackdrop())
+        .sheet(isPresented: $showInstall) { InstallFullProtectionSheet() }
         .onReceive(NotificationCenter.default.publisher(for: .rampartOnboardingAdvance)) { _ in advance() }
-        .onReceive(poll) { _ in
-            if step == .fullDisk && !fdaGranted && FDAProbe.check() {
-                fdaGranted = true
-                model.hasFullDiskAccess = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { if step == .fullDisk { advance() } }
-            }
-        }
     }
 
     private func advance() {
@@ -75,7 +67,11 @@ struct OnboardingView: View {
     private func page<Content: View>(symbol: String, tint: Color = .rampartTeal, title: String, body: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(spacing: Spacing.l) {
             Spacer()
-            ShieldHero(symbol: symbol, tint: tint, breathe: step == .welcome, size: 112)
+            if symbol == "brand" {
+                RamPartMark(size: 112)
+            } else {
+                ShieldHero(symbol: symbol, tint: tint, breathe: false, size: 112)
+            }
             Text(title).font(.largeTitle.weight(.bold)).fontDesign(.rounded).multilineTextAlignment(.center)
             Text(body).font(.title3).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             content()
@@ -83,76 +79,63 @@ struct OnboardingView: View {
         }
     }
 
+    private var permissions: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            PermissionsChecklistView()
+            HStack {
+                Spacer()
+                Button("Continue") { advance() }.buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(.top, Spacing.s)
+    }
+
     private var welcome: some View {
-        page(symbol: "shield.lefthalf.filled", title: "Welcome to Rampart",
-             body: "Rampart protects your Mac quietly in the background. We'll set up two permissions, then run a quick check. It takes about 2 minutes.") {
+        page(symbol: "brand", title: "Welcome to \(Product.name)",
+             body: "\(Product.name) protects your Mac quietly in the background. We'll set up permissions in one place, then run a quick check. It takes about 2 minutes.") {
             Button("Get Started") { advance() }.buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
                 .padding(.top, Spacing.s)
             Text("No ads. No upsells. Your files stay on your Mac.").font(.callout).foregroundStyle(.secondary)
         }
     }
 
-    private var fullDisk: some View {
-        page(symbol: fdaGranted ? "checkmark.circle.fill" : "internaldrive", tint: fdaGranted ? .statusProtected : .rampartTeal,
-             title: "Let Rampart check every folder",
-             body: "macOS keeps some folders, like Mail and Messages, private by default. Full Disk Access lets Rampart scan them for threats. Rampart only checks files for malware; it doesn't read or upload your content.") {
-            if fdaGranted {
-                StatusLabel(text: "Full Disk Access is on", symbol: "checkmark.circle.fill", tint: .statusProtected).font(.headline)
-            } else {
-                Button("Open Privacy Settings") { openURL(FDAProbe.settingsURL) }
-                    .buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("In System Settings, find **Rampart** in the list", systemImage: "1.circle")
-                    Label("Turn its switch on and enter your password", systemImage: "2.circle")
-                    Label("Come back here. This step ticks itself off.", systemImage: "3.circle")
-                }
-                .font(.callout).foregroundStyle(.secondary)
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("Waiting for access…").font(.callout).foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-
-    private var notifications: some View {
-        page(symbol: "bell.badge", title: "Hear from us only when it matters",
-             body: "We'll notify you if Rampart blocks a threat. Everything else stays in the app. You can change this anytime.") {
-            // Rendered preview of a notification.
-            HStack(alignment: .top, spacing: Spacing.m) {
-                Image(systemName: "shield.lefthalf.filled").font(.title2).foregroundStyle(Color.rampartTeal)
-                    .frame(width: 36, height: 36).background(.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Rampart blocked a threat").font(.callout.weight(.semibold))
-                    Text("\"Installer.app\" was moved to quarantine. No action needed unless you recognize it.").font(.callout).foregroundStyle(.secondary)
-                }
-            }
-            .padding(Spacing.m)
-            .frame(maxWidth: 400, alignment: .leading)
-            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .accessibilityLabel("Example notification: Rampart blocked a threat.")
-            HStack {
-                Button("Not Now") { advance() }.controlSize(.large)
-                Button("Allow Notifications") {
-                    Task { notifState = await Notifier.shared.requestAuthorization(); advance() }
-                }
-                .buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
-            }
-        }
-    }
-
     @ViewBuilder private var firstScan: some View {
         let p = model.scanProgress
         if case .finished(let rec, let found) = model.scanPhase, scanStarted {
-            page(symbol: found.isEmpty ? "checkmark.shield.fill" : "archivebox.fill", tint: found.isEmpty ? .statusProtected : .secondary,
-                 title: found.isEmpty ? "All set. Your Mac is protected." : "Found \(found.count) item\(found.count == 1 ? "" : "s"). It's in quarantine and can't run.",
+            page(symbol: found.isEmpty ? "checkmark.shield.fill" : "archivebox.fill", tint: found.isEmpty ? .statusProtected : .gray,
+                 title: found.isEmpty ? "All set. Your Mac is protected." : "Found \(found.count) item\(found.count == 1 ? "" : "s"). \(found.count == 1 ? "It's" : "They're") in quarantine and can't run.",
                  body: "Checked \(Fmt.count(rec.scanned)) files in \(Fmt.duration(rec.seconds)). Security Score: \(model.securityScore) · \(AppModel.scoreLabel(model.securityScore)).") {
-                Button(found.isEmpty ? "Open Rampart" : "Review") {
+                if !found.isEmpty {
+                    VStack(spacing: 0) { ForEach(found.prefix(3)) { DetectionRowSummary(detection: $0).padding(Spacing.s) } }
+                        .card(padding: Spacing.s).frame(maxWidth: 460)
+                }
+                if model.mode == .live && model.source == .basic {
+                    VStack(spacing: Spacing.s) {
+                        Text("Basic protection is running. For web protection and system-wide monitoring, enable full protection. macOS will ask for your password once.")
+                            .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 460)
+                        Button("Enable Full Protection…") { showInstall = true }
+                    }
+                }
+                Button(found.isEmpty ? "Open \(Product.name)" : "Review") {
                     model.scanPhase = .idle
                     if !found.isEmpty { model.selection = .threats }
                     onFinish()
                 }
                 .buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
+            }
+        } else if model.mode == .connecting {
+            page(symbol: "brand", title: "Starting protection…",
+                 body: "\(Product.name) is starting its background checker. This only takes a moment and doesn't install anything.") {
+                ProgressView().controlSize(.regular)
+            }
+            .onChange(of: model.mode) { _, m in if m != .connecting { beginFirstScan() } }
+        } else if model.mode == .offline {
+            page(symbol: "shield.slash", tint: .statusAction, title: "Protection service isn't running",
+                 body: model.lastError ?? "\(Product.name) couldn't start its background checker, so it can't run a first scan yet.") {
+                HStack {
+                    Button("Retry") { Task { await model.retry(); beginFirstScan() } }.buttonStyle(GlowButtonStyle()).controlSize(.large)
+                    Button("Finish Without Scanning") { onFinish() }
+                }
             }
         } else {
             page(symbol: "magnifyingglass", title: "Let's do a quick check",
@@ -160,15 +143,22 @@ struct OnboardingView: View {
                 ProgressView(value: p?.fraction ?? 0).tint(Color.rampartTeal).frame(maxWidth: 360)
                 Text(p.map { $0.total > 0 ? "\(Fmt.count($0.scanned)) of \(Fmt.count($0.total)) files" : "Estimating files…" } ?? "Starting…")
                     .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+                if let cur = p?.current, !cur.isEmpty {
+                    Text(cur.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                        .font(.caption.monospaced()).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle).frame(maxWidth: 420)
+                }
+                if let n = p?.found, n > 0 { Text("\(n) item\(n == 1 ? "" : "s") found so far").font(.callout) }
                 Button("Continue in Background") { onFinish() }.buttonStyle(.link)
             }
-            .onAppear {
-                guard !scanStarted else { return }
-                scanStarted = true
-                if model.isScanning { return }
-                model.scanPhase = .idle
-                model.startScan(.quick)
-            }
+            .onAppear { beginFirstScan() }
         }
+    }
+
+    private func beginFirstScan() {
+        guard !scanStarted, model.mode != .connecting, !Headless.active else { return }
+        scanStarted = true
+        if model.isScanning { return }
+        model.scanPhase = .idle
+        model.startScan(.quick)
     }
 }

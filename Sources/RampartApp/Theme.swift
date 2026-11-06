@@ -58,6 +58,7 @@ struct SectionHeader: View {
     var body: some View {
         HStack {
             Text(title).font(.title3.weight(.semibold)).fontDesign(.rounded)
+                .revealText(on: title)
             Spacer()
             if let trailing { trailing }
         }

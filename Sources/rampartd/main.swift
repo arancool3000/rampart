@@ -9,14 +9,18 @@ setvbuf(stdout, nil, _IOLBF, 0)
 signal(SIGPIPE, SIG_IGN)
 
 let usage = """
-usage: rampartd [--user] [--root DIR] [--socket PATH] [--verbose] [--no-realtime] [--no-scheduler] [--updates]
+usage: rampartd [--user] [--root DIR] [--socket PATH] [--verbose] [--no-realtime] [--no-scheduler] [--no-updates]
        rampartd --version | --print-config | --help
-  --user          development mode: run unprivileged with per-user state and socket
+  --user          no-root mode: protects this user's files (FSEvents, process sweep, unified log, behaviour,
+                  on-write scans, scheduled scans, user quarantine) and never changes system settings
   --root DIR      state directory override (tests)
   --socket PATH   socket path override
   --no-realtime   do not start event sources
   --no-scheduler  do not run scheduled scans/updates
-  --updates       allow scheduled network signature updates in --user mode (always on as root)
+  --scheduler     run the scheduler even from a development build (off by default outside an installed copy)
+env RAMPART_NO_PRIVILEGED_TOOLS=1: never spawn sfltool/profiles/systemextensionsctl/tccutil/osascript/security/sudo
+                and never read the pasteboard
+  --no-updates    never download signature/blocklist updates on schedule
 """
 
 var args = Array(CommandLine.arguments.dropFirst())
@@ -31,8 +35,10 @@ if flag("--version") { print("rampartd \(Product.version)"); exit(0) }
 let userMode = flag("--user")
 let verbose = flag("--verbose") || flag("-v")
 let noRealtime = flag("--no-realtime")
-let noScheduler = flag("--no-scheduler")
-let allowUpdates = flag("--updates")
+var noScheduler = flag("--no-scheduler")
+let forceScheduler = flag("--scheduler")
+_ = flag("--updates")   // accepted for compatibility; updates are on unless --no-updates
+let noUpdates = flag("--no-updates")
 let printConfig = flag("--print-config")
 let rootOverride = option("--root").map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
 let socketOverride = option("--socket")
@@ -64,15 +70,28 @@ do { try server.start() } catch {
     exit(1)
 }
 
-let scheduler = Scheduler(protection, allowNetworkUpdates: !runtime.userMode || allowUpdates)
+let scheduler = Scheduler(protection, allowNetworkUpdates: !noUpdates)
 if let rt = services.realtime as? RealtimePipeline { rt.onPersistenceEvent = { scheduler.persistenceChanged() } }
-if runtime.config.realtime && !noRealtime, let rt = services.realtime {
-    rt.start(onEvent: { _ in }, onDetection: { protection.handle($0) })
+if runtime.config.realtime && !noRealtime { protection.startRealtime() }
+services.behaviour?.apply(learningMode: runtime.config.learningMode, developerMode: runtime.config.developerMode)
+protection.applyCanaries()
+if let g = services.guardian {
+    g.onDetection = { protection.handle($0) }
+    g.startMonitor()
 }
-if runtime.config.webProtection, let web = services.web {
+protection.activity.add(.system, "\(Product.name) protection started",
+                        detail: runtime.userMode ? "User mode: protecting your files without system changes" : "System service",
+                        outcome: protection.services.realtime?.isRunning == true ? "real-time on" : "real-time off")
+if runtime.config.webProtection, !runtime.userMode, let web = services.web {
     do { try web.setOn(true) } catch { logWarn("web protection failed to start: \(error.localizedDescription)") }
 }
-if !noScheduler { scheduler.start() }
+// The scheduler runs only for installed copies (LaunchDaemon / app bundle) or with --scheduler,
+// and never with RAMPART_NO_PRIVILEGED_TOOLS unless --scheduler is given explicitly.
+let exePath = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
+let installed = exePath.hasPrefix("/Library/PrivilegedHelperTools/") || exePath.contains(".app/Contents/")
+if !forceScheduler && (!installed || Privileged.noPrivilegedTools) { noScheduler = true }
+if Privileged.noPrivilegedTools { logInfo("RAMPART_NO_PRIVILEGED_TOOLS=1: no prompting tools, no pasteboard reads") }
+if !noScheduler { scheduler.start() } else { logInfo("scheduler off") }
 for w in services.warmups { DispatchQueue.global(qos: .utility).async(execute: w) }
 
 // Signals: TERM/INT -> clean shutdown; HUP -> reload config.
@@ -84,6 +103,7 @@ func onSignal(_ sig: Int32, _ handler: @escaping () -> Void) {
 }
 func shutdown(_ why: String) {
     logInfo("shutting down (\(why))")
+    protection.activity.add(.system, "\(Product.name) protection stopped", detail: why)
     scheduler.stop()
     services.realtime?.stop()
     if let w = services.web, w.isOn { try? w.setOn(false) }

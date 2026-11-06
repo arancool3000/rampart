@@ -30,6 +30,7 @@ public enum TrustSubject: String, Codable, Sendable {
     case actor     // the acting process image
     case lineage   // least-trusted non-Apple process in the chain (LOLBins scored through their ancestor)
     case target    // the file/executable the event points at (persistence targets)
+    case none      // no signing multiplier (the behaviour is bad whoever signed the code, e.g. Dock hijack)
 }
 
 public enum TrustRequirement: String, Codable, Sendable {

@@ -20,7 +20,7 @@ public struct BehaviourConfig: Sendable {
     /// Apply the first-seen ×1.2 multiplier once the engine has watched this long.
     public var firstSeenWarmup: TimeInterval = 3600
     /// How long a risky browser clipboard copy stays armed for R31 token matching.
-    public var clipboardWindow: TimeInterval = 120
+    public var clipboardWindow: TimeInterval = 600
     /// Salt for clipboard token hashes; must match the producer (default: per-boot salt).
     public var clipboardSalt: String = ClipboardFingerprint.bootSalt
     public var beaconMinSamples = 6
@@ -77,7 +77,7 @@ public final class BehaviourEngine: @unchecked Sendable {
     private var beacons: [String: [Date]] = [:]
     private var beaconFired: Set<String> = []
     private var rcCache: [String: Set<String>] = [:]
-    private var clipboards: [(date: Date, tokens: Set<String>, source: String)] = []
+    private var clipboards: [(date: Date, tokens: Set<String>, source: String, verdict: String?)] = []
     private var learned: Set<String> = []
     private var startDate: Date?
     private let lock = NSRecursiveLock()
@@ -192,18 +192,20 @@ public final class BehaviourEngine: @unchecked Sendable {
         guard e.kind == .other, e.detail["type"] == "clipboard", e.detail["class"] == "risky",
               let tok = e.detail["clip_tokens"], !tok.isEmpty else { return }
         let src = e.detail["source_app"] ?? ""
-        guard anyRegex(["@browserRegex"], src) else { return }
+        // PasteGuard-rated copies (detail["paste_verdict"]) arm R31 whatever app they came from.
+        let verdict = e.detail["paste_verdict"].flatMap { ["suspicious", "malicious"].contains($0) ? $0 : nil }
+        guard verdict != nil || anyRegex(["@browserRegex"], src) else { return }
         clipboards = clipboards.filter { e.date.timeIntervalSince($0.date) <= config.clipboardWindow }
-        clipboards.append((e.date, ClipboardFingerprint.parse(tok), src))
+        clipboards.append((e.date, ClipboardFingerprint.parse(tok), src.isEmpty ? "an app" : src, verdict))
     }
 
     /// Best overlap between the current command and an armed clipboard copy.
-    func clipboardMatch(_ ctx: Context, min: Double) -> (Double, Int, String)? {
+    func clipboardMatch(_ ctx: Context, min: Double) -> (Double, Int, String, String?)? {
         let now = ctx.event.date
-        var best: (Double, Int, String)?
+        var best: (Double, Int, String, String?)?
         for c in clipboards where now.timeIntervalSince(c.date) <= config.clipboardWindow && now >= c.date {
             let o = ClipboardFingerprint.overlap(command: ctx.argv, clip: c.tokens, salt: config.clipboardSalt)
-            if o.fraction >= min && o.shared >= 2 && o.distinctive >= 1 && o.fraction > (best?.0 ?? -1) { best = (o.fraction, o.shared, c.source) }
+            if o.fraction >= min && o.shared >= 2 && o.distinctive >= 1 && o.fraction > (best?.0 ?? -1) { best = (o.fraction, o.shared, c.source, c.verdict) }
         }
         return best
     }
@@ -556,6 +558,8 @@ public final class BehaviourEngine: @unchecked Sendable {
             if let t = h.targetPath, t.hasPrefix("/") {
                 apply(trust: trustEval.trust(path: t), path: t, label: "target"); identity = t
             }
+        case .none:
+            break
         case .lineage:
             let nodes = [h.ctx.node].compactMap { $0 } + h.ctx.chain
             if let n = h.ctx.node, trustOf(n) != .apple, !isAllowlisted(node: n, rule: nil) {
@@ -576,6 +580,9 @@ public final class BehaviourEngine: @unchecked Sendable {
         }
         if rule.devSensitive == true && config.developerMode && names.dropFirst().contains(where: { nameIn($0, ["@devtools"]) }) {
             m *= 0.5; why.append("developer toolchain in lineage ×0.5")
+        }
+        if rule.id == "R31", let v = clipboardMatch(h.ctx, min: 0.6)?.3 {
+            m *= 1.3; why.append("PasteGuard rated the copied command \(v) ×1.3")
         }
         if learned.contains(rule.id + "|" + identity) { m *= 0.25; why.append("seen during learning ×0.25") }
         return (m, why, identity)

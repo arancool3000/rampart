@@ -57,6 +57,8 @@ install_rampart() {
   # Start the menu bar agent for the logged-in user (the agent plist also loads at every login).
   local uid; uid="$(console_uid)"
   if [ "$uid" != 0 ]; then
+    # The root daemon replaces the no-root user daemon.
+    run launchctl bootout "gui/$uid/app.rampart.userdaemon" 2>/dev/null || true
     run launchctl bootout "gui/$uid/$LABEL_A" 2>/dev/null || true
     run launchctl bootstrap "gui/$uid" "$AGENT_PLIST" || true
   fi
@@ -91,6 +93,7 @@ uninstall_rampart() {
     local uid; uid=$(stat -f %u "$home" 2>/dev/null) || continue
     [ "$uid" -ge 500 ] 2>/dev/null || continue
     run launchctl bootout "gui/$uid/$LABEL_A" 2>/dev/null || true
+    run launchctl bootout "gui/$uid/app.rampart.userdaemon" 2>/dev/null || true
   done
   run pkill -x rampartd 2>/dev/null || true
   run pkill -f "$HELPER" 2>/dev/null || true

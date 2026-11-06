@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><style>
+body { width: 300px; margin: 0; padding: 14px 16px; font-family: -apple-system, "SF Pro Text", Helvetica, Arial, sans-serif; font-size: 13px; color: #0d1b2a; background: #f7fafc; }
+h1 { font-size: 15px; margin: 0 0 4px; } .sub { color: #6c7a89; margin: 0 0 12px; }
+.row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid #e3e9ee; }
+.stat { display: flex; gap: 14px; margin: 8px 0 4px; } .stat div { flex: 1; background: #fff; border-radius: 10px; padding: 8px 10px; border: 1px solid #e3e9ee; } .stat b { font-size: 18px; display: block; color: #0a84a0; }
+.ok { color: #1c8f4a; } .bad { color: #b3261e; } .hint { font-size: 12px; color: #6c7a89; margin: 6px 0 0; line-height: 1.35; }
+button { cursor: pointer; border: 0; border-radius: 999px; padding: 6px 12px; font-weight: 600; background: #eef3f6; color: #2c3e50; }
+@media (prefers-color-scheme: dark) { body { background: #0f1923; color: #e6edf3; } .stat div { background: #16222f; border-color: #253345; } .row { border-color: #253345; } button { background: #243447; color: #e6edf3; } }
+</style></head>
+<body>
+<h1>RamPart Web Protection</h1>
+<p class="sub" id="hostline">Connecting to RamPart…</p>
+<div class="stat"><div><b id="checked">0</b>pages checked</div><div><b id="warned">0</b>warned</div><div><b id="blocked">0</b>blocked</div></div>
+<div class="row"><span>Check pages as they load</span><input type="checkbox" id="enabled"></div>
+<div class="row"><span>Warn when a site copies a command</span><input type="checkbox" id="clip"></div>
+<div class="row"><span id="allowcount">0 trusted sites</span><button id="clear">Clear</button></div>
+<p class="hint" id="hint"></p>
+<script src="popup.js"></script>
+</body></html>

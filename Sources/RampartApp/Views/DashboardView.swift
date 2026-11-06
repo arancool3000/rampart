@@ -7,15 +7,22 @@ struct DashboardView: View {
     @Environment(\.openURL) private var openURL
     @StateVar private var showScoreInfo = false
     @StateVar private var confirmOff = false
+    @StateVar private var showInstall = false
+    @AppStorage("dashboard.basicCardDismissed") private var basicCardDismissed = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Spacing.xl) {
                 hero
-                tiles
-                if !model.daily.isEmpty { weekChart }
-                if !model.recommendations.isEmpty { recommendations }
-                recentActivity
+                if model.mode == .live && model.source == .basic && !basicCardDismissed { basicCard }
+                if model.hasData {
+                    tiles
+                    if !model.daily.isEmpty && model.daily.contains(where: { $0.sitesBlocked + $0.threats > 0 }) { weekChart }
+                }
+                if model.hasData {
+                    if !model.recommendations.isEmpty { recommendations }
+                    recentActivity
+                }
             }
             .contentColumn()
         }
@@ -48,19 +55,29 @@ struct DashboardView: View {
         switch model.overall {
         case .protected:
             return .init(symbol: "checkmark.shield.fill", tint: .statusProtected, title: "Your Mac is protected",
-                         detail: "Real-time protection is on. Last scan found nothing.", button: "Run Quick Scan", prominent: false)
+                         detail: model.source == .basic && model.mode == .live
+                             ? "Basic protection is on. \(Product.name) checks new files and startup items without installing anything."
+                             : "Real-time protection is on. Last scan found nothing.",
+                         button: "Run Quick Scan", prominent: false)
         case .recommendations(let n):
             return .init(symbol: "exclamationmark.shield.fill", tint: .statusAttention, title: "Your Mac is protected",
                          detail: "\(n) setting\(n == 1 ? "" : "s") could make your Mac more secure.", button: "Review", prominent: false)
         case .threat(let n):
             return .init(symbol: "xmark.shield.fill", tint: .statusAction, title: n == 1 ? "1 item needs your attention" : "\(n) items need your attention",
-                         detail: "Rampart stopped it. Choose what to do next.", button: "Review Item", prominent: true)
+                         detail: "\(Product.name) stopped it. Choose what to do next.", button: "Review Item", prominent: true)
         case .off:
             return .init(symbol: "shield.slash", tint: .statusAction, title: "Real-time protection is off",
                          detail: "Files aren't being checked as they open.", button: "Turn On", prominent: true)
         case .limited:
             return .init(symbol: "exclamationmark.shield.fill", tint: .statusAttention, title: "Protection is limited",
-                         detail: "Rampart can't check some folders without Full Disk Access.", button: "Grant Access…", prominent: true)
+                         detail: "\(Product.name) can't check some folders without Full Disk Access.", button: "Grant Access…", prominent: true)
+        case .starting:
+            return .init(symbol: "shield.lefthalf.filled", tint: .rampartTeal, title: "Starting protection…",
+                         detail: "\(Product.name) is starting its background checker. This takes a moment.", button: "Retry", prominent: false)
+        case .serviceDown:
+            return .init(symbol: "shield.slash", tint: .statusAction, title: "Protection service isn't running",
+                         detail: model.lastError ?? "\(Product.name) couldn't start its background checker, so nothing is being checked right now.",
+                         button: "Retry", prominent: true)
         case .paused(let until):
             return .init(symbol: "pause.circle.fill", tint: .secondary, title: "Protection paused",
                          detail: "Resumes automatically at \(until.formatted(date: .omitted, time: .shortened)).", button: "Resume Now", prominent: true)
@@ -74,6 +91,7 @@ struct DashboardView: View {
         case .threat: model.selection = .threats
         case .off, .paused: model.setRealtime(true)
         case .limited: openURL(FDAProbe.settingsURL)
+        case .starting, .serviceDown: Task { await model.retry() }
         }
     }
 
@@ -82,10 +100,22 @@ struct DashboardView: View {
         let score = model.securityScore
         let isProtected: Bool = { if case .protected = model.overall { return true }; if case .recommendations = model.overall { return true }; return false }()
         return HStack(alignment: .center, spacing: Spacing.xl) {
-            ShieldHero(symbol: h.symbol, tint: h.tint == .secondary ? .gray : h.tint, breathe: isProtected, size: 132)
+            Group {
+                if isProtected {
+                    StatusMark(size: 118, badge: "checkmark.circle.fill", tint: .statusProtected)
+                } else if case .serviceDown = model.overall {
+                    StatusMark(size: 118, badge: "xmark.circle.fill", tint: .statusAction, dimmed: true)
+                } else if case .starting = model.overall {
+                    RamPartMark(size: 118)
+                } else {
+                    ShieldHero(symbol: h.symbol, tint: h.tint == .secondary ? .gray : h.tint, breathe: false, size: 132)
+                }
+            }
+            .frame(width: 132, height: 132)
             VStack(alignment: .leading, spacing: Spacing.s) {
                 Text(h.title)
                     .font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+                    .revealText(on: h.title, duration: 0.8)
                     .fixedSize(horizontal: false, vertical: true)
                 Text(h.detail).font(.title3).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -105,6 +135,7 @@ struct DashboardView: View {
             }
             .accessibilityElement(children: .contain)
             Spacer(minLength: Spacing.l)
+            if model.hasData {
             VStack(spacing: Spacing.s) {
                 ScoreRing(score: score, size: 136, lineWidth: 13)
                 HStack(spacing: 4) {
@@ -119,8 +150,26 @@ struct DashboardView: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Security score \(score) out of 100, \(AppModel.scoreLabel(score)). \(model.recommendations.count) recommendations.")
             .accessibilityAction(named: "How is this calculated?") { showScoreInfo = true }
+            }
         }
         .card(padding: Spacing.xl, tint: h.tint == .secondary ? .gray : h.tint)
+    }
+
+    private var basicCard: some View {
+        HStack(spacing: Spacing.l) {
+            RamPartMark(size: 40)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Basic protection (no install)").font(.headline).fontDesign(.rounded)
+                Text("\(Product.name) is checking files and startup items from your account. The optional system service adds web protection and system-wide monitoring.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Button("Enable Full Protection…") { showInstall = true }.buttonStyle(GlowButtonStyle())
+            Button { basicCardDismissed = true } label: { Image(systemName: "xmark") }
+                .buttonStyle(.borderless).accessibilityLabel("Hide this card")
+        }
+        .card(tint: .rampartTeal)
+        .sheet(isPresented: $showInstall) { InstallFullProtectionSheet() }
     }
 
     // MARK: Tiles
@@ -228,7 +277,7 @@ struct DashboardView: View {
                 Button("Show All") { model.selection = .activity }.buttonStyle(.link)))
             VStack(spacing: 0) {
                 if model.activity.isEmpty {
-                    Text("Nothing yet. Rampart will list what it checks and blocks here.")
+                    Text(model.mode == .live ? "Nothing yet. Run a Quick Scan and \(Product.name) will list what it checks here." : "Nothing yet. \(Product.name) will list what it checks and blocks here.")
                         .foregroundStyle(.secondary).padding(Spacing.m)
                 }
                 ForEach(Array(model.activity.prefix(5).enumerated()), id: \.element.id) { idx, a in
@@ -265,7 +314,7 @@ struct StatusTile<Accessory: View, ChartContent: View>: View {
         }
         .frame(minWidth: 200, maxWidth: .infinity, minHeight: 150, alignment: .topLeading)
         .card()
-        .hoverLift()
+        .modifier(MagneticTilt())
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(title): \(value)\(caption.map { ". " + $0 } ?? "")")
     }

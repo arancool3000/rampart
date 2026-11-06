@@ -20,7 +20,8 @@ final class Router {
     static func isPrivileged(_ r: IPCRequest) -> Bool {
         switch r {
         case .quarantine, .restore, .deleteQuarantined, .allow, .fixPosture, .setWebProtection, .updateSignatures,
-             .setSettings, .setRealtime, .remediate, .addAllowRule, .removeAllowRule: return true
+             .setSettings, .setRealtime, .remediate, .addAllowRule, .removeAllowRule,
+             .allowRemoteTool, .revokeRemoteTool, .setRemoteLockdown, .disableProtection, .requestUninstall, .uninstall: return true
         default: return false
         }
     }
@@ -38,6 +39,11 @@ final class Router {
         case .previewRemediation: return "previewRemediation"; case .remediate: return "remediate"
         case .listAllowRules: return "listAllowRules"; case .addAllowRule: return "addAllowRule"
         case .removeAllowRule: return "removeAllowRule"; case .health: return "health"
+        case .remoteAccessReport: return "remoteAccessReport"; case .allowRemoteTool: return "allowRemoteTool"
+        case .revokeRemoteTool: return "revokeRemoteTool"; case .setRemoteLockdown: return "setRemoteLockdown"
+        case .tamperStatus: return "tamperStatus"; case .requestDisableProtection: return "requestDisableProtection"
+        case .disableProtection: return "disableProtection"; case .requestUninstall: return "requestUninstall"
+        case .uninstall: return "uninstall"; case .forwardEvents: return "forwardEvents"
         }
     }
 
@@ -169,6 +175,50 @@ final class Router {
                 _ = send(.allowRules(p.allowRules.all()))
             case .health:
                 _ = send(.health(p.health()))
+            case .remoteAccessReport:
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("remote-access monitor (daemon only)") }
+                _ = send(.remoteAccess(try JSONEncoder.rampart.encode(g.report())))
+            case .allowRemoteTool(let id, let minutes):
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("remote-access lockdown") }
+                try g.allow(id, minutes: minutes)
+                p.activity.add(.settings, "Allowed remote tool \(id)", detail: minutes.map { "for \($0) min" } ?? "until revoked", outcome: "allowed")
+                _ = send(.ok)
+            case .revokeRemoteTool(let id):
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("remote-access lockdown") }
+                g.revoke(id); p.activity.add(.settings, "Revoked remote tool \(id)", outcome: "revoked"); _ = send(.ok)
+            case .setRemoteLockdown(let on):
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("remote-access lockdown") }
+                g.setLockdown(on); p.activity.add(.settings, "Remote-access lockdown \(on ? "on" : "off")", outcome: on ? "on" : "off"); _ = send(.ok)
+            case .tamperStatus:
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection (daemon only)") }
+                _ = send(.tamper(try JSONEncoder.rampart.encode(g.status())))
+            case .requestDisableProtection(let auth, let reason):
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
+                let t = try g.requestDisable(peer: peer, authorization: auth)
+                logInfo("disable-protection token issued to uid \(peer.uid): \(reason)")
+                _ = send(.disableToken(t))
+            case .disableProtection(let token, let minutes):
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
+                try g.redeem(token, peer: peer, purpose: .pause, minutes: minutes)
+                p.pauseProtection(minutes: minutes)
+                _ = send(.ok)
+            case .requestUninstall(let auth):
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
+                _ = send(.disableToken(try g.requestDisable(peer: peer, authorization: auth)))
+            case .uninstall(let token):
+                guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
+                try g.redeem(token, peer: peer, purpose: .uninstall, minutes: 10)
+                try p.beginUninstall()
+                _ = send(.ok)
+            case .forwardEvents(let events):
+                guard let rt = p.services.realtime as? RealtimePipeline else { throw ServiceError.unavailable("real-time pipeline") }
+                guard events.count <= 500 else { throw ServiceError.failed("too many events in one batch") }
+                for var e in events {
+                    e.detail["forwarded_uid"] = String(peer.uid)
+                    if e.source.isEmpty { e.source = "session" }
+                    if e.kind == .other, e.detail["type"] == "clipboard" || e.source == "pasteguard" { DaemonHooks.ingestClipboard?(e) } else { rt.inject(e) }
+                }
+                _ = send(.ok)
             case .subscribeEvents:
                 let token = p.subscribe(send)
                 _ = send(.ok)

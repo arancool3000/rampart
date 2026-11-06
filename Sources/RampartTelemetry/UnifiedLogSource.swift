@@ -103,7 +103,7 @@ public final class UnifiedLogParser {
 /// Tails the unified log via `/usr/bin/log stream --style ndjson` with a narrow security predicate
 /// (XProtect, BTM, TCC auth requests, syspolicyd/Gatekeeper). Restarts with backoff if `log` dies.
 /// Works unprivileged (fewer messages, more `<private>`); full value as root.
-public final class UnifiedLogSource: EventSource {
+public final class UnifiedLogSource: EventSource, CPUReporting {
     public static let defaultPredicate =
         #"subsystem == "com.apple.xprotect" OR subsystem == "com.apple.XProtectFramework" OR process BEGINSWITH "XProtect" "# +
         #"OR subsystem == "com.apple.backgroundtaskmanagement" "# +
@@ -112,6 +112,7 @@ public final class UnifiedLogSource: EventSource {
     public static let binary = "/usr/bin/log"
 
     public let name = "unifiedlog"
+    public let cpu = CPUMeter()
     public let predicate: String
     public let level: String
     public let parser = UnifiedLogParser()
@@ -133,8 +134,8 @@ public final class UnifiedLogSource: EventSource {
     public func start(handler: @escaping @Sendable (SecurityEvent) -> Void) throws {
         stop()
         let s = ChildLineStream(executable: Self.binary, arguments: arguments, label: "logstream", maxLineBytes: 1 << 20)
-        let parser = self.parser
-        s.onLine = { line in if let ev = parser.parse(data: line) { handler(ev) } }
+        let parser = self.parser, cpu = self.cpu
+        s.onLine = { line in if let ev = cpu.measure({ parser.parse(data: line) }) { handler(ev) } }
         s.onExit = { [weak self] status, err in
             self?.lock.withLock { self?.lastError = "log stream exited \(status): \(err.suffix(300))" }
         }

@@ -1,4 +1,5 @@
 import SwiftUI
+import RampartShared
 import Observation
 
 /// The only state the App scene body and Commands are allowed to read.
@@ -46,7 +47,19 @@ final class ChromeState {
 struct MenuBarLabel: View {
     let chrome = ChromeState.shared
     var body: some View {
-        Image(systemName: chrome.hasThreat ? "exclamationmark.shield" : "shield.lefthalf.filled")
-            .accessibilityLabel(chrome.hasThreat ? "Rampart: item needs attention" : "Rampart: protected")
+        Group {
+            if chrome.hasThreat { Image(systemName: "exclamationmark.shield") } else { Image(nsImage: BrandImages.menuBarTemplate) }
+        }
+            .accessibilityLabel(chrome.hasThreat ? "\(Product.name): item needs attention" : "\(Product.name): protected")
     }
+}
+
+/// PasteGuard's status, published by PasteGuardHost (which lives with the AI/behaviour modules) and read by
+/// the permissions screen. Kept dependency-free so screens don't need those modules.
+@MainActor
+@Observable
+final class PasteGuardStatusBox {
+    static let shared = PasteGuardStatusBox()
+    enum Status { case active, needsPermission, denied, stopped }
+    var status: Status?
 }

@@ -6,6 +6,8 @@ public struct PersistenceSnapshot: Codable, Sendable {
     public var date: Date
     public var host: String
     public var records: [PersistenceRecord]
+    /// Kinds whose source failed during this scan (e.g. sfltool timed out).
+    public var incompleteKinds: [PersistenceItem.Kind]? = nil
 
     public init(date: Date = Date(), records: [PersistenceRecord]) {
         self.date = date; self.records = records
@@ -50,8 +52,12 @@ public struct PersistenceDiff: Codable, Sendable {
 }
 
 public enum PersistenceDiffer {
+    /// Items of kinds the current scan could not read are never reported as removed.
     public static func diff(baseline: PersistenceSnapshot, current: PersistenceSnapshot) -> PersistenceDiff {
-        diff(old: baseline.records, new: current.records)
+        var d = diff(old: baseline.records, new: current.records)
+        let skip = Set(current.incompleteKinds ?? [])
+        if !skip.isEmpty { d.removed.removeAll { skip.contains($0.item.kind) } }
+        return d
     }
 
     public static func diff(old: [PersistenceRecord], new: [PersistenceRecord]) -> PersistenceDiff {

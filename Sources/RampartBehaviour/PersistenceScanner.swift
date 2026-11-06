@@ -38,6 +38,11 @@ public struct PersistenceScanConfig: Sendable {
     /// Run sfltool / profiles / systemextensionsctl / crontab. Off in unit fixtures.
     public var runCommands: Bool
     public var commandTimeout: TimeInterval
+    /// ZERO POP-UPS: when true (default: env RAMPART_NO_PRIVILEGED_TOOLS=1) sfltool, profiles and
+    /// systemextensionsctl are never spawned; their kinds are reported incomplete.
+    public var noPrivilegedTools: Bool = ProcessInfo.processInfo.environment["RAMPART_NO_PRIVILEGED_TOOLS"] == "1"
+    /// `sfltool dumpbtm` can take minutes when backgroundtaskmanagementd is busy.
+    public var btmTimeout: TimeInterval = 180
     public var resolveSigning: Bool
 
     public static let allKinds: Set<PersistenceItem.Kind> = [.launchAgent, .launchDaemon, .loginItem, .btm, .cron, .periodic,
@@ -54,14 +59,51 @@ public struct PersistenceScanConfig: Sendable {
     }
 }
 
+/// Runs a command-line tool: (absolute path, arguments, timeout) -> (exit status, stdout), nil if it could not run.
+public typealias PersistenceCommandRunner = @Sendable (String, [String], TimeInterval) -> (status: Int32, out: String)?
+
 /// KnockKnock-style enumerator of every `PersistenceItem.Kind`.
+///
+/// Authorization safety: on macOS 27, `sfltool dumpbtm` run by a non-root user raises an "Allow administrator
+/// access" dialog. As non-root the scanner therefore never runs sfltool (BTM and login items are reported in
+/// `lastIncompleteKinds`) and only runs the read-only commands in `nonRootCommands`, which need no authorization.
 public final class PersistenceScanner: @unchecked Sendable {
     public var config: PersistenceScanConfig
     private let signing: SigningProvider?
+    private let runner: PersistenceCommandRunner
+    private let isRoot: Bool
+    /// Commands (path + exact arguments) allowed when not running as root. Everything else is skipped.
+    public static let nonRootCommands: Set<String> = ["/usr/bin/crontab -l", "/usr/bin/profiles list", "/usr/bin/systemextensionsctl list"]
+    /// Tools refused outright when `noPrivilegedTools` is set.
+    public static let privilegedTools: Set<String> = ["/usr/bin/sfltool", "/usr/bin/profiles", "/usr/bin/systemextensionsctl"]
+    /// Commands that require root and are never spawned otherwise.
+    public static let rootOnlyCommands: Set<String> = ["/usr/bin/sfltool dumpbtm", "/usr/bin/profiles list -all"]
     private let fm = FileManager.default
+    private var lastBTM: [PersistenceRecord]?
+    /// Kinds whose source failed or timed out in the last scan (their absence is not a removal).
+    public private(set) var lastIncompleteKinds: Set<PersistenceItem.Kind> = []
 
-    public init(config: PersistenceScanConfig = PersistenceScanConfig(), signing: SigningProvider? = nil) {
-        self.config = config; self.signing = signing
+    public init(config: PersistenceScanConfig = PersistenceScanConfig(), signing: SigningProvider? = nil,
+                runner: PersistenceCommandRunner? = nil, isRoot: Bool = getuid() == 0) {
+        self.config = config; self.signing = signing; self.isRoot = isRoot
+        self.runner = runner ?? { Shell.run($0, $1, timeout: $2) }
+    }
+
+    /// Single gate for every spawned command: refuses anything that could raise an authorization dialog.
+    private func run(_ path: String, _ args: [String], timeout: TimeInterval) -> (status: Int32, out: String)? {
+        guard config.runCommands else { return nil }
+        if config.noPrivilegedTools && Self.privilegedTools.contains(path) { return nil }
+        let key = ([path] + args).joined(separator: " ")
+        if !isRoot && !Self.nonRootCommands.contains(key) { return nil }
+        if isRoot && !Self.nonRootCommands.contains(key) && !Self.rootOnlyCommands.contains(key) { return nil }
+        return runner(path, args, timeout)
+    }
+
+    /// A snapshot that remembers which kinds were incomplete, so the differ will not report them as removed.
+    public func snapshot() -> PersistenceSnapshot {
+        var s = PersistenceSnapshot(records: scanRecords())
+        s.incompleteKinds = Array(lastIncompleteKinds).sorted { $0.rawValue < $1.rawValue }
+        return s
     }
 
     /// Plain items (the shared IPC type).
@@ -73,24 +115,40 @@ public final class PersistenceScanner: @unchecked Sendable {
         var out: [PersistenceRecord] = []
         if k.contains(.launchAgent) { for d in config.launchAgentDirs { out += launchd(dir: d, kind: .launchAgent) } }
         if k.contains(.launchDaemon) { for d in config.launchDaemonDirs { out += launchd(dir: d, kind: .launchDaemon) } }
-        if (k.contains(.btm) || k.contains(.loginItem)) && config.runCommands,
-           let r = Shell.run("/usr/bin/sfltool", ["dumpbtm"], timeout: config.commandTimeout) {
-            out += Self.parseBTM(r.out).filter { k.contains($0.item.kind) }
+        var incomplete: Set<PersistenceItem.Kind> = []
+        let wantsBTM = k.contains(.btm) || k.contains(.loginItem)
+        if wantsBTM && config.runCommands && (!isRoot || config.noPrivilegedTools) {
+            // Never run sfltool unprivileged (it prompts for admin access); BTM/login items are unknown, not absent.
+            incomplete.formUnion([.btm, .loginItem].filter { k.contains($0) })
+        } else if wantsBTM && config.runCommands {
+            let r = run("/usr/bin/sfltool", ["dumpbtm"], timeout: config.btmTimeout)
+            let parsed = r.map { Self.parseBTM($0.out) } ?? []
+            if let r, r.status == 0, !parsed.isEmpty {
+                lastBTM = parsed
+                out += parsed.filter { k.contains($0.item.kind) }
+            } else if let cached = lastBTM {
+                out += cached.filter { k.contains($0.item.kind) }          // reuse the last good result
+            } else {
+                incomplete.formUnion([.btm, .loginItem].filter { k.contains($0) })
+            }
         }
         if k.contains(.cron) { out += cron() }
         if k.contains(.periodic) { out += periodic() }
         if k.contains(.shellRC) { out += shellRC() }
         if k.contains(.profile) && config.runCommands {
-            var args = ["list"]; if getuid() == 0 { args.append("-all") }
-            if let r = Shell.run("/usr/bin/profiles", args, timeout: config.commandTimeout) { out += Self.parseProfiles(r.out) }
+            var args = ["list"]; if isRoot { args.append("-all") }
+            if let r = run("/usr/bin/profiles", args, timeout: config.commandTimeout) { out += Self.parseProfiles(r.out) }
+            else { incomplete.insert(.profile) }
         }
         if k.contains(.browserExtension) { out += browserExtensions() }
-        if k.contains(.systemExtension) && config.runCommands,
-           let r = Shell.run("/usr/bin/systemextensionsctl", ["list"], timeout: config.commandTimeout) {
-            out += Self.parseSystemExtensions(r.out)
+        if k.contains(.systemExtension) && config.runCommands {
+            if let r = run("/usr/bin/systemextensionsctl", ["list"], timeout: config.commandTimeout), r.status == 0 {
+                out += Self.parseSystemExtensions(r.out)
+            } else { incomplete.insert(.systemExtension) }
         }
         if k.contains(.sshKey) { out += sshKeys() }
         if k.contains(.other) { out += others() }
+        lastIncompleteKinds = incomplete
 
         var seen = Set<String>()
         var result: [PersistenceRecord] = []
@@ -200,7 +258,7 @@ public final class PersistenceScanner: @unchecked Sendable {
 
     func cron() -> [PersistenceRecord] {
         var out: [PersistenceRecord] = []
-        if config.runCommands, let r = Shell.run("/usr/bin/crontab", ["-l"], timeout: config.commandTimeout), r.status == 0 {
+        if let r = run("/usr/bin/crontab", ["-l"], timeout: config.commandTimeout), r.status == 0 {
             out += Self.parseCrontab(r.out, source: "crontab:" + NSUserName())
         }
         for f in ["/etc/crontab"] + files(in: "/usr/lib/cron/tabs") + files(in: "/usr/lib/cron/jobs") {

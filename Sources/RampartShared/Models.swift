@@ -265,6 +265,18 @@ public enum IPCRequest: Codable, Sendable {
     case addAllowRule(AllowRuleSpec)
     case removeAllowRule(id: UUID)
     case health
+    // v3: tamper protection and remote-access lockdown (RampartGuard). Privileged ones need an admin peer.
+    case remoteAccessReport
+    case allowRemoteTool(id: String, minutes: Int?)
+    case revokeRemoteTool(id: String)
+    case setRemoteLockdown(on: Bool)
+    case tamperStatus
+    case requestDisableProtection(authorization: Data?, reason: String)
+    case disableProtection(token: String, minutes: Int)
+    case requestUninstall(authorization: Data?)
+    case uninstall(token: String)
+    // v3: forward per-user events (PasteGuard/clipboard) from the user session to the root daemon
+    case forwardEvents([SecurityEvent])
 }
 
 public enum IPCResponse: Codable, Sendable {
@@ -287,4 +299,8 @@ public enum IPCResponse: Codable, Sendable {
     case remediationPreview(RemediationPreview)
     case allowRules([AllowRuleSpec])
     case health(HealthReport)
+    // v3
+    case remoteAccess(Data)   // JSON of RampartGuard.RemoteAccessReport
+    case tamper(Data)         // JSON of the tamper status struct
+    case disableToken(String)
 }

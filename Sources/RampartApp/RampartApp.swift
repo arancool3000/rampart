@@ -25,9 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(showDock && !background ? .regular : .accessory)
         Notifier.shared.configure()
         AppModel.shared.start()
+        AppFeatures.startBackgroundServices()
         if background {
             DispatchQueue.main.async {
-                for window in NSApp.windows where window.identifier?.rawValue.contains("main") == true || window.title == "Rampart" {
+                for window in NSApp.windows where window.identifier?.rawValue.contains("main") == true || window.title == Product.name {
                     window.close()
                 }
             }
@@ -59,7 +60,7 @@ struct RampartApp: App {
     }
 
     private var mainWindow: some Scene {
-        Window("Rampart", id: "main") {
+        Window(Product.name, id: "main") {
             RootView()
                 .background(HeadlessWindowHider())
                 .environment(model)
@@ -93,6 +94,15 @@ struct RampartApp: App {
 struct RampartCommands: Commands {
     let chrome = ChromeState.shared
     var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("About \(Product.name)") {
+                NSApp.orderFrontStandardAboutPanel(options: [
+                    .applicationIcon: BrandImages.mark(size: 128),
+                    .applicationName: Product.name,
+                    .applicationVersion: Product.version,
+                ])
+            }
+        }
         CommandGroup(after: .sidebar) {
             Button("Overview") { AppModel.shared.selection = .dashboard }.keyboardShortcut("1", modifiers: .command)
             Button("Scan") { AppModel.shared.selection = .scan }.keyboardShortcut("2", modifiers: .command)

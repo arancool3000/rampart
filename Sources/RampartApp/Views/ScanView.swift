@@ -132,7 +132,7 @@ struct ScanChoiceCard: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(selected || targeted ? Color.rampartTeal.opacity(0.9) : Color.clear, lineWidth: 1.5)
         )
-        .hoverLift()
+        .modifier(MagneticTilt())
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
@@ -233,6 +233,7 @@ struct RunningScanView: View {
         ZStack(alignment: .bottom) {
             HStack(alignment: .center, spacing: 48) {
                 RadarView(fraction: progress.fraction, paused: progress.paused)
+                    .anchorPreference(key: RadarCenterKey.self, value: .center) { $0 }
                 VStack(alignment: .leading, spacing: Spacing.m) {
                     Label(progress.kind.title, systemImage: progress.kind.symbol)
                         .font(.headline).foregroundStyle(Color.rampartTeal)
@@ -267,12 +268,20 @@ struct RunningScanView: View {
                     .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: model.recentScanPaths)
                     .frame(maxWidth: 420, minHeight: 150, alignment: .topLeading)
                     .card(padding: Spacing.m)
+                    .anchorPreference(key: FileListLeadingKey.self, value: .leading) { $0 }
                     .accessibilityHidden(true)
                 }
                 .frame(maxWidth: 440, alignment: .leading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.bottom, 70)
+            .overlayPreferenceValue(RadarCenterKey.self) { radar in
+                GeometryReader { geo in
+                    if let radar {
+                        FileFlowOverlay(radar: geo[radar], active: !progress.paused)
+                    }
+                }
+            }
 
             HStack(spacing: Spacing.l) {
                 if model.mode != .live {
@@ -312,15 +321,19 @@ struct ScanResultView: View {
             VStack(spacing: Spacing.l) {
                 Spacer(minLength: Spacing.xxl)
                 if found.isEmpty {
-                    ShieldHero(symbol: "checkmark.shield.fill", tint: .statusProtected, size: 150)
-                        .symbolEffect(.bounce, value: bounce)
-                        .onAppear { bounce += 1 }
-                    Text("No threats found").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+                    ZStack {
+                        RippleOnce(tint: .statusProtected).frame(width: 150, height: 150)
+                        StatusMark(size: 130, badge: "checkmark.circle.fill", tint: .statusProtected)
+                    }
+                    Text("All clear").font(.system(size: 44, weight: .bold, design: .rounded))
+                        .revealText(duration: 0.9)
+                    Text("No threats found").font(.title2.weight(.semibold)).fontDesign(.rounded)
                     Text("Scanned \(Fmt.count(record.scanned)) files in \(Fmt.duration(record.seconds)).")
                         .font(.title3).foregroundStyle(.secondary)
                 } else {
                     Image(systemName: "archivebox.fill").font(.system(size: 64)).foregroundStyle(.secondary)
-                    Text(found.count == 1 ? "Found 1 item" : "Found \(found.count) items").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+                    Text(found.count == 1 ? "1 item found" : "\(found.count) items found").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+                        .revealText(duration: 0.9)
                     Text("They've been moved to quarantine and can't run.").font(.title3).foregroundStyle(.secondary)
                     VStack(spacing: 0) {
                         ForEach(found) { d in DetectionRowSummary(detection: d).padding(Spacing.s) }
@@ -329,7 +342,7 @@ struct ScanResultView: View {
                 }
                 if record.skipped > 0 {
                     DisclosureGroup(isExpanded: $showSkipped) {
-                        Text("Some files were in use, protected by macOS, or couldn't be read without Full Disk Access. They aren't a sign of a problem. Granting Full Disk Access lets Rampart check more of them.")
+                        Text("Some files were in use, protected by macOS, or couldn't be read without Full Disk Access. They aren't a sign of a problem. Granting Full Disk Access lets \(Product.name) check more of them.")
                             .font(.callout).foregroundStyle(.secondary).padding(.top, Spacing.xs)
                     } label: {
                         Text("\(Fmt.count(record.skipped)) files couldn't be scanned. Why?").font(.callout)
@@ -364,6 +377,25 @@ struct DetectionRowSummary: View {
             }
             Spacer()
             Badge(text: detection.category.label)
+        }
+    }
+}
+
+struct RadarCenterKey: PreferenceKey {
+    static var defaultValue: Anchor<CGPoint>? = nil
+    static func reduce(value: inout Anchor<CGPoint>?, nextValue: () -> Anchor<CGPoint>?) { value = value ?? nextValue() }
+}
+struct FileListLeadingKey: PreferenceKey {
+    static var defaultValue: Anchor<CGPoint>? = nil
+    static func reduce(value: inout Anchor<CGPoint>?, nextValue: () -> Anchor<CGPoint>?) { value = value ?? nextValue() }
+}
+/// Particles flow from the file list (right) into the radar centre while scanning.
+struct FileFlowOverlay: View {
+    let radar: CGPoint
+    let active: Bool
+    var body: some View {
+        GeometryReader { geo in
+            ScanParticles(from: CGPoint(x: min(geo.size.width - 40, radar.x + 360), y: radar.y), to: radar, active: active)
         }
     }
 }

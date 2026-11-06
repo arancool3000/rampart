@@ -57,6 +57,16 @@ final class DaemonLauncher {
         var args = ["--user"]
         if let s = Self.socketOverride { args += ["--socket", s] }
         if let r = Self.rootOverride { args += ["--root", r] }
+        // QA only: keep a test daemon from watching the user's real folders.
+        if CommandLine.arguments.contains("--helper-no-realtime") { args += ["--no-realtime"] }
+        // ZERO POP-UPS RULE: test runs never let the daemon schedule work or spawn privileged tools
+        // (sfltool, profiles, …), so nothing can show a dialog.
+        if Headless.active || CommandLine.arguments.contains("--helper-no-realtime") {
+            if !args.contains("--no-scheduler") { args += ["--no-scheduler"] }
+            var env = ProcessInfo.processInfo.environment
+            env["RAMPART_NO_PRIVILEGED_TOOLS"] = "1"
+            p.environment = env
+        }
         p.arguments = args
         p.standardInput = FileHandle.nullDevice
         let logDir = Self.rootOverride.map { URL(fileURLWithPath: $0) }

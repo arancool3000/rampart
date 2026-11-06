@@ -51,7 +51,12 @@ final class RealtimePipeline: RealtimeService {
         self.runtime = runtime; self.feed = feed; self.scanner = scanner
     }
 
-    var sources: [String: Bool] { feed.status }
+    var sources: [String: Bool] {
+        var s = feed.status
+        let on = q.sync { companionsRunning }
+        for c in companions { s[c.name] = on }
+        return s
+    }
     var isRunning: Bool { q.sync { started } && feed.status.values.contains(true) }
 
     func start(onEvent: @escaping (SecurityEvent) -> Void, onDetection: @escaping (Detection) -> Void) {
@@ -59,6 +64,10 @@ final class RealtimePipeline: RealtimeService {
         feed.start { [weak self] ev in self?.q.async { self?.ingest(ev) } }
         for (k, v) in feed.status.sorted(by: { $0.key < $1.key }) { logInfo("event source \(k): \(v ? "running" : "unavailable")") }
         q.sync { started = true }
+        if !companions.isEmpty {
+            for c in companions { c.start({ d in onDetection(d) }, { [weak self] e in self?.inject(e) }) }
+            q.sync { companionsRunning = true }
+        }
         let t = DispatchSource.makeTimerSource(queue: q)
         t.schedule(deadline: .now() + 1, repeating: 1)
         t.setEventHandler { [weak self] in self?.flush() }
@@ -68,8 +77,21 @@ final class RealtimePipeline: RealtimeService {
     func stop() {
         timer?.cancel(); timer = nil
         feed.stop()
-        q.sync { started = false }
+        for c in companions { c.stop() }
+        q.sync { started = false; companionsRunning = false }
     }
+
+    /// Extra per-session components started/stopped with the pipeline (e.g. PasteGuard).
+    struct Companion {
+        var name: String
+        var start: (_ onDetection: @escaping (Detection) -> Void, _ inject: @escaping (SecurityEvent) -> Void) -> Void
+        var stop: () -> Void
+    }
+    var companions: [Companion] = []
+    private var companionsRunning = false
+
+    /// Feeds an event from outside the hub (e.g. the DNS filter's query log).
+    func inject(_ ev: SecurityEvent) { q.async { [weak self] in self?.ingest(ev) } }
 
     private func ingest(_ ev: SecurityEvent) {
         eventsSeen += 1
@@ -105,6 +127,7 @@ final class RealtimePipeline: RealtimeService {
         let scanner = self.scanner, cb = onDetection
         for p in ready {
             scanQ.async {
+                Thread.current.threadDictionary["rampart.onwrite"] = true   // never paused by "pause scan"
                 var isDir: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: p, isDirectory: &isDir), !isDir.boolValue else { return }
                 if let d = scanner.scanFile(p) { cb?(d) }

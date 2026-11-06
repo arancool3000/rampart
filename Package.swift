@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "rampart", targets: ["rampart"]),
         .executable(name: "RampartApp", targets: ["RampartApp"]),
         .executable(name: "rampart-nmh", targets: ["rampart-nmh"]),
+        .executable(name: "RampartBrowser", targets: ["RampartBrowser"]),
     ],
     targets: [
         .target(name: "RampartShared"),
@@ -27,6 +28,9 @@ let package = Package(
         .target(name: "RampartVault", dependencies: ["RampartShared"]),
         .target(name: "RampartAI", dependencies: ["RampartShared"]),
         .executableTarget(name: "rampart-nmh", dependencies: ["RampartShared", "RampartWeb"]),
+        .executableTarget(name: "RampartBrowser", dependencies: ["RampartShared", "RampartWeb"],
+                          exclude: ["README.md"],
+                          linkerSettings: [.linkedFramework("WebKit")]),
         .executableTarget(name: "rampartd", dependencies: [
             "RampartShared", "RampartEngine", "RampartYara", "RampartSigning", "RampartTelemetry",
             "RampartBehaviour", "RampartRemediation", "RampartNetwork", "RampartPosture",
@@ -34,7 +38,7 @@ let package = Package(
         .executableTarget(name: "rampart", dependencies: [
             "RampartShared", "RampartEngine", "RampartYara", "RampartSigning", "RampartRemediation",
             "RampartPosture", "RampartNetwork", "RampartBehaviour", "RampartGuard", "RampartWeb"]),
-        .executableTarget(name: "RampartApp", dependencies: ["RampartShared", "RampartVault", "RampartAI", "RampartWeb", "RampartNetwork"]),
+        .executableTarget(name: "RampartApp", dependencies: ["RampartShared", "RampartVault", "RampartAI", "RampartWeb", "RampartNetwork", "RampartBehaviour", "RampartGuard"]),
         .executableTarget(name: "rampart-selftest", dependencies: [
             "RampartShared", "RampartEngine", "RampartYara", "RampartSigning", "RampartTelemetry",
             "RampartBehaviour", "RampartRemediation", "RampartNetwork", "RampartPosture",

@@ -50,6 +50,46 @@ public enum ClipboardClassifier {
     }
 }
 
+/// Byte-for-byte mirror of `RampartBehaviour.ClipboardFingerprint` (telemetry can't import the behaviour
+/// module). Produces `detail["clip_tokens"]`: comma-separated first 8 lowercase hex chars of
+/// SHA-256(bootSalt + token). The self-test cross-checks both implementations; change them together.
+public enum ClipFingerprint {
+    /// Per-boot salt: `sysctl kern.bootsessionuuid` (falls back to kern.boottime seconds).
+    public static let bootSalt: String = {
+        var size = 0
+        if sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 1 {
+            var buf = [CChar](repeating: 0, count: size)
+            if sysctlbyname("kern.bootsessionuuid", &buf, &size, nil, 0) == 0 { return String(cString: buf) }
+        }
+        var tv = timeval(); var sz = MemoryLayout<timeval>.size
+        if sysctlbyname("kern.boottime", &tv, &sz, nil, 0) == 0 { return "boot-\(tv.tv_sec)" }
+        return "rampart-unsalted"
+    }()
+
+    static let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "|;&<>()`\"'{}$"))
+
+    /// Split on whitespace and |;&<>()`"'{}$, lowercase, absolute paths -> last component, drop empty and
+    /// "\\", de-duplicate in order.
+    public static func tokens(_ text: String) -> [String] {
+        var seen = Set<String>(); var out: [String] = []
+        for raw in text.components(separatedBy: separators) {
+            var t = raw.lowercased()
+            if t.hasPrefix("/") && t.count > 1 { t = (t as NSString).lastPathComponent }
+            if t.isEmpty || t == "\\" { continue }
+            if seen.insert(t).inserted { out.append(t) }
+        }
+        return out
+    }
+
+    public static func hash(_ token: String, salt: String = bootSalt) -> String {
+        String(SHA256.hash(data: Data((salt + token).utf8)).map { String(format: "%02x", $0) }.joined().prefix(8))
+    }
+
+    public static func fingerprint(_ text: String, salt: String = bootSalt) -> String {
+        tokens(text).map { hash($0, salt: salt) }.joined(separator: ",")
+    }
+}
+
 /// In-memory, time-limited record of recent command-like clipboard copies, kept only as salted
 /// hashes: one of the whole normalized text and one per token. Never stores or logs the text.
 /// `match(args:)` lets the exec path recognise "this command line was pasted from that copy".
@@ -138,7 +178,8 @@ public final class ClipboardMemory: @unchecked Sendable {
 /// Per-user clipboard watcher (runs in the session agent, not the root daemon). Polls `changeCount`
 /// every `interval`; only on a change does it read the string, classify it, and drop it. Emits
 /// `.other` events with `type=clipboard`, `class=command|risky`, `reasons`, `source_app`, `length`,
-/// `text_fp`, `token_fps` (salted HMAC prefixes). Plain text copies (class `text`, e.g. passwords)
+/// `text_fp`, `token_fps` (salted HMAC prefixes, for `ClipboardMemory`), and `clip_tokens`
+/// (`ClipFingerprint`, the format the behaviour engine's R31 rule consumes). Plain text copies (class `text`, e.g. passwords)
 /// emit nothing and are not remembered.
 ///
 /// Privacy note: on macOS 15.4+ reading the *general* pasteboard programmatically can show the user a
@@ -207,12 +248,13 @@ public final class ClipboardSource: EventSource, CPUReporting {
             let (cls, reasons) = ClipboardClassifier.classify(text)
             guard cls != .text else { text = ""; return }
             let entry = memory.remember(text: text, cls: cls, reasons: reasons, sourceApp: app)
+            let clipTokens = ClipFingerprint.fingerprint(ClipboardClassifier.normalize(text))
             let length = text.count
             text = ""
             var detail: [String: String] = [
                 "type": "clipboard", "class": cls.rawValue, "length": String(length),
                 "text_fp": entry.textHash, "token_fps": entry.tokenFPs.sorted().joined(separator: ","),
-                "change_count": String(cc),
+                "change_count": String(cc), "clip_tokens": clipTokens,
             ]
             if !reasons.isEmpty { detail["reasons"] = reasons.joined(separator: ",") }
             if let app { detail["source_app"] = app }

@@ -1,0 +1,7 @@
+{
+  "name": "app.rampart.nmh",
+  "description": "RamPart Web Protection native messaging host",
+  "path": "__NMH_PATH__",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://__EXTENSION_ID__/"]
+}

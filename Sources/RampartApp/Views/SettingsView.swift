@@ -76,14 +76,16 @@ struct ServiceFooter: View {
     @Environment(AppModel.self) private var model
     var body: some View {
         switch model.mode {
-        case .live: Text("Saved by the Rampart background service.").foregroundStyle(.secondary)
-        case .demo: Text("Demo mode: changes here aren't saved.").foregroundStyle(.secondary)
+        case .live: Text("Saved by the \(Product.name) background service.").foregroundStyle(.secondary)
+        case .demo: Text("Developer demo: changes here aren't saved.").foregroundStyle(.secondary)
+        case .offline: Text("The protection service isn't running, so changes can't be saved right now.").foregroundStyle(.secondary)
         case .connecting: Text("Connecting to the background service…").foregroundStyle(.secondary)
         }
     }
 }
 
 struct GeneralSettings: View {
+    @StateVar private var showPermissions = false
     @AppStorage("general.launchAtLogin") private var launchAtLogin = true
     @AppStorage("general.showDock") private var showDock = true
     @AppStorage(DaemonLauncher.keepRunningKey) private var keepProtecting = true
@@ -91,14 +93,14 @@ struct GeneralSettings: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Open Rampart at login", isOn: $launchAtLogin)
-                Toggle("Keep protecting when Rampart is closed", isOn: $keepProtecting)
+                Toggle("Open \(Product.name) at login", isOn: $launchAtLogin)
+                Toggle("Keep protecting when \(Product.name) is closed", isOn: $keepProtecting)
                 Toggle("Show in menu bar", isOn: Binding(get: { ChromeState.shared.menuBarInserted },
                                                           set: { ChromeState.shared.setMenuBarInserted($0) }))
                 Toggle("Show Dock icon", isOn: $showDock)
                     .onChange(of: showDock) { _, v in if !Headless.active { NSApp.setActivationPolicy(v ? .regular : .accessory) } }
             } footer: {
-                Text("With basic protection, closing Rampart leaves checking running in the background unless you turn that off here.")
+                Text("With basic protection, closing \(Product.name) leaves checking running in the background unless you turn that off here.")
                     .foregroundStyle(.secondary)
             }
             Section {
@@ -107,7 +109,13 @@ struct GeneralSettings: View {
                 }
                 Button("Show Welcome Guide Again") { NotificationCenter.default.post(name: .rampartShowOnboarding, object: nil) }
             }
+            Section {
+                LabeledContent("Permissions") {
+                    Button("Set Up \(Product.name)…") { showPermissions = true }
+                }
+            } footer: { Text("Grant everything \(Product.name) needs in one place.").foregroundStyle(.secondary) }
         }
+        .sheet(isPresented: $showPermissions) { PermissionsSheet() }
     }
 }
 
@@ -127,7 +135,7 @@ struct ProtectionSettings: View {
             Section {
                 Toggle("Learn quietly for the first 48 hours", isOn: model.setting(\.learningMode))
             } footer: {
-                Text("While learning, Rampart records how your apps normally behave and only interrupts you for clear threats.").foregroundStyle(.secondary)
+                Text("While learning, \(Product.name) records how your apps normally behave and only interrupts you for clear threats.").foregroundStyle(.secondary)
             }
             Section {
                 LabeledContent("Not scanned") {
@@ -190,14 +198,14 @@ struct NotificationSettings: View {
             if authorized == false {
                 Section {
                     HStack {
-                        Label("Notifications are off for Rampart in System Settings.", systemImage: "bell.slash")
+                        Label("Notifications are off for \(Product.name) in System Settings.", systemImage: "bell.slash")
                         Spacer()
                         Button("Allow…") { Task { authorized = await Notifier.shared.requestAuthorization() } }
                     }
                 }
             }
             Section {
-                Toggle("Threats Rampart blocks", isOn: model.setting(\.notifyThreats))
+                Toggle("Threats \(Product.name) blocks", isOn: model.setting(\.notifyThreats))
                 Toggle("Finished scans and updates", isOn: model.setting(\.notifyInfo))
                 Toggle("Play sounds", isOn: $sounds)
             } header: { Text("Notify me about") } footer: {
@@ -234,7 +242,7 @@ struct PrivacySettings: View {
     var body: some View {
         Form {
             Section {
-                Label("Rampart doesn't collect usage statistics.", systemImage: "chart.bar.xaxis")
+                Label("\(Product.name) doesn't collect usage statistics.", systemImage: "chart.bar.xaxis")
                 Label("Scanning happens on this Mac. Your files are never uploaded.", systemImage: "internaldrive")
                 Label("Definition updates download public threat lists; nothing about you is sent.", systemImage: "arrow.down.circle")
                 Label("The password breach check sends only the first 5 characters of a fingerprint.", systemImage: "key")
@@ -249,7 +257,7 @@ struct AccountSettings: View {
     var body: some View {
         Form {
             Section("Plan") {
-                LabeledContent("Plan", value: "Rampart Personal")
+                LabeledContent("Plan", value: "\(Product.name) Personal")
                 LabeledContent("Price", value: "$29.99 per year")
                 LabeledContent("Renews", value: Calendar.current.date(byAdding: .month, value: 10, to: Date())!.formatted(date: .long, time: .omitted))
                 LabeledContent("Devices", value: "1 of 3 Macs")
@@ -274,7 +282,7 @@ struct AdvancedSettings: View {
             Section("Protection service") {
                 LabeledContent("Running as") { ProtectionSourceLabel() }
                 if model.source == .basic {
-                    Button("Install Full Protection…") { showInstall = true }
+                    Button("Enable Full Protection…") { showInstall = true }.buttonStyle(GlowButtonStyle())
                 }
             }
             HealthPanel()
@@ -289,14 +297,14 @@ struct AdvancedSettings: View {
             }
             Section {
                 Button("Remove All Allow Rules…", role: .destructive) { confirmReset = true }.disabled(model.allowRules.isEmpty)
-                Button("Uninstall Rampart…") { showUninstall = true }
+                Button("Uninstall \(Product.name)…") { showUninstall = true }
             }
         }
         .sheet(isPresented: $showInstall) { InstallFullProtectionSheet() }
         .confirmationDialog("Remove all allow rules?", isPresented: $confirmReset) {
             Button("Remove All", role: .destructive) { Task { for r in model.allowRules { await model.removeAllowRule(r) } } }
         } message: { Text("Every allowed file, developer and folder will be checked normally again. This can't be undone.") }
-        .alert("Uninstall Rampart", isPresented: $showUninstall) {
+        .alert("Uninstall \(Product.name)", isPresented: $showUninstall) {
             Button("Cancel", role: .cancel) {}
             Button("Copy Uninstall Command") {
                 NSPasteboard.general.clearContents()
@@ -314,7 +322,8 @@ struct ProtectionSourceLabel: View {
         switch (model.mode, model.source) {
         case (.live, .systemService): StatusLabel(text: "System service (full protection)", symbol: "checkmark.shield.fill", tint: .statusProtected)
         case (.live, _): StatusLabel(text: "Basic protection (no install)", symbol: "shield.lefthalf.filled", tint: .rampartTeal)
-        case (.demo, _): StatusLabel(text: "Not running · demo mode", symbol: "sparkles.rectangle.stack", tint: .statusInfo)
+        case (.demo, _): StatusLabel(text: "Developer demo", symbol: "sparkles.rectangle.stack", tint: .statusInfo)
+        case (.offline, _): StatusLabel(text: "Not running", symbol: "shield.slash", tint: .statusAction)
         case (.connecting, _): StatusLabel(text: "Starting…", symbol: "hourglass", tint: .secondary)
         }
     }
@@ -324,7 +333,7 @@ struct ProtectionSourceLabel: View {
 struct HealthPanel: View {
     @Environment(AppModel.self) private var model
     var body: some View {
-        Section("Rampart health") {
+        Section("\(Product.name) health") {
             if let h = model.health {
                 LabeledContent("Version", value: "\(h.version) · \(h.mode == "user" ? "basic" : "system") mode")
                 LabeledContent("Running for", value: Fmt.duration(h.uptimeSeconds))
@@ -362,33 +371,51 @@ struct HealthPanel: View {
     }
 }
 
-/// Calm upgrade path from basic protection to the full system service.
+/// Calm upgrade path from basic protection to the full system service: one password prompt, once.
 struct InstallFullProtectionSheet: View {
     @Environment(\.dismiss) private var dismiss
+    private let installer = FullProtectionInstaller.shared
+    @StateVar private var showManual = false
     @StateVar private var copied = false
-    private var command: String {
-        let scripts = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("scripts/install.sh").path
-        return FileManager.default.fileExists(atPath: scripts) ? "sudo \"\(scripts)\"" : "sudo ./scripts/install.sh"
-    }
+    private var command: String { "sudo \"\(installer.cliURL.path)\" install" }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
             HStack(spacing: Spacing.m) {
-                IconBadge(symbol: "shield.lefthalf.filled", tint: .rampartTeal, size: 44)
+                IconBadge(symbol: "lock.shield", tint: .rampartTeal, size: 44)
                 VStack(alignment: .leading) {
-                    Text("Install full protection").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                    Text("Enable full protection").font(.title2.weight(.semibold)).fontDesign(.rounded)
                     Text("Optional. Basic protection keeps working either way.").foregroundStyle(.secondary)
                 }
             }
             VStack(alignment: .leading, spacing: Spacing.s) {
-                Text("The system service adds:").font(.headline)
                 Label("Web protection that blocks malicious and phishing sites for every app", systemImage: "globe")
                 Label("System-wide monitoring of new processes and startup items", systemImage: "waveform.path.ecg")
                 Label("Protection that starts before you log in", systemImage: "power")
             }
-            VStack(alignment: .leading, spacing: Spacing.s) {
-                Text("How to install").font(.headline)
-                Text("Open Rampart.pkg from the Rampart disk image, or run this in Terminal. macOS will ask for an administrator password; Rampart never sees it.")
-                    .fixedSize(horizontal: false, vertical: true)
+            Text("macOS will ask for your password once. After that \(Product.name) handles protection without asking again.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+
+            switch installer.phase {
+            case .idle:
+                EmptyView()
+            case .waitingForPassword:
+                progress("Waiting for your password…")
+            case .installing:
+                progress("Installing the system service…")
+            case .connecting:
+                progress("Connecting to the new service…")
+            case .done:
+                Label("Full protection is on.", systemImage: "checkmark.shield.fill").foregroundStyle(.primary).font(.headline)
+            case .failed(let why):
+                Label(why, systemImage: "exclamationmark.circle").foregroundStyle(.secondary)
+            }
+
+            if let reason = installer.unavailableReason {
+                Label(reason, systemImage: "info.circle").font(.callout).foregroundStyle(.secondary)
+            }
+
+            DisclosureGroup("Prefer Terminal?", isExpanded: $showManual) {
                 HStack {
                     Text(command).font(.callout.monospaced()).textSelection(.enabled)
                         .padding(8).frame(maxWidth: .infinity, alignment: .leading)
@@ -398,9 +425,24 @@ struct InstallFullProtectionSheet: View {
                     }
                 }
             }
-            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+            .font(.callout)
+
+            HStack {
+                Spacer()
+                Button(installer.phase == .done ? "Done" : "Not Now") { dismiss() }.keyboardShortcut(.cancelAction)
+                if installer.phase != .done {
+                    Button("Enable Full Protection") { installer.run() }
+                        .buttonStyle(GlowButtonStyle()).controlSize(.large)
+                        .disabled(installer.unavailableReason != nil || [.waitingForPassword, .installing, .connecting].contains(installer.phase))
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
         }
         .padding(Spacing.xl)
         .frame(width: 540)
+    }
+
+    private func progress(_ text: String) -> some View {
+        HStack(spacing: Spacing.s) { ProgressView().controlSize(.small); Text(text).foregroundStyle(.secondary) }
     }
 }
