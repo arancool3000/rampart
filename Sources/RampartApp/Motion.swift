@@ -191,8 +191,6 @@ struct MagneticTilt: ViewModifier {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func body(content: Content) -> some View {
-        let nx = point.map { ($0.x / max(size.width, 1)) - 0.5 } ?? 0
-        let ny = point.map { ($0.y / max(size.height, 1)) - 0.5 } ?? 0
         content
             .overlay {
                 if let p = point {
@@ -202,9 +200,10 @@ struct MagneticTilt: ViewModifier {
                         .allowsHitTesting(false)
                 }
             }
-            .rotation3DEffect(.degrees(reduceMotion ? 0 : Double(ny) * -maxDegrees * 2), axis: (x: 1, y: 0, z: 0), perspective: 0.6)
-            .rotation3DEffect(.degrees(reduceMotion ? 0 : Double(nx) * maxDegrees * 2), axis: (x: 0, y: 1, z: 0), perspective: 0.6)
-            .scaleEffect(point != nil && !reduceMotion ? 1.01 : 1)
+            // No 3D rotation: on macOS rotation3DEffect stops controls inside the card receiving clicks.
+            // A soft lift (shadow + tiny scale) gives the same "alive" feel and keeps buttons and toggles working.
+            .shadow(color: .black.opacity(point != nil && !reduceMotion ? 0.18 : 0), radius: 10, y: 4)
+            .scaleEffect(point != nil && !reduceMotion ? 1.006 : 1)
             .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.75), value: point)
             .onGeometryChange(for: CGSize.self) { $0.size } action: { size = $0 }
             .onContinuousHover { phase in

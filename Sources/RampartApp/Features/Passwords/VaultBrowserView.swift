@@ -176,7 +176,9 @@ struct ItemDetail: View {
                     }
                     Button("Edit") { model.editing = item }.secondaryActionStyle()
                 }
-                VStack(spacing: 0) { fields }.card(padding: Spacing.s)
+                if item.kind != .secureNote || !item.customFields.isEmpty {
+                    VStack(spacing: 0) { fields }.card(padding: Spacing.s)
+                }
                 if let totp = item.totp { TOTPView(totp: totp) }
                 if !item.notes.isEmpty, item.kind != .secureNote || true {
                     VStack(alignment: .leading, spacing: 6) {
