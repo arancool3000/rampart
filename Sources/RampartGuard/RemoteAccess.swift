@@ -31,7 +31,7 @@ public enum RemoteToolCatalogue {
         RemoteTool(id: "apple.screensharing", name: "Screen Sharing", vendor: "Apple", signingIDPrefixes: ["com.apple.screensharing", "com.apple.ScreensharingAgent"],
                    pathHints: ["screensharingd", "screensharingagent"], ports: [5900], isAppleService: true),
         RemoteTool(id: "apple.ard", name: "Remote Management (ARD)", vendor: "Apple", signingIDPrefixes: ["com.apple.RemoteDesktop", "com.apple.ARDAgent"],
-                   pathHints: ["ardagent", "remotemanagement"], ports: [3283, 5900], isAppleService: true),
+                   pathHints: ["/ardagent.app/", "/ardagent"], ports: [3283, 5900], isAppleService: true),
         RemoteTool(id: "apple.ssh", name: "Remote Login (SSH)", vendor: "Apple", signingIDPrefixes: ["com.openssh.sshd"],
                    pathHints: ["/usr/sbin/sshd", "sshd-keygen-wrapper", "sshd-session"], ports: [22], isAppleService: true),
         RemoteTool(id: "apple.aeserver", name: "Remote Apple Events", vendor: "Apple", signingIDPrefixes: ["com.apple.AEServer"],
@@ -64,8 +64,15 @@ public enum RemoteToolCatalogue {
     /// Well-known Team IDs (strong on their own).
     public static let strongTeamIDs: Set<String> = ["EQHXZ8M8AV"]
 
+    /// Apple's MDM machinery (device management, single sign-on, configuration profiles). Not remote access:
+    /// on organisation-managed Macs it is how the organisation applies settings and network filters. Never match it.
+    public static let mdmPathPrefixes = ["/system/library/privateframeworks/remotemanagement.framework/",
+                                         "/system/library/privateframeworks/managedconfiguration.framework/"]
+
     public static func identify(signingID: String?, teamID: String?, path: String?, bundleID: String? = nil, label: String? = nil) -> (RemoteTool, [String])? {
         let lowPath = (path ?? "").lowercased()
+        if mdmPathPrefixes.contains(where: { lowPath.hasPrefix($0) }) { return nil }
+        if let sid = (signingID ?? bundleID)?.lowercased(), sid.hasPrefix("com.apple.remotemanagement") || sid.hasPrefix("com.apple.managedclient") { return nil }
         for t in all {
             var why: [String] = []
             for s in [signingID, bundleID, label].compactMap({ $0 }) where t.signingIDPrefixes.contains(where: { s.lowercased().hasPrefix($0.lowercased()) }) {
@@ -377,6 +384,8 @@ public struct RemoteEnforcementPlan: Codable, Sendable {
 /// Turns a report + policy into actions. Kills go through `KillHook` (the daemon injects ProcessKiller-backed logic
 /// that refuses platform binaries and checks pid reuse). Everything else is a GuardCommand for the daemon.
 public struct RemoteAccessEnforcer: Sendable {
+    /// Resolves a pid to its executable path (injectable for tests).
+    nonisolated(unsafe) public static var processPath: (Int32) -> String = { GuardProc.path(of: $0) }
     public static let launchctl = "/bin/launchctl", systemsetup = "/usr/sbin/systemsetup", kickstart = "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart", pfctl = "/sbin/pfctl"
     public let kill: KillHook
     public let firewall: RemoteAccessFirewall
@@ -409,6 +418,10 @@ public struct RemoteAccessEnforcer: Sendable {
         }
         p.pfRules = firewall.anchorRules(blockedPorts: r.blockedPorts)
         p.commands += firewall.loadCommands()
+        // Hard guard: never signal macOS system processes, whatever matched upstream.
+        let protectedPrefixes = ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"]
+        func isSystem(_ pid: Int32) -> Bool { pid <= 1 || protectedPrefixes.contains { Self.processPath(pid).hasPrefix($0) } }
+        p.suspendPIDs.removeAll(where: isSystem); p.killPIDs.removeAll(where: isSystem)
         if !dryRun {
             for pid in p.suspendPIDs where kill(pid, SIGSTOP) { p.signalled.append(pid) }
             for pid in p.killPIDs where kill(pid, SIGKILL) { p.signalled.append(pid) }

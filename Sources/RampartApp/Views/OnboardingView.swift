@@ -4,7 +4,16 @@ import AppKit
 import Combine
 
 struct OnboardingView: View {
-    enum Step: Int, CaseIterable { case welcome, permissions, firstScan }
+    enum Step: Int, CaseIterable { case welcome, applications, permissions, firstScan }
+    /// True when the app is running from somewhere other than an Applications folder.
+    static var needsMoveToApplications: Bool {
+        let path = Bundle.main.bundlePath
+        return !(path.hasPrefix("/Applications/") || path.hasPrefix(NSHomeDirectory() + "/Applications/"))
+    }
+    private var steps: [Step] {
+        Step.allCases.filter { $0 != .applications || Self.needsMoveToApplications || step == .applications }
+    }
+    private var stepIndex: Int { steps.firstIndex(of: step) ?? 0 }
     var onFinish: () -> Void
     init(onFinish: @escaping () -> Void, initialStep: Step = .welcome) {
         self.onFinish = onFinish
@@ -20,13 +29,16 @@ struct OnboardingView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: Spacing.m) {
                 if step != .welcome {
-                    Text("Step \(step.rawValue) of \(Step.allCases.count - 1)").font(.callout).foregroundStyle(.secondary)
+                    Button { goBack() } label: { Label("Back", systemImage: "chevron.left") }
+                        .buttonStyle(.link).help("Go to the previous step")
+                        .disabled(step == .firstScan && scanStarted && model.isScanning)
+                    Text("Step \(stepIndex) of \(steps.count - 1)").font(.callout).foregroundStyle(.secondary).monospacedDigit()
                 }
                 Spacer()
                 if step != .firstScan {
-                    Button("Skip for now") { advance() }.buttonStyle(.link)
+                    Button("Skip for now") { advance() }.buttonStyle(.link).help("You can finish this later in Settings")
                 }
             }
             .padding(.horizontal, Spacing.xl).padding(.top, Spacing.l)
@@ -35,6 +47,7 @@ struct OnboardingView: View {
             Group {
                 switch step {
                 case .welcome: welcome
+                case .applications: applications
                 case .permissions: permissions
                 case .firstScan: firstScan
                 }
@@ -43,24 +56,47 @@ struct OnboardingView: View {
             .padding(.horizontal, 48)
             .transition(.opacity)
 
-            HStack(spacing: 8) {
-                ForEach(Step.allCases, id: \.rawValue) { s in
-                    Circle().fill(s == step ? Color.rampartTeal : Color.secondary.opacity(0.3)).frame(width: 7, height: 7)
+            HStack(spacing: 6) {
+                ForEach(steps, id: \.rawValue) { s in
+                    Capsule()
+                        .fill(s == step ? Color.rampartTeal : (s.rawValue < step.rawValue ? Color.rampartTeal.opacity(0.45) : Color.secondary.opacity(0.3)))
+                        .frame(width: s == step ? 18 : 7, height: 7)
                 }
             }
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: step)
             .padding(.bottom, Spacing.l)
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Step \(step.rawValue + 1) of \(Step.allCases.count)")
+            .accessibilityLabel("Step \(stepIndex + 1) of \(steps.count)")
         }
         .frame(width: 680, height: 600)
         .background(AppBackdrop())
         .sheet(isPresented: $showInstall) { InstallFullProtectionSheet() }
         .onReceive(NotificationCenter.default.publisher(for: .rampartOnboardingAdvance)) { _ in advance() }
+        .onExitCommand { if step != .welcome && !(step == .firstScan && model.isScanning) { goBack() } }
     }
 
     private func advance() {
         withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) {
-            if let next = Step(rawValue: step.rawValue + 1) { step = next } else { onFinish() }
+            let i = stepIndex + 1
+            if i < steps.count { step = steps[i] } else { onFinish() }
+        }
+    }
+
+    private func goBack() {
+        guard stepIndex > 0 else { return }
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) { step = steps[stepIndex - 1] }
+    }
+
+    private var applications: some View {
+        page(symbol: "folder.fill", title: "Move \(Product.name) to Applications",
+             body: "\(Product.name) works best from your Applications folder. It keeps updates and background protection reliable. It only takes a second.") {
+            Button("Show Me How") {
+                NotificationCenter.default.post(name: .rampartShowMoveToApplications, object: nil)
+            }
+            .buttonStyle(GlowButtonStyle()).controlSize(.large)
+            .padding(.top, Spacing.s)
+            Button("Continue") { advance() }.keyboardShortcut(.defaultAction)
+            Text("You can also do this later. Nothing is lost.").font(.callout).foregroundStyle(.secondary)
         }
     }
 
@@ -92,7 +128,7 @@ struct OnboardingView: View {
 
     private var welcome: some View {
         page(symbol: "brand", title: "Welcome to \(Product.name)",
-             body: "\(Product.name) protects your Mac quietly in the background. We'll set up permissions in one place, then run a quick check. It takes about 2 minutes.") {
+             body: "\(Product.name) protects your Mac quietly in the background. First we'll set up a few permissions in one place, then run a quick check. It takes about two minutes.") {
             Button("Get Started") { advance() }.buttonStyle(GlowButtonStyle()).controlSize(.large).keyboardShortcut(.defaultAction)
                 .padding(.top, Spacing.s)
             Text("No ads. No upsells. Your files stay on your Mac.").font(.callout).foregroundStyle(.secondary)
@@ -139,7 +175,7 @@ struct OnboardingView: View {
             }
         } else {
             page(symbol: "magnifyingglass", title: "Let's do a quick check",
-                 body: "This takes about a minute. You can close this window — the scan continues.") {
+                 body: "This usually takes about a minute. Feel free to close this window; the scan keeps going.") {
                 ProgressView(value: p?.fraction ?? 0).tint(Color.rampartTeal).frame(maxWidth: 360)
                 Text(p.map { $0.total > 0 ? "\(Fmt.count($0.scanned)) of \(Fmt.count($0.total)) files" : "Estimating files…" } ?? "Starting…")
                     .font(.callout).foregroundStyle(.secondary).monospacedDigit()
@@ -161,4 +197,9 @@ struct OnboardingView: View {
         model.scanPhase = .idle
         model.startScan(.quick)
     }
+}
+
+extension Notification.Name {
+    /// Posted by onboarding when the user asks how to move the app into Applications.
+    static let rampartShowMoveToApplications = Notification.Name("rampartShowMoveToApplications")
 }

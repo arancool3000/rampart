@@ -32,9 +32,6 @@ struct ScanView: View {
                             .accessibilityAction { choice = kind }
                     }
                 }
-                .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
-                    loadDrop(providers); return true
-                }
 
                 HStack(spacing: Spacing.m) {
                     Button { start() } label: {
@@ -45,8 +42,18 @@ struct ScanView: View {
                     .disabled(choice == .custom && customPaths.isEmpty)
                     if choice == .custom {
                         Button("Choose…") { pickFolders() }.controlSize(.large)
+                            .help("Pick files, folders or drives to check")
+                        if !customPaths.isEmpty {
+                            Button("Clear") { withAnimation(.easeOut(duration: 0.15)) { customPaths = [] } }
+                                .buttonStyle(.link)
+                                .help("Remove the chosen items")
+                        }
                     }
                     Spacer()
+                    if choice == .custom {
+                        Text("Tip: drop files or folders anywhere in this window.")
+                            .font(.caption).foregroundStyle(.tertiary)
+                    }
                 }
 
                 HStack(spacing: Spacing.s) {
@@ -73,6 +80,11 @@ struct ScanView: View {
             }
             .contentColumn()
         }
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
+            loadDrop(providers); return !providers.isEmpty
+        }
+        .overlay { if dropTargeted { DropHintOverlay().transition(.opacity) } }
+        .animation(.easeOut(duration: 0.15), value: dropTargeted)
     }
 
     private var customSummary: String {
@@ -101,6 +113,27 @@ struct ScanView: View {
                 }
             }
         }
+    }
+}
+
+/// Shown while files are dragged over the Scan screen.
+private struct DropHintOverlay: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(reduceTransparency ? AnyShapeStyle(Color(nsColor: .windowBackgroundColor)) : AnyShapeStyle(.ultraThinMaterial))
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .strokeBorder(Color.rampartTeal.opacity(0.8), style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+            VStack(spacing: Spacing.s) {
+                Image(systemName: "arrow.down.doc").font(.system(size: 40, weight: .semibold)).foregroundStyle(Color.rampartTeal)
+                Text("Drop to scan").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("Files and folders are added to a Custom Scan.").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+        .padding(Spacing.l)
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
     }
 }
 

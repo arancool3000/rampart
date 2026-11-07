@@ -8,6 +8,7 @@ struct DashboardView: View {
     @StateVar private var showScoreInfo = false
     @StateVar private var confirmOff = false
     @StateVar private var showInstall = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("dashboard.basicCardDismissed") private var basicCardDismissed = false
 
     var body: some View {
@@ -57,7 +58,7 @@ struct DashboardView: View {
             return .init(symbol: "checkmark.shield.fill", tint: .statusProtected, title: "Your Mac is protected",
                          detail: model.source == .basic && model.mode == .live
                              ? "Basic protection is on. \(Product.name) checks new files and startup items without installing anything."
-                             : "Real-time protection is on. Last scan found nothing.",
+                             : (model.scanHistory.first.map { $0.found == 0 ? "Real-time protection is on. Your last scan found nothing." : "Real-time protection is on." } ?? "Real-time protection is on. Run a Quick Scan anytime for a full check."),
                          button: "Run Quick Scan", prominent: false)
         case .recommendations(let n):
             return .init(symbol: "exclamationmark.shield.fill", tint: .statusAttention, title: "Your Mac is protected",
@@ -130,6 +131,7 @@ struct DashboardView: View {
                     .controlSize(.large)
                     Text("Definitions \(model.status.signatureVersion == "0" ? "" : model.status.signatureVersion + " · ")updated \(Fmt.ago(model.definitionsUpdated).lowercased())")
                         .font(.callout).foregroundStyle(.secondary)
+                        .help(model.definitionsUpdated.map { "Definitions last updated \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "Definitions haven't been updated yet")
                 }
                 .padding(.top, Spacing.s)
             }
@@ -165,8 +167,9 @@ struct DashboardView: View {
             }
             Spacer()
             Button("Enable Full Protection…") { showInstall = true }.buttonStyle(GlowButtonStyle())
-            Button { basicCardDismissed = true } label: { Image(systemName: "xmark") }
+            Button { withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { basicCardDismissed = true } } label: { Image(systemName: "xmark") }
                 .buttonStyle(.borderless).accessibilityLabel("Hide this card")
+                .help("Hide this card. You can install full protection later from Settings.")
         }
         .card(tint: .rampartTeal)
         .sheet(isPresented: $showInstall) { InstallFullProtectionSheet() }
@@ -198,8 +201,9 @@ struct DashboardView: View {
         }
         StatusTile(symbol: "magnifyingglass", tint: .rampartTeal, title: "Last scan", value: lastScanText,
                    caption: model.scanHistory.first.map { "\(Fmt.count($0.scanned)) files in \(Fmt.duration($0.seconds))" }) {
-            Button("Scan Now") { model.selection = .scan; model.startScan(.quick) }
+            Button(model.isScanning ? "Scanning…" : "Scan Now") { model.selection = .scan; model.startScan(.quick) }
                 .buttonStyle(.link).disabled(model.isScanning)
+                .help("Run a Quick Scan (⌘R)")
         } chart: {
             if !model.scanHistory.isEmpty {
                 // One pill per recent scan, oldest to newest: green = clean, grey = items found and contained.
@@ -217,6 +221,7 @@ struct DashboardView: View {
                    value: model.status.webProtectionOn ? "\(model.blockedThisMonth) blocked this month" : "Off",
                    caption: model.status.webProtectionOn ? "\(model.blockedToday) today" : nil) {
             Button("Details") { model.selection = .network }.buttonStyle(.link)
+                .help("Open Network to see blocked sites")
         } chart: {
             if model.blockedLast7.contains(where: { $0 > 0 }) { MiniBars(values: model.blockedLast7, tint: .statusInfo) }
         }
@@ -277,8 +282,18 @@ struct DashboardView: View {
                 Button("Show All") { model.selection = .activity }.buttonStyle(.link)))
             VStack(spacing: 0) {
                 if model.activity.isEmpty {
-                    Text(model.mode == .live ? "Nothing yet. Run a Quick Scan and \(Product.name) will list what it checks here." : "Nothing yet. \(Product.name) will list what it checks and blocks here.")
-                        .foregroundStyle(.secondary).padding(Spacing.m)
+                    HStack(spacing: Spacing.m) {
+                        Image(systemName: "list.bullet.rectangle").foregroundStyle(.tertiary).font(.title3)
+                            .accessibilityHidden(true)
+                        Text(model.mode == .live ? "Nothing yet. Run a Quick Scan and \(Product.name) will list what it checks here." : "Nothing yet. \(Product.name) will list what it checks and blocks here.")
+                            .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                        if model.mode == .live {
+                            Button("Run Quick Scan") { model.selection = .scan; model.startScan(.quick) }
+                                .disabled(model.isScanning)
+                        }
+                    }
+                    .padding(Spacing.m)
                 }
                 ForEach(Array(model.activity.prefix(5).enumerated()), id: \.element.id) { idx, a in
                     if idx > 0 { Divider() }
@@ -381,6 +396,7 @@ struct ScoreExplainer: View {
 
 struct ActivityRow: View {
     let item: ActivityItem
+    @StateVar private var hovering = false
     var body: some View {
         HStack(spacing: Spacing.m) {
             Image(systemName: item.kind.symbol).foregroundStyle(.secondary).frame(width: 22)
@@ -388,7 +404,12 @@ struct ActivityRow: View {
             Spacer()
             Text(item.outcome).font(.callout).foregroundStyle(.secondary)
             Text(Fmt.ago(item.date)).font(.callout).foregroundStyle(.tertiary).frame(minWidth: 90, alignment: .trailing)
+                .help(item.date.formatted(date: .abbreviated, time: .standard))
         }
+        .contentShape(Rectangle())
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(hovering ? 0.04 : 0)).padding(-4))
+        .onHover { hovering = $0 }
+        .help(item.title)
         .accessibilityElement(children: .combine)
     }
 }

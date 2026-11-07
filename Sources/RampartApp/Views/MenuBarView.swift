@@ -7,6 +7,7 @@ struct MenuBarView: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
     @StateVar private var showQuitInfo = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.m) {
@@ -15,13 +16,20 @@ struct MenuBarView: View {
                 HStack(spacing: Spacing.s) {
                     Button { model.startScan(.quick) } label: { Label("Quick Scan", systemImage: "bolt.fill").frame(maxWidth: .infinity) }
                         .buttonStyle(GlowButtonStyle())
+                        .keyboardShortcut("r", modifiers: .command)
+                        .help("Check the places malware usually hides (⌘R)")
                     Button { openMain() } label: { Text("Open \(Product.name)").frame(maxWidth: .infinity) }
                         .secondaryActionStyle()
+                        .keyboardShortcut("o", modifiers: .command)
+                        .help("Open the main window (⌘O)")
                 }
                 .controlSize(.large)
             }
             VStack(spacing: 0) {
-                infoRow("magnifyingglass", "Last scan", lastScan)
+                TimelineView(.periodic(from: .now, by: 60)) { ctx in
+                    infoRow("magnifyingglass", "Last scan", lastScan(now: ctx.date))
+                }
+                .help(lastScanDate.map { "Last scan: \(Fmt.dayTime($0))" } ?? "No scan has run yet")
                 Divider().padding(.leading, 34)
                 infoRow("arrow.triangle.2.circlepath", "Definitions", Fmt.ago(model.definitionsUpdated))
                 Divider().padding(.leading, 34)
@@ -32,13 +40,25 @@ struct MenuBarView: View {
             .font(.callout)
             .card(padding: Spacing.s)
             VStack(alignment: .leading, spacing: 2) {
-                Menu("Pause Protection") {
-                    Button("For 15 minutes") { model.setRealtime(false, pauseFor: 15) }
-                    Button("For 1 hour") { model.setRealtime(false, pauseFor: 60) }
-                    if model.pausedUntil != nil { Button("Resume Now") { model.setRealtime(true) } }
+                Menu {
+                    if let until = model.pausedUntil {
+                        Button { model.setRealtime(true) } label: { Label("Resume Now", systemImage: "play.fill") }
+                        Text("Resumes automatically at \(until.formatted(date: .omitted, time: .shortened))")
+                        Divider()
+                    }
+                    Section("Pause for") {
+                        Button("15 minutes") { model.setRealtime(false, pauseFor: 15) }
+                        Button("1 hour") { model.setRealtime(false, pauseFor: 60) }
+                        Button("4 hours") { model.setRealtime(false, pauseFor: 240) }
+                        Button("Until tomorrow") { model.setRealtime(false, pauseFor: minutesUntilTomorrow) }
+                    }
+                } label: {
+                    Label(model.pausedUntil == nil ? "Pause Protection" : "Paused · Resume or Extend", systemImage: model.pausedUntil == nil ? "pause.circle" : "play.circle")
                 }
                 .menuStyle(.borderlessButton)
                 .disabled(model.mode == .live)
+                .help(model.mode == .live ? "Pausing is managed by the system service in Settings" : "Temporarily pause real-time protection; it resumes on its own")
+                .accessibilityHint("Real-time protection resumes automatically after the chosen time")
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 MenuRowButton(title: "Settings…", shortcut: "⌘,") { NSApp.activate(ignoringOtherApps: true); openSettings() }
                 MenuRowButton(title: "Quit \(Product.name)", shortcut: "⌘Q") { showQuitInfo = true }
@@ -46,10 +66,17 @@ struct MenuBarView: View {
                     VStack(alignment: .leading, spacing: Spacing.s) {
                         Text("Real-time protection keeps running in the background. To stop it, turn off protection in Settings.")
                             .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        HStack { Spacer(); Button("Cancel") { showQuitInfo = false }; Button("Quit") { NSApp.terminate(nil) }.keyboardShortcut(.defaultAction) }
+                        HStack { Spacer(); Button("Cancel") { showQuitInfo = false }.keyboardShortcut(.cancelAction); Button("Quit") { NSApp.terminate(nil) }.keyboardShortcut(.defaultAction) }
                     }
                     .padding(Spacing.s)
+                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .top)))
                 }
+            }
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: showQuitInfo)
+            .background {
+                // Hidden keyboard shortcuts for the popover.
+                Button("") { NSApp.activate(ignoringOtherApps: true); openSettings() }.keyboardShortcut(",", modifiers: .command).hidden()
+                Button("") { showQuitInfo = true }.keyboardShortcut("q", modifiers: .command).hidden()
             }
         }
         .padding(Spacing.m)
@@ -125,9 +152,20 @@ struct MenuBarView: View {
         }
     }
 
-    private var lastScan: String {
-        if let r = model.scanHistory.first { return "\(Fmt.dayTime(r.date)) · \(r.found == 0 ? "Clean" : "\(r.found) found")" }
-        return model.status.lastScan.map(Fmt.dayTime) ?? "Not yet"
+    private var lastScanDate: Date? { model.scanHistory.first?.date ?? model.status.lastScan }
+
+    private func lastScan(now: Date) -> String {
+        guard let d = lastScanDate else { return "Not yet" }
+        let rel = now.timeIntervalSince(d) < 60 ? "Just now" : RelativeDateTimeFormatter.short.localizedString(for: d, relativeTo: now)
+        if let r = model.scanHistory.first { return "\(rel) · \(r.found == 0 ? "Clean" : "\(r.found) found")" }
+        return rel
+    }
+
+    private var minutesUntilTomorrow: Int {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: cal.date(byAdding: .day, value: 1, to: .now) ?? .now)
+        let morning = cal.date(byAdding: .hour, value: 8, to: start) ?? start
+        return max(60, Int(morning.timeIntervalSinceNow / 60))
     }
 
     private func infoRow(_ symbol: String, _ k: String, _ v: String) -> some View {
@@ -148,6 +186,10 @@ struct MenuBarView: View {
     }
 }
 
+private extension RelativeDateTimeFormatter {
+    static let short: RelativeDateTimeFormatter = { let f = RelativeDateTimeFormatter(); f.unitsStyle = .full; return f }()
+}
+
 struct MenuRowButton: View {
     let title: String
     let shortcut: String
@@ -162,5 +204,7 @@ struct MenuRowButton: View {
         }
         .buttonStyle(.plain)
         .onHover { hover = $0 }
+        .accessibilityLabel(title)
+        .accessibilityHint("Keyboard shortcut \(shortcut)")
     }
 }

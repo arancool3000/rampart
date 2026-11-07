@@ -34,6 +34,28 @@ final class PermissionsModel {
             case .accessibility: return "Lets \(Product.name) set up Safari protection for you with one button."
             }
         }
+        /// Where to click in System Settings, as a breadcrumb for the mini illustration.
+        var settingsPath: [String] {
+            switch self {
+            case .admin: return ["Password prompt", "Install"]
+            case .fullDisk: return ["Privacy & Security", "Full Disk Access"]
+            case .notifications: return ["Notifications", Product.name]
+            case .paste: return ["Privacy & Security", "Paste from Other Apps"]
+            case .localNetwork: return ["Privacy & Security", "Local Network"]
+            case .accessibility: return ["Privacy & Security", "Accessibility"]
+            }
+        }
+        /// What happens without it, plainly.
+        var withoutIt: String {
+            switch self {
+            case .admin: return "Without it, scanning still works, but web protection stays off."
+            case .fullDisk: return "Without it, protected folders are skipped during scans."
+            case .notifications: return "Without it, you'll only see blocks when you open \(Product.name)."
+            case .paste: return "Without it, Paste Guard and Scam Check can't see what you copy."
+            case .localNetwork: return "Without it, Network Scan can't list nearby devices."
+            case .accessibility: return "Without it, you can still turn on Safari protection by hand."
+            }
+        }
         var symbol: String {
             switch self {
             case .admin: return "lock.shield"; case .fullDisk: return "internaldrive"; case .notifications: return "bell.badge"
@@ -120,6 +142,7 @@ final class PermissionsModel {
         }
         s[.localNetwork] = .optional   // macOS offers no status API; checked in System Settings
         s[.accessibility] = Headless.active ? .needed : (AXIsProcessTrusted() ? .granted : .needed)
+        if s[.fullDisk] == .granted, PermissionGuidePanel.shared.isShowing { PermissionGuidePanel.shared.finish() }
         if s != statuses { statuses = s }
         if let w = walking, status(w) == .granted { advanceWalk() }
     }
@@ -134,6 +157,7 @@ final class PermissionsModel {
             Task { _ = await Notifier.shared.requestAuthorization(); refresh() }
         default:
             if let u = r.settingsURL { NSWorkspace.shared.open(u) }
+            if r == .fullDisk && status(.fullDisk) != .granted { PermissionGuidePanel.shared.show() }
         }
     }
 
@@ -160,6 +184,8 @@ struct PermissionsChecklistView: View {
     private let perms = PermissionsModel.shared
     @Environment(AppModel.self) private var model
     @StateVar private var showInstall = false
+    @StateVar private var expanded: PermissionsModel.Row?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.m) {
@@ -175,8 +201,11 @@ struct PermissionsChecklistView: View {
                 }
             }
             .card(padding: Spacing.s)
-            HStack {
+            HStack(spacing: Spacing.s) {
                 let left = perms.remaining.count
+                let total = max(perms.rows.count, 1)
+                PermissionsProgressRing(fraction: Double(perms.rows.count - left) / Double(total), done: left == 0)
+                    .accessibilityHidden(true)
                 Text(left == 0 ? "Everything's set up." : "\(left) left to grant")
                     .font(.callout).foregroundStyle(.secondary)
                 Spacer()
@@ -197,17 +226,37 @@ struct PermissionsChecklistView: View {
         let st = perms.status(r)
         HStack(spacing: Spacing.m) {
             IconBadge(symbol: r.symbol, tint: st == .granted ? .statusProtected : .rampartTeal, size: 32)
-            VStack(alignment: .leading, spacing: 2) {
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.3), value: st)
+            VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(r.title).font(.body.weight(.medium))
                     if perms.walking == r { ProgressView().controlSize(.mini) }
                 }
                 Text(r.reason).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if st != .granted {
+                    Button {
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { expanded = expanded == r ? nil : r }
+                    } label: {
+                        Label(expanded == r ? "Hide details" : "Why, and where to click",
+                              systemImage: expanded == r ? "chevron.down" : "chevron.right")
+                            .font(.caption).labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.plain).foregroundStyle(Color.rampartTeal)
+                    .help("Shows where this setting lives in System Settings")
+                    if expanded == r {
+                        SettingsPathIllustration(path: r.settingsPath)
+                            .padding(.top, 2)
+                            .transition(.opacity)
+                        Text(r.withoutIt).font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
             Spacer()
             switch st {
             case .granted:
                 StatusLabel(text: "Granted", symbol: "checkmark.circle.fill", tint: .statusProtected).font(.callout)
+                    .transition(reduceMotion ? .opacity : .scale(scale: 0.85).combined(with: .opacity))
             case .optional:
                 StatusLabel(text: "Optional", symbol: "circle.dashed", tint: .secondary).font(.callout)
                 Button("Open") { perms.grant(r) }.controlSize(.small)
@@ -217,8 +266,74 @@ struct PermissionsChecklistView: View {
             }
         }
         .padding(Spacing.s)
+        .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.7), value: st)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(r.title): \(st == .granted ? "granted" : st == .optional ? "optional" : "needed"). \(r.reason)")
+    }
+}
+
+/// A small, static sketch of a System Settings window: sidebar item on the left, the switch to turn on at right.
+private struct SettingsPathIllustration: View {
+    let path: [String]
+    var body: some View {
+        HStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 3) {
+                    ForEach(0..<3, id: \.self) { i in
+                        Circle().fill([Color.red, .yellow, .green][i].opacity(0.6)).frame(width: 5, height: 5)
+                    }
+                }
+                .padding(.bottom, 2)
+                Text(path.first ?? "")
+                    .font(.system(size: 9, weight: .semibold))
+                    .padding(.horizontal, 5).padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 3).fill(Color.accentColor.opacity(0.25)))
+                RoundedRectangle(cornerRadius: 2).fill(.quaternary).frame(width: 50, height: 4)
+            }
+            .padding(6)
+            .frame(width: 110, alignment: .leading)
+            .background(.quaternary.opacity(0.5))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(path.last ?? "").font(.system(size: 9, weight: .semibold))
+                HStack(spacing: 4) {
+                    RoundedRectangle(cornerRadius: 2).fill(Color.rampartTeal).frame(width: 8, height: 8)
+                    Text(Product.name).font(.system(size: 9))
+                    Spacer(minLength: 6)
+                    Capsule().fill(Color.statusProtected).frame(width: 16, height: 9)
+                        .overlay(alignment: .trailing) { Circle().fill(.white).frame(width: 7, height: 7).padding(1) }
+                        .overlay { Capsule().stroke(Color.rampartTeal, lineWidth: 1.5).padding(-3) }
+                }
+            }
+            .padding(6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: 260)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("In System Settings, open \(path.joined(separator: ", then ")), and turn on \(Product.name).")
+    }
+}
+
+/// Footer progress ring: fills as permissions are granted, settles to a check when done.
+private struct PermissionsProgressRing: View {
+    let fraction: Double
+    let done: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body: some View {
+        ZStack {
+            Circle().stroke(.quaternary, lineWidth: 3)
+            Circle().trim(from: 0, to: max(0, min(1, fraction)))
+                .stroke(done ? Color.statusProtected : Color.rampartTeal, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+            if done {
+                Image(systemName: "checkmark").font(.system(size: 8, weight: .bold)).foregroundStyle(Color.statusProtected)
+                    .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .frame(width: 18, height: 18)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.4), value: fraction)
+        .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.6), value: done)
     }
 }
 

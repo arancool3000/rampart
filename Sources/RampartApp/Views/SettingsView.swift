@@ -6,6 +6,24 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "General", protection = "Protection", scans = "Scans", network = "Network", notifications = "Notifications",
          updates = "Updates", privacy = "Privacy", account = "Account", advanced = "Advanced"
     var id: String { rawValue }
+    /// Words people might type when looking for a setting on this tab.
+    var keywords: String {
+        switch self {
+        case .general: return "login launch dock menu bar text size welcome permissions background"
+        case .protection: return "real-time realtime quarantine archives disk images ransomware decoy learning exclusions pause"
+        case .scans: return "schedule daily quick scan time"
+        case .network: return "web phishing malicious sites trackers dns"
+        case .notifications: return "alerts sounds threats finished"
+        case .updates: return "definitions xprotect version automatic check"
+        case .privacy: return "data statistics upload breach"
+        case .account: return "plan subscription renew price devices"
+        case .advanced: return "developer logs diagnostics health uninstall allow rules data folder finder full protection"
+        }
+    }
+    func matches(_ query: String) -> Bool {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        return q.isEmpty || rawValue.localizedCaseInsensitiveContains(q) || keywords.localizedCaseInsensitiveContains(q)
+    }
     var symbol: String {
         switch self {
         case .general: return "gearshape"; case .protection: return "shield.lefthalf.filled"; case .scans: return "magnifyingglass"
@@ -18,6 +36,8 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 struct SettingsView: View {
     let standalone: Bool
     @StateVar private var tab: SettingsTab = .protection
+    @StateVar private var query = ""
+    private var visibleTabs: [SettingsTab] { SettingsTab.allCases.filter { $0.matches(query) } }
 
     var body: some View {
         if standalone {
@@ -28,11 +48,24 @@ struct SettingsView: View {
             }
         } else {
             HStack(spacing: 0) {
-                List(SettingsTab.allCases, selection: Binding(get: { Optional(tab) }, set: { if let t = $0 { tab = t } })) { t in
-                    Label(t.rawValue, systemImage: t.symbol).tag(t)
+                VStack(spacing: 0) {
+                    SettingsSearchField(text: $query)
+                        .padding(.horizontal, Spacing.s).padding(.top, Spacing.s)
+                        .onChange(of: query) { _, _ in
+                            if let first = visibleTabs.first, !visibleTabs.contains(tab) { tab = first }
+                        }
+                    if visibleTabs.isEmpty {
+                        Text("No settings match \u{201C}\(query)\u{201D}.")
+                            .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                            .padding(Spacing.m).frame(maxHeight: .infinity, alignment: .top)
+                    } else {
+                        List(visibleTabs, selection: Binding(get: { Optional(tab) }, set: { if let t = $0 { tab = t } })) { t in
+                            Label(t.rawValue, systemImage: t.symbol).tag(t)
+                        }
+                        .listStyle(.sidebar)
+                        .scrollContentBackground(.hidden)
+                    }
                 }
-                .listStyle(.sidebar)
-                .scrollContentBackground(.hidden)
                 .frame(width: 200)
                 Divider()
                 SettingsPane(tab: tab).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -71,6 +104,70 @@ struct SettingsPane: View {
     }
 }
 
+/// Compact search field for the settings sidebar.
+struct SettingsSearchField: View {
+    @Binding var text: String
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
+            TextField("Search settings", text: $text).textFieldStyle(.plain)
+                .onExitCommand { text = "" }
+            if !text.isEmpty {
+                Button { text = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
+                    .buttonStyle(.plain).help("Clear search").accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, 7).padding(.vertical, 5)
+        .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+}
+
+/// A toggle with a one-line plain-language explanation underneath.
+struct HintToggle: View {
+    let title: String
+    let hint: String
+    @Binding var isOn: Bool
+    init(_ title: String, hint: String, isOn: Binding<Bool>) { self.title = title; self.hint = hint; self._isOn = isOn }
+    var body: some View {
+        Toggle(isOn: $isOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(hint).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityHint(hint)
+    }
+}
+
+/// Small "Reset to Defaults" control for a section; disabled when nothing differs.
+struct ResetSectionButton: View {
+    let isDefault: Bool
+    let reset: () -> Void
+    var body: some View {
+        HStack {
+            Spacer()
+            Button("Reset to Defaults", action: reset)
+                .buttonStyle(.link).font(.caption)
+                .disabled(isDefault)
+                .help(isDefault ? "Already using the recommended settings" : "Restore the recommended settings for this section")
+        }
+    }
+}
+
+extension AppModel {
+    /// True when every key path matches a fresh `RampartSettings()`.
+    func settingsAreDefault(_ kps: [PartialKeyPath<RampartSettings>]) -> Bool {
+        let d = RampartSettings()
+        return kps.allSatisfy { kp in
+            (settings[keyPath: kp] as? AnyHashable) == (d[keyPath: kp] as? AnyHashable)
+        }
+    }
+    func resetSettings(_ apply: @escaping (inout RampartSettings, RampartSettings) -> Void) {
+        let d = RampartSettings()
+        updateSettings { apply(&$0, d) }
+    }
+}
+
 /// Footer shown where a setting is held by the background service.
 struct ServiceFooter: View {
     @Environment(AppModel.self) private var model
@@ -93,15 +190,20 @@ struct GeneralSettings: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Open \(Product.name) at login", isOn: $launchAtLogin)
-                Toggle("Keep protecting when \(Product.name) is closed", isOn: $keepProtecting)
-                Toggle("Show in menu bar", isOn: Binding(get: { ChromeState.shared.menuBarInserted },
-                                                          set: { ChromeState.shared.setMenuBarInserted($0) }))
-                Toggle("Show Dock icon", isOn: $showDock)
+                HintToggle("Open \(Product.name) at login", hint: "Starts quietly in the background when you log in.", isOn: $launchAtLogin)
+                HintToggle("Keep protecting when \(Product.name) is closed", hint: "Checking continues even after you quit the window.", isOn: $keepProtecting)
+                HintToggle("Show in menu bar", hint: "A small icon for status and quick actions.",
+                           isOn: Binding(get: { ChromeState.shared.menuBarInserted }, set: { ChromeState.shared.setMenuBarInserted($0) }))
+                HintToggle("Show Dock icon", hint: "Turn off to keep \(Product.name) out of the Dock and app switcher.", isOn: $showDock)
                     .onChange(of: showDock) { _, v in if !Headless.active { NSApp.setActivationPolicy(v ? .regular : .accessory) } }
             } footer: {
-                Text("With basic protection, closing \(Product.name) leaves checking running in the background unless you turn that off here.")
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: Spacing.s) {
+                    Text("With basic protection, closing \(Product.name) leaves checking running in the background unless you turn that off here.")
+                        .foregroundStyle(.secondary)
+                    ResetSectionButton(isDefault: launchAtLogin && keepProtecting && showDock) {
+                        launchAtLogin = true; keepProtecting = true; showDock = true
+                    }
+                }
             }
             Section {
                 Picker("Text size", selection: $textSize) {
@@ -128,12 +230,19 @@ struct ProtectionSettings: View {
             Section {
                 Toggle("Real-time protection", isOn: Binding(get: { model.settings.realtimeOn && model.pausedUntil == nil },
                                                              set: { v in if v { model.setRealtime(true) } else { confirmOff = true } }))
-                Toggle("Move threats to quarantine automatically", isOn: model.setting(\.autoQuarantine))
-                Toggle("Scan inside archives and disk images", isOn: model.setting(\.scanArchives))
-                Toggle("Ransomware early warning (decoy files)", isOn: model.setting(\.ransomwareCanaries))
-            } header: { Text("Real-time") } footer: { ServiceFooter() }
+                HintToggle("Move threats to quarantine automatically", hint: "Threats are set aside safely; you can restore them from Quarantine.", isOn: model.setting(\.autoQuarantine))
+                HintToggle("Scan inside archives and disk images", hint: "Checks .zip, .dmg and similar files before you open what's inside.", isOn: model.setting(\.scanArchives))
+                HintToggle("Ransomware early warning (decoy files)", hint: "Places hidden decoy files and alerts you if something starts encrypting them.", isOn: model.setting(\.ransomwareCanaries))
+            } header: { Text("Real-time") } footer: {
+                VStack(alignment: .leading, spacing: Spacing.s) {
+                    ServiceFooter()
+                    ResetSectionButton(isDefault: model.settingsAreDefault([\.autoQuarantine, \.scanArchives, \.ransomwareCanaries])) {
+                        model.resetSettings { $0.autoQuarantine = $1.autoQuarantine; $0.scanArchives = $1.scanArchives; $0.ransomwareCanaries = $1.ransomwareCanaries }
+                    }
+                }
+            }
             Section {
-                Toggle("Learn quietly for the first 48 hours", isOn: model.setting(\.learningMode))
+                HintToggle("Learn quietly for the first 48 hours", hint: "Fewer questions while \(Product.name) gets to know your Mac.", isOn: model.setting(\.learningMode))
             } footer: {
                 Text("While learning, \(Product.name) records how your apps normally behave and only interrupts you for clear threats.").foregroundStyle(.secondary)
             }
@@ -160,12 +269,19 @@ struct ScanSettings: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Run a Quick Scan every day", isOn: model.setting(\.scheduledQuickScan))
+                HintToggle("Run a Quick Scan every day", hint: "Checks the places malware usually hides. Takes a minute or two.", isOn: model.setting(\.scheduledQuickScan))
                 Picker("Time", selection: model.setting(\.scheduledScanHour)) {
                     ForEach(0..<24, id: \.self) { Text(String(format: "%02d:00", $0)).tag($0) }
                 }
                 .disabled(!model.settings.scheduledQuickScan)
-            } header: { Text("Scheduled scan") } footer: { ServiceFooter() }
+            } header: { Text("Scheduled scan") } footer: {
+                VStack(alignment: .leading, spacing: Spacing.s) {
+                    ServiceFooter()
+                    ResetSectionButton(isDefault: model.settingsAreDefault([\.scheduledQuickScan, \.scheduledScanHour])) {
+                        model.resetSettings { $0.scheduledQuickScan = $1.scheduledQuickScan; $0.scheduledScanHour = $1.scheduledScanHour }
+                    }
+                }
+            }
         }
     }
 }
@@ -175,10 +291,10 @@ struct NetworkSettings: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Block known malicious and phishing sites", isOn: Binding(get: { model.settings.webProtection },
+                HintToggle("Block known malicious and phishing sites", hint: "Stops pages that try to steal passwords or install malware.", isOn: Binding(get: { model.settings.webProtection },
                                                                               set: { v in model.updateSettings { $0.webProtection = v }; Task { await model.setWebProtection(v) } }))
                     .disabled(!model.webProtectionAvailable)
-                Toggle("Block trackers (privacy, not security)", isOn: model.setting(\.blockTrackers))
+                HintToggle("Block trackers (privacy, not security)", hint: "Hides known ad and analytics domains. Some sites may behave differently.", isOn: model.setting(\.blockTrackers))
                     .disabled(!model.webProtectionAvailable)
             } header: { Text("Web protection") } footer: {
                 if !model.webProtectionAvailable {
@@ -205,11 +321,17 @@ struct NotificationSettings: View {
                 }
             }
             Section {
-                Toggle("Threats \(Product.name) blocks", isOn: model.setting(\.notifyThreats))
-                Toggle("Finished scans and updates", isOn: model.setting(\.notifyInfo))
-                Toggle("Play sounds", isOn: $sounds)
+                HintToggle("Threats \(Product.name) blocks", hint: "A short note whenever something is stopped or quarantined.", isOn: model.setting(\.notifyThreats))
+                HintToggle("Finished scans and updates", hint: "Lets you know when routine work is done.", isOn: model.setting(\.notifyInfo))
+                HintToggle("Play sounds", hint: "Adds a gentle sound to notifications.", isOn: $sounds)
             } header: { Text("Notify me about") } footer: {
-                Text("Everything other than threats is limited to one notification per hour.").foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: Spacing.s) {
+                    Text("Everything other than threats is limited to one notification per hour.").foregroundStyle(.secondary)
+                    ResetSectionButton(isDefault: !sounds && model.settingsAreDefault([\.notifyThreats, \.notifyInfo])) {
+                        sounds = false
+                        model.resetSettings { $0.notifyThreats = $1.notifyThreats; $0.notifyInfo = $1.notifyInfo }
+                    }
+                }
             }
         }
     }
@@ -220,7 +342,7 @@ struct UpdateSettings: View {
     var body: some View {
         Form {
             Section {
-                Toggle("Update definitions automatically", isOn: model.setting(\.autoUpdate))
+                HintToggle("Update definitions automatically", hint: "Downloads the latest threat lists in the background. Recommended.", isOn: model.setting(\.autoUpdate))
             } footer: { ServiceFooter() }
             Section {
                 LabeledContent("Definitions", value: model.status.signatureVersion == "0" ? "—" : model.status.signatureVersion)
@@ -277,6 +399,11 @@ struct AdvancedSettings: View {
     @StateVar private var confirmReset = false
     @StateVar private var showUninstall = false
     @StateVar private var showInstall = false
+    private var dataFolder: URL {
+        model.source == .basic
+            ? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Rampart")
+            : Paths.supportRoot
+    }
     var body: some View {
         Form {
             Section("Protection service") {
@@ -287,12 +414,21 @@ struct AdvancedSettings: View {
             }
             HealthPanel()
             Section {
-                Toggle("Developer mode (fewer alerts for build tools)", isOn: model.setting(\.developerMode))
+                HintToggle("Developer mode (fewer alerts for build tools)", hint: "Trusts compilers and package managers that create many new files.", isOn: model.setting(\.developerMode))
             } footer: { ServiceFooter() }
             Section("Diagnostics") {
                 Button("Open Logs Folder") {
                     let dir = model.source == .basic ? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Rampart") : URL(fileURLWithPath: "/Library/Logs/Rampart")
                     NSWorkspace.shared.open(dir)
+                }
+                LabeledContent("Data folder") {
+                    HStack(spacing: Spacing.s) {
+                        Text(dataFolder.path).font(.caption.monospaced()).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                        Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([dataFolder]) }
+                            .buttonStyle(.link)
+                            .help("Reveal where \(Product.name) keeps its definitions, rules and quarantine")
+                    }
                 }
             }
             Section {

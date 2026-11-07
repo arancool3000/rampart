@@ -10,6 +10,20 @@ struct ThreatsView: View {
     @StateVar private var selectedQuarantine: QuarantineRecord.ID?
     @StateVar private var showInspector = true
     @StateVar private var sortOrder = [KeyPathComparator(\Detection.date, order: .reverse)]
+    /// Records the user deleted but whose permanent delete hasn't run yet (undo window).
+    @StateVar private var pendingDeletes: Set<QuarantineRecord.ID> = []
+    @StateVar private var undo: UndoNote?
+    @StateVar private var undoTask: Task<Void, Never>?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    struct UndoNote: Identifiable {
+        let id = UUID()
+        let text: String
+        let undo: @MainActor () async -> Void
+        let commit: (@MainActor () async -> Void)?
+    }
+
+    private var visibleQuarantine: [QuarantineRecord] { model.quarantine.filter { !pendingDeletes.contains($0.id) } }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,6 +32,16 @@ struct ThreatsView: View {
             case .quarantine: quarantineTable
             }
         }
+        .overlay(alignment: .bottom) {
+            if let undo {
+                UndoBanner(text: undo.text) { performUndo() } dismiss: { finishUndo(commit: true) }
+                    .id(undo.id)
+                    .padding(Spacing.m)
+                    .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.9), value: undo?.id)
+        .onDisappear { finishUndo(commit: true) }
         .navigationTitle("Threats & Quarantine")
         .toolbar {
             ToolbarItem(placement: .principal) {
@@ -38,14 +62,14 @@ struct ThreatsView: View {
         .inspector(isPresented: $showInspector) {
             Group {
                 if segment == .detections, let id = selectedDetection, let d = model.detections.first(where: { $0.id == id }) {
-                    DetectionInspector(detection: d, record: record(for: d))
-                } else if segment == .quarantine, let id = selectedQuarantine, let r = model.quarantine.first(where: { $0.id == id }) {
-                    DetectionInspector(detection: detection(for: r), record: r)
+                    DetectionInspector(detection: d, record: record(for: d), onDelete: scheduleDelete, onRestored: offerReQuarantine)
+                } else if segment == .quarantine, let id = selectedQuarantine, let r = visibleQuarantine.first(where: { $0.id == id }) {
+                    DetectionInspector(detection: detection(for: r), record: r, onDelete: scheduleDelete, onRestored: offerReQuarantine)
                 } else {
                     EmptyStateView(symbol: "info.circle", title: "Select an item", detail: "You'll see why \(Product.name) flagged it and what you can do.")
                 }
             }
-            .inspectorColumnWidth(min: 320, ideal: 380, max: 480)
+            .inspectorColumnWidth(min: 340, ideal: 400, max: 520)
         }
         .onAppear {
             if selectedDetection == nil { selectedDetection = model.openDetections.first?.id ?? model.detections.first?.id }
@@ -53,8 +77,50 @@ struct ThreatsView: View {
         }
     }
 
+    // MARK: Undo
+
+    /// Hides the record at once and deletes it for real only after a short grace period.
+    private func scheduleDelete(_ r: QuarantineRecord) {
+        finishUndo(commit: true)
+        pendingDeletes.insert(r.id)
+        if selectedQuarantine == r.id { selectedQuarantine = visibleQuarantine.first?.id }
+        let name = (r.originalPath as NSString).lastPathComponent
+        present(UndoNote(text: "Deleted \u{201C}\(name)\u{201D}", undo: { pendingDeletes.remove(r.id); selectedQuarantine = r.id },
+                         commit: { await model.delete(r); pendingDeletes.remove(r.id) }))
+    }
+
+    /// After a restore, offers to put the file straight back in quarantine.
+    private func offerReQuarantine(_ r: QuarantineRecord, _ d: Detection?) {
+        finishUndo(commit: true)
+        let name = (r.originalPath as NSString).lastPathComponent
+        guard let d, d.path != nil else { return }
+        present(UndoNote(text: "Restored \u{201C}\(name)\u{201D}", undo: { await model.quarantine(d) }, commit: nil))
+    }
+
+    private func present(_ note: UndoNote) {
+        undo = note
+        let id = note.id
+        undoTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled, undo?.id == id else { return }
+            finishUndo(commit: true)
+        }
+    }
+
+    private func performUndo() {
+        guard let note = undo else { return }
+        undoTask?.cancel(); undoTask = nil; undo = nil
+        Task { @MainActor in await note.undo() }
+    }
+
+    private func finishUndo(commit: Bool) {
+        guard let note = undo else { return }
+        undoTask?.cancel(); undoTask = nil; undo = nil
+        if commit, let c = note.commit { Task { @MainActor in await c() } }
+    }
+
     private func record(for d: Detection) -> QuarantineRecord? {
-        model.quarantine.first { $0.sha256 == d.sha256 && d.sha256 != nil } ?? model.quarantine.first { $0.originalPath == d.path }
+        visibleQuarantine.first { $0.sha256 == d.sha256 && d.sha256 != nil } ?? visibleQuarantine.first { $0.originalPath == d.path }
     }
     private func detection(for r: QuarantineRecord) -> Detection? {
         model.detections.first { $0.sha256 == r.sha256 } ?? model.detections.first { $0.path == r.originalPath }
@@ -93,6 +159,10 @@ struct ThreatsView: View {
             .scrollContentBackground(.hidden)
             .contextMenu(forSelectionType: Detection.ID.self) { ids in
                 if let id = ids.first, let d = model.detections.first(where: { $0.id == id }), let p = d.path {
+                    if FileManager.default.fileExists(atPath: p) {
+                        Button("Reveal in Finder") { NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "") }
+                        Divider()
+                    }
                     Button("Copy Path") { copy(p) }
                     if let h = d.sha256 { Button("Copy SHA-256") { copy(h) } }
                 }
@@ -101,12 +171,12 @@ struct ThreatsView: View {
     }
 
     @ViewBuilder private var quarantineTable: some View {
-        if model.quarantine.isEmpty {
+        if visibleQuarantine.isEmpty {
             EmptyStateView(symbol: "archivebox", title: "Quarantine is empty",
                            detail: "Files \(Product.name) isolates will appear here. They can't run while they're here.")
         } else {
             VStack(spacing: 0) {
-                Table(model.quarantine, selection: $selectedQuarantine) {
+                Table(visibleQuarantine, selection: $selectedQuarantine) {
                     TableColumn("Item") { r in
                         HStack(spacing: Spacing.s) {
                             Image(systemName: "lock.square.stack").foregroundStyle(Color.statusQuarantined).font(.title3).frame(width: 24)
@@ -129,6 +199,14 @@ struct ThreatsView: View {
                     .width(min: 90, ideal: 100)
                 }
                 .scrollContentBackground(.hidden)
+                .contextMenu(forSelectionType: QuarantineRecord.ID.self) { ids in
+                    if let id = ids.first, let r = visibleQuarantine.first(where: { $0.id == id }) {
+                        Button("Copy Original Path") { copy(r.originalPath) }
+                        if !r.sha256.isEmpty { Button("Copy SHA-256") { copy(r.sha256) } }
+                        Divider()
+                        Button("Delete Permanently", role: .destructive) { scheduleDelete(r) }
+                    }
+                }
                 HStack {
                     Image(systemName: "info.circle").foregroundStyle(.secondary)
                     Text("Deleted automatically after 30 days.").foregroundStyle(.secondary)
@@ -179,6 +257,8 @@ struct FileIcon: View {
 struct DetectionInspector: View {
     let detection: Detection?
     let record: QuarantineRecord?
+    var onDelete: (QuarantineRecord) -> Void = { _ in }
+    var onRestored: (QuarantineRecord, Detection?) -> Void = { _, _ in }
     @Environment(AppModel.self) private var model
     @Environment(\.openURL) private var openURL
     @StateVar private var whyExpanded = true
@@ -210,14 +290,14 @@ struct DetectionInspector: View {
                 .padding(Spacing.m)
         }
         .sheet(isPresented: $showRestore) {
-            if let record { RestoreSheet(record: record, detection: detection) }
+            if let record { RestoreSheet(record: record, detection: detection, onRestored: onRestored) }
         }
         .sheet(isPresented: $showReport) { ReportSheet(name: displayName) }
         .sheet(isPresented: $showAllow) { if let detection { AllowSheet(detection: detection) } }
         .confirmationDialog("Delete \"\(displayName)\" permanently?", isPresented: $showDelete) {
-            Button("Delete", role: .destructive) { if let record { Task { await model.delete(record) } } }
+            Button("Delete", role: .destructive) { if let record { onDelete(record) } }
             Button("Cancel", role: .cancel) {}
-        } message: { Text("This can't be undone.") }
+        } message: { Text("You'll have a few seconds to undo. After that, the file is gone for good.") }
     }
 
     private var header: some View {
@@ -246,12 +326,18 @@ struct DetectionInspector: View {
                 ForEach(Array(d.evidence.sorted { $0.score > $1.score }.enumerated()), id: \.element) { idx, e in
                     HStack(alignment: .top, spacing: Spacing.s) {
                         Image(systemName: e.source.symbol).foregroundStyle(Color.rampartTeal).frame(width: 20)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(e.title).font(.body.weight(.medium))
-                            Text(e.detail).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
+                                Text(e.title).font(.body.weight(.medium))
+                                Spacer(minLength: 0)
+                                SignalStrength(score: e.score)
+                            }
+                            EvidenceDetail(detail: e.detail)
+                            Text(e.source.label).font(.caption).foregroundStyle(.tertiary)
                         }
                     }
+                    .padding(Spacing.s)
+                    .background(Color.primary.opacity(e == primary ? 0.06 : 0.03), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .accessibilityElement(children: .combine)
                     .modifier(Cascade(index: idx, trigger: d.id))
                 }
@@ -287,7 +373,11 @@ struct DetectionInspector: View {
             } else if detection?.resolved == true {
                 Text("This item was resolved and is no longer flagged.")
             } else {
-                Text("\(Product.name) stopped the process. The file is still in place. Choose what to do next.")
+                if processStopped {
+                    Text("\(Product.name) stopped the process. The file is still in place. Choose what to do next.")
+                } else {
+                    Text("\(Product.name) hasn't changed anything yet. The file is still in place. Choose what to do next.")
+                }
             }
         }
         .font(.callout)
@@ -301,7 +391,15 @@ struct DetectionInspector: View {
                 if let d = detection { row("First seen", d.date.formatted(date: .abbreviated, time: .shortened)) }
                 if let pid = detection?.pid { row("Process ID", String(pid), mono: true) }
                 if let r = record { row("Size", Fmt.bytes(r.size)) }
-                if let sha { row("SHA-256", sha, mono: true) }
+                if let sha {
+                    GridRow {
+                        Text("SHA-256").foregroundStyle(.secondary).font(.callout)
+                        HStack(alignment: .top, spacing: 6) {
+                            Text(sha).font(.callout.monospaced()).textSelection(.enabled).lineLimit(3).truncationMode(.middle)
+                            CopyHashButton(value: sha)
+                        }
+                    }
+                }
             }
         }
     }
@@ -309,7 +407,7 @@ struct DetectionInspector: View {
     private func row(_ k: String, _ v: String, mono: Bool = false) -> some View {
         GridRow {
             Text(k).foregroundStyle(.secondary).font(.callout)
-            Text(v).font(mono ? .callout.monospaced() : .callout).textSelection(.enabled).lineLimit(3).truncationMode(.middle)
+            Text(v).font(mono ? .callout.monospaced() : .callout).textSelection(.enabled).lineLimit(k == "Location" ? 1 : 3).truncationMode(.middle).help(k == "Location" ? v : "")
         }
     }
 
@@ -328,22 +426,49 @@ struct DetectionInspector: View {
         .font(.callout)
     }
 
+    /// True only when the evidence records that a process stop actually succeeded.
+    private var processStopped: Bool {
+        guard let d = detection else { return false }
+        return d.evidence.contains { e in
+            let t = (e.title + " " + e.detail).lowercased()
+            let said = ["stopped", "terminated", "killed"].contains { t.contains($0) }
+            let failed = ["failed", "couldn't", "could not", "unable", "not stopped"].contains { t.contains($0) }
+            return said && !failed
+        }
+    }
+
+    /// Never truncates: full labels, then short labels, then two rows.
     private var actions: some View {
-        HStack(spacing: Spacing.s) {
-            if record != nil {
-                Button(role: .destructive) { showDelete = true } label: { Label("Delete", systemImage: "trash") }
-                Button { showRestore = true } label: { Label("Restore…", systemImage: "arrow.uturn.backward") }
-            } else if let d = detection, !d.resolved {
-                Button { Task { await model.quarantine(d) } } label: { Label("Quarantine", systemImage: "archivebox") }
-                    .buttonStyle(GlowButtonStyle())
-                Button { showAllow = true } label: { Label("Allow…", systemImage: "checkmark.seal") }
-            } else if let p = detection?.path {
-                Button { NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "") } label: { Label("Show in Finder", systemImage: "folder") }
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: Spacing.s) { primaryButtons(short: false); Spacer(minLength: Spacing.s); reportButton(short: false) }
+            HStack(spacing: Spacing.s) { primaryButtons(short: true); Spacer(minLength: Spacing.s); reportButton(short: true) }
+            VStack(alignment: .leading, spacing: Spacing.s) {
+                HStack(spacing: Spacing.s) { primaryButtons(short: true) }
+                reportButton(short: true)
             }
-            Spacer()
-            Button { showReport = true } label: { Label("Report as Safe…", systemImage: "flag") }
         }
         .controlSize(.regular)
+    }
+
+    @ViewBuilder private func primaryButtons(short: Bool) -> some View {
+        if record != nil {
+            Button(role: .destructive) { showDelete = true } label: { Label("Delete", systemImage: "trash").fixedSize() }
+            Button { showRestore = true } label: { Label(short ? "Restore" : "Restore…", systemImage: "arrow.uturn.backward").fixedSize() }
+        } else if let d = detection, !d.resolved {
+            Button { Task { await model.quarantine(d) } } label: { Label("Quarantine", systemImage: "archivebox").fixedSize() }
+                .buttonStyle(GlowButtonStyle())
+            Button { showAllow = true } label: { Label(short ? "Allow" : "Allow…", systemImage: "checkmark.seal").fixedSize() }
+        } else if let p = detection?.path {
+            Button { NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "") } label: {
+                Label(short ? "Reveal" : "Reveal in Finder", systemImage: "folder").fixedSize()
+            }
+            .help("Reveal in Finder")
+        }
+    }
+
+    private func reportButton(short: Bool) -> some View {
+        Button { showReport = true } label: { Label(short ? "Report Safe" : "Report as Safe…", systemImage: "flag").fixedSize() }
+            .help("Tell the \(Product.name) lab this file is safe")
     }
 
     private func copyDetails() {
@@ -362,6 +487,7 @@ struct RestoreSheet: View {
     enum Choice: Hashable { case allowFile, allowDeveloper, once }
     let record: QuarantineRecord
     let detection: Detection?
+    var onRestored: (QuarantineRecord, Detection?) -> Void = { _, _ in }
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @StateVar private var choice: Choice = .once
@@ -386,6 +512,7 @@ struct RestoreSheet: View {
                     Task {
                         if choice == .allowDeveloper, let d = detection { await model.allow(d, scope: .developer) }
                         await model.restore(record, allow: choice != .once)
+                        if choice == .once { onRestored(record, detection) }
                     }
                     dismiss()
                 }
@@ -469,5 +596,110 @@ struct Cascade: ViewModifier {
     private func play() {
         guard !Headless.active else { shown = true; return }
         withAnimation(.spring(response: 0.4, dampingFraction: 0.85).delay(0.15 + Double(index) * 0.06)) { shown = true }
+    }
+}
+
+/// How much one piece of evidence contributed, in words rather than raw numbers.
+struct SignalStrength: View {
+    let score: Int
+    private var label: String { score >= 70 ? "Strong signal" : score >= 40 ? "Moderate signal" : "Weak signal" }
+    private var bars: Int { score >= 70 ? 3 : score >= 40 ? 2 : 1 }
+    var body: some View {
+        HStack(spacing: 4) {
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(0..<3, id: \.self) { i in
+                    Capsule().fill(i < bars ? Color.rampartTeal : Color.secondary.opacity(0.25))
+                        .frame(width: 3, height: CGFloat(5 + i * 3))
+                }
+            }
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }
+        .fixedSize()
+        .help("Contributed \(score) points to this detection")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+    }
+}
+
+/// Small copy button that confirms with a checkmark for a moment.
+struct CopyHashButton: View {
+    let value: String
+    @StateVar private var copied = false
+    var body: some View {
+        Button {
+            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(value, forType: .string)
+            copied = true
+            Task { @MainActor in try? await Task.sleep(for: .seconds(1.5)); copied = false }
+        } label: {
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .foregroundStyle(copied ? Color.statusProtected : Color.secondary)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 16, height: 16)
+        }
+        .buttonStyle(.borderless)
+        .help(copied ? "Copied" : "Copy SHA-256")
+        .accessibilityLabel(copied ? "Copied" : "Copy SHA-256")
+    }
+}
+
+/// Bottom banner offering a few seconds to undo the last action.
+struct UndoBanner: View {
+    let text: String
+    let undo: () -> Void
+    let dismiss: () -> Void
+    var body: some View {
+        HStack(spacing: Spacing.m) {
+            Image(systemName: "arrow.uturn.backward.circle").foregroundStyle(.secondary)
+            Text(text).lineLimit(1).truncationMode(.middle)
+            Button("Undo", action: undo).keyboardShortcut("z", modifiers: .command)
+            Button(action: dismiss) { Image(systemName: "xmark") }
+                .buttonStyle(.borderless).foregroundStyle(.secondary).accessibilityLabel("Dismiss")
+        }
+        .font(.callout)
+        .padding(.horizontal, Spacing.m).padding(.vertical, Spacing.s)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08)))
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 2)
+        .accessibilityElement(children: .contain)
+    }
+}
+
+/// Evidence text made readable: long pid lists collapse to a count with a disclosure,
+/// and long paths truncate in the middle with the full text as a tooltip.
+struct EvidenceDetail: View {
+    let detail: String
+    @StateVar private var showPIDs = false
+
+    private var split: (text: String, pids: [String])? {
+        guard let r = detail.range(of: #"pids?\s*[:=]?\s*\d+(\s*,\s*\d+)+"#, options: [.regularExpression, .caseInsensitive]) else { return nil }
+        let pids = detail[r].components(separatedBy: CharacterSet.decimalDigits.inverted).filter { !$0.isEmpty }
+        guard pids.count > 3 else { return nil }
+        var text = detail.replacingCharacters(in: r, with: "\(pids.count) processes")
+        text = text.trimmingCharacters(in: CharacterSet(charactersIn: " ;,"))
+        return (text, pids)
+    }
+
+    var body: some View {
+        if let s = split {
+            VStack(alignment: .leading, spacing: 2) {
+                line(s.text)
+                DisclosureGroup(isExpanded: $showPIDs) {
+                    Text(s.pids.joined(separator: ", ")).font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                } label: {
+                    Text("Process IDs").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        } else {
+            line(detail)
+        }
+    }
+
+    private func line(_ t: String) -> some View {
+        let pathy = t.count > 60 && t.contains("/") && !t.contains(" ")
+        return Text(t).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+            .lineLimit(pathy ? 1 : nil).truncationMode(.middle)
+            .fixedSize(horizontal: false, vertical: !pathy)
+            .help(t.count > 60 ? t : "")
     }
 }

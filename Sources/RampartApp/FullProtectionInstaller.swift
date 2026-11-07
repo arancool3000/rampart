@@ -22,7 +22,14 @@ final class FullProtectionInstaller {
         return nil
     }
 
+    /// True when the only blocker is that this copy isn't in /Applications.
+    var needsMoveToApplications: Bool { !Headless.active && !ApplicationsMover.runsFromApplications }
+
+    /// Shows the drag-to-Applications window (no-op when already in /Applications).
+    func showMoveToApplications() { InstallToApplicationsWindow.showIfNeeded() }
+
     func run() {
+        if needsMoveToApplications { showMoveToApplications(); return }
         guard unavailableReason == nil, phase != .waitingForPassword, phase != .installing else { return }
         phase = .waitingForPassword
         let p = Process()

@@ -6,6 +6,7 @@ struct RootView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("onboarding.done") private var onboardingDone = false
     @StateVar private var showOnboarding = false
+    @AppStorage("sidebar.toolsExpanded") private var toolsExpanded = true
 
     var body: some View {
         @Bindable var model = model
@@ -17,10 +18,14 @@ struct RootView: View {
                             .accessibilityHint("Command \(SidebarItem.core.firstIndex(of: item)! + 1)")
                     }
                 }
-                Section("Tools") {
+                Section(isExpanded: $toolsExpanded) {
                     ForEach(SidebarItem.tools) { item in
                         NavigationLink(value: item) { SidebarRow(item: item) }
                     }
+                } header: {
+                    Text("Tools")
+                        .help(toolsExpanded ? "Hide tools" : "Show tools")
+                        .accessibilityHint(toolsExpanded ? "Collapses the tools list" : "Expands the tools list")
                 }
             }
             .navigationSplitViewColumnWidth(min: 210, ideal: 236, max: 260)
@@ -28,9 +33,12 @@ struct RootView: View {
             .safeAreaInset(edge: .bottom) { SidebarFooter() }
         } detail: {
             VStack(spacing: 0) {
+                Group {
                 if model.isDemo { DemoBanner() }
                 if model.isOffline { OfflineBanner() }
                 else if let err = model.lastError, model.mode == .live { ErrorBanner(message: err) }
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
                 detail
                     .id(model.selection)
                     .transition(reduceMotion ? .opacity : .blurFade)
@@ -38,6 +46,8 @@ struct RootView: View {
             }
             .background(AppBackdrop())
             .animation(.easeInOut(duration: reduceMotion ? 0.15 : 0.28), value: model.selection)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.22), value: model.isOffline)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.22), value: model.lastError)
         }
         .overlay { SplashOverlay() }
         .sheet(isPresented: $showOnboarding) {
@@ -90,7 +100,13 @@ struct SidebarFooter: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, Spacing.l).padding(.vertical, Spacing.m)
+        .overlay(alignment: .top) { Divider().opacity(0.5).padding(.horizontal, Spacing.l) }
+        .contentShape(Rectangle())
+        .onTapGesture { model.selection = .dashboard }
+        .help("Open Dashboard")
         .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Opens the dashboard")
     }
     private var footerTitle: String {
         switch model.overall {
@@ -126,6 +142,19 @@ struct SidebarFooter: View {
     }
 }
 
+/// Shared chrome so every banner above the detail pane looks and behaves the same.
+private struct BannerChrome: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, Spacing.l).padding(.vertical, 7)
+            .frame(minHeight: 34)
+            .background(.bar)
+            .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+private extension View { func bannerChrome() -> some View { modifier(BannerChrome()) } }
+
 struct DemoBanner: View {
     @Environment(AppModel.self) private var model
     var body: some View {
@@ -140,10 +169,9 @@ struct DemoBanner: View {
             Spacer()
             Button("Retry Connection") { Task { await model.connect() } }
                 .controlSize(.small)
+                .help("Try to reach the background service again")
         }
-        .padding(.horizontal, Spacing.l).padding(.vertical, 7)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
+        .bannerChrome()
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Demo mode. Showing sample data because the background service isn't running.")
     }
@@ -156,12 +184,13 @@ struct OfflineBanner: View {
             Image(systemName: "shield.slash").foregroundStyle(Color.statusAction)
             Text("Protection service isn't running.").font(.callout.weight(.semibold))
             Text(model.lastError ?? "Nothing is being checked right now.").font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                .help(model.lastError ?? "Nothing is being checked right now.")
             Spacer()
-            Button("Retry") { Task { await model.retry() } }.controlSize(.small)
+            Button("Retry") { Task { await model.retry() } }
+                .controlSize(.small)
+                .help("Try to start the protection service again")
         }
-        .padding(.horizontal, Spacing.l).padding(.vertical, 7)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
+        .bannerChrome()
         .accessibilityElement(children: .combine)
     }
 }
@@ -185,14 +214,20 @@ struct ErrorBanner: View {
     let message: String
     @Environment(AppModel.self) private var model
     var body: some View {
-        HStack {
-            Image(systemName: "exclamationmark.circle").foregroundStyle(.secondary)
-            Text(message).font(.callout)
+        HStack(spacing: Spacing.s) {
+            Image(systemName: "exclamationmark.circle.fill").foregroundStyle(Color.statusAttention)
+                .symbolRenderingMode(.hierarchical)
+            Text(message).font(.callout).lineLimit(2).truncationMode(.tail)
+                .textSelection(.enabled)
+                .help(message)
             Spacer()
-            Button("Dismiss") { model.lastError = nil }.controlSize(.small)
+            Button("Dismiss") { model.lastError = nil }
+                .controlSize(.small)
+                .help("Hide this message")
         }
-        .padding(.horizontal, Spacing.l).padding(.vertical, Spacing.s)
-        .background(.background.secondary)
+        .bannerChrome()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Notice: \(message)")
     }
 }
 
@@ -265,6 +300,10 @@ struct EmptyStateView: View {
     let title: String
     let detail: String
     var brand = false
+    var actionTitle: String? = nil
+    var action: (() -> Void)? = nil
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateVar private var appeared = false
     var body: some View {
         VStack(spacing: Spacing.m) {
             if brand {
@@ -274,10 +313,22 @@ struct EmptyStateView: View {
             }
             Text(title).font(.title3.weight(.medium))
             Text(detail).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 380)
+                .fixedSize(horizontal: false, vertical: true)
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .controlSize(.regular)
+                    .padding(.top, Spacing.xs)
+            }
         }
+        .opacity(appeared ? 1 : 0)
+        .offset(y: appeared || reduceMotion ? 0 : 6)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(Spacing.xxl)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: actionTitle == nil ? .combine : .contain)
+        .onAppear {
+            if reduceMotion || Headless.active { appeared = true }
+            else { withAnimation(.easeOut(duration: 0.3)) { appeared = true } }
+        }
     }
 }
 
@@ -297,6 +348,9 @@ struct SidebarRow: View {
                 .symbolEffect(.bounce, value: reduceMotion ? false : model.selection == item)
         }
         .badge(item == .threats && !model.openDetections.isEmpty ? model.openDetections.count : 0)
+        .help(item == .threats && !model.openDetections.isEmpty
+              ? "\(item.title): \(model.openDetections.count) open"
+              : item.title)
     }
 }
 

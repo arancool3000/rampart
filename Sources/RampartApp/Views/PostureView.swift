@@ -7,6 +7,35 @@ struct PostureView: View {
     @Environment(\.openURL) private var openURL
     @StateVar private var showIgnored = false
     @StateVar private var removing: PersistenceItem?
+    @StateVar private var showFixAllPreview = false
+    @StateVar private var fixingAll = false
+    @StateVar private var scoreChange: (from: Int, to: Int, fixed: Int)?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Keys mirror AppModel.scoreBreakdown so the shown impact matches the real score.
+    private static let scoreKeys: [String: [String]] = [
+        "filevault": ["filevault"],
+        "firewall": ["firewall"],
+        "updates": ["autoupdate", "auto-update", "automatic update", "softwareupdate"],
+        "gk": ["gatekeeper", "sip", "integrity"],
+    ]
+
+    /// Points the score would gain if this one check were fixed (0 if it doesn't move the score on its own).
+    static func scoreImpact(of c: PostureCheck, in model: AppModel) -> Int {
+        guard c.state == .fail, !model.ignoredChecks.contains(c.id) else { return 0 }
+        func matches(_ x: PostureCheck, _ keys: [String]) -> Bool {
+            keys.contains { x.id.lowercased().contains($0) || x.title.lowercased().contains($0) }
+        }
+        var total = 0
+        for item in model.scoreBreakdown where !item.earned {
+            guard let keys = scoreKeys[item.id], matches(c, keys) else { continue }
+            let others = model.failingChecks.filter { $0.id != c.id && matches($0, keys) }
+            if others.isEmpty { total += item.weight }
+        }
+        return total
+    }
+
+    private var safeFixes: [PostureCheck] { model.failingChecks.filter(\.fixable) }
 
     static func symbol(for c: PostureCheck) -> String {
         let id = c.id.lowercased()
@@ -29,6 +58,8 @@ struct PostureView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Spacing.xl) {
                 summary
+                if let change = scoreChange { scoreChangeBanner(change) }
+                if showFixAllPreview && !safeFixes.isEmpty { fixAllPreview }
                 group("macOS protections", active)
                 startupItems
                 if !ignored.isEmpty {
@@ -69,8 +100,81 @@ struct PostureView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if safeFixes.count > 1 && !showFixAllPreview {
+                Button("Fix All Safe Items…") { withAnimation(anim) { showFixAllPreview = true } }
+                    .buttonStyle(GlowButtonStyle())
+                    .disabled(fixingAll)
+                    .help("Review the one-click fixes first. Nothing changes until you confirm.")
+            }
         }
         .card(padding: Spacing.xl)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var anim: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.25) }
+
+    private var fixAllPreview: some View {
+        let items = safeFixes
+        let gain = min(100 - model.securityScore, items.reduce(0) { $0 + Self.scoreImpact(of: $1, in: model) })
+        return VStack(alignment: .leading, spacing: Spacing.m) {
+            Text("\(Product.name) will turn on:").font(.headline)
+            ForEach(items) { c in
+                HStack(spacing: Spacing.s) {
+                    Image(systemName: PostureView.symbol(for: c)).foregroundStyle(.secondary).frame(width: 20)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(c.title)
+                        if !c.fixHint.isEmpty { Text(c.fixHint).font(.caption).foregroundStyle(.secondary) }
+                    }
+                    Spacer()
+                    if model.fixingChecks.contains(c.id) { ProgressView().controlSize(.small) }
+                    else if let impact = Optional(Self.scoreImpact(of: c, in: model)), impact > 0 {
+                        Text("+\(impact)").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+            }
+            Text("Only settings with a built-in one-click fix are included. Anything that needs System Settings stays for you to decide.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                if gain > 0 { Text("Score: \(model.securityScore) → \(model.securityScore + gain)").font(.callout.monospacedDigit()).foregroundStyle(.secondary) }
+                Spacer()
+                Button("Cancel") { withAnimation(anim) { showFixAllPreview = false } }
+                    .keyboardShortcut(.cancelAction).disabled(fixingAll)
+                Button(fixingAll ? "Fixing…" : "Fix \(items.count) Items") { fixAll(items) }
+                    .buttonStyle(GlowButtonStyle()).keyboardShortcut(.defaultAction).disabled(fixingAll)
+            }
+        }
+        .card()
+        .transition(.opacity)
+    }
+
+    private func fixAll(_ items: [PostureCheck]) {
+        fixingAll = true
+        let before = model.securityScore
+        Task {
+            for c in items { await model.fix(c) }
+            await model.refreshPosture()
+            let fixed = items.filter { c in model.posture.first { $0.id == c.id }?.state == .pass }.count
+            withAnimation(anim) {
+                fixingAll = false
+                showFixAllPreview = false
+                scoreChange = (before, model.securityScore, fixed)
+            }
+        }
+    }
+
+    private func scoreChangeBanner(_ c: (from: Int, to: Int, fixed: Int)) -> some View {
+        HStack(spacing: Spacing.m) {
+            Image(systemName: c.to > c.from ? "arrow.up.circle.fill" : "checkmark.circle.fill").foregroundStyle(Color.statusProtected)
+            Text(c.to > c.from
+                 ? "Fixed \(c.fixed) setting\(c.fixed == 1 ? "" : "s"). Your score went from \(c.from) to \(c.to)."
+                 : "Fixed \(c.fixed) setting\(c.fixed == 1 ? "" : "s"). Your score is \(c.to).")
+            Spacer()
+            Button { withAnimation(anim) { scoreChange = nil } } label: { Image(systemName: "xmark") }
+                .buttonStyle(.borderless).accessibilityLabel("Dismiss")
+        }
+        .card(padding: Spacing.m)
+        .transition(.opacity)
         .accessibilityElement(children: .combine)
     }
 
@@ -101,7 +205,13 @@ struct PostureView: View {
             }
             ForEach(StartupGroup.groups(model.persistence)) { g in
                 VStack(alignment: .leading, spacing: Spacing.s) {
-                    Label(g.title, systemImage: g.symbol).font(.headline).foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Label(g.title, systemImage: g.symbol).font(.headline).foregroundStyle(.secondary)
+                        Text("\(g.items.count)").font(.callout.monospacedDigit()).foregroundStyle(.tertiary)
+                        let look = g.items.filter { StartupGroup.risk($0) <= 1 }.count
+                        if look > 0 { Text("· \(look) worth a look").font(.callout).foregroundStyle(.secondary) }
+                    }
+                    .accessibilityElement(children: .combine)
                     VStack(spacing: 0) {
                         ForEach(Array(g.items.enumerated()), id: \.element.id) { i, p in
                             if i > 0 { Divider().padding(.leading, 44) }
@@ -120,6 +230,16 @@ struct PostureRow: View {
     let check: PostureCheck
     @Environment(AppModel.self) private var model
     @Environment(\.openURL) private var openURL
+    @StateVar private var justFixed: String?
+
+    private func fixOne() {
+        let before = model.securityScore
+        Task {
+            await model.fix(check)
+            let after = model.securityScore
+            justFixed = after > before ? "Fixed. Score \(before) → \(after)" : (model.posture.first { $0.id == check.id }?.state == .pass ? "Fixed" : nil)
+        }
+    }
 
     private var stateInfo: (String, String, Color) {
         switch check.state {
@@ -135,7 +255,20 @@ struct PostureRow: View {
         HStack(spacing: Spacing.m) {
             Image(systemName: PostureView.symbol(for: check)).font(.title3).foregroundStyle(.secondary).frame(width: 28)
             VStack(alignment: .leading, spacing: 2) {
-                Text(check.title).font(.body.weight(.medium))
+                HStack(spacing: 6) {
+                    Text(check.title).font(.body.weight(.medium))
+                    let impact = PostureView.scoreImpact(of: check, in: model)
+                    if impact > 0 {
+                        Text("+\(impact) pts").font(.caption.weight(.medium).monospacedDigit()).foregroundStyle(.secondary)
+                            .padding(.horizontal, 6).padding(.vertical, 1)
+                            .background(.quaternary, in: Capsule())
+                            .help("Fixing this raises your score by \(impact).")
+                            .accessibilityLabel("Raises score by \(impact) points")
+                    }
+                }
+                if let j = justFixed {
+                    Label(j, systemImage: "checkmark").font(.caption).foregroundStyle(Color.statusProtected).transition(.opacity)
+                }
                 Text(check.detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
@@ -145,7 +278,7 @@ struct PostureRow: View {
                     if model.fixingChecks.contains(check.id) {
                         ProgressView().controlSize(.small)
                     } else if check.fixable {
-                        Button("Fix") { Task { await model.fix(check) } }.buttonStyle(GlowButtonStyle())
+                        Button("Fix") { fixOne() }.buttonStyle(GlowButtonStyle())
                             .help(check.fixHint)
                     } else {
                         Button("Open Settings") { openSettings() }.help(check.fixHint)

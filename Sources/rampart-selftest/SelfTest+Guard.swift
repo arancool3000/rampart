@@ -6,6 +6,7 @@ import RampartGuard
 // nothing with sudo. HMAC checks use scratch files; sharing-state probes are read-only.
 extension SelfTest {
     static func guardSuite() {
+        guardMDMRegression()
         let scratch = ProcessInfo.processInfo.environment["RAMPART_SCRATCH"]
             ?? "/private/tmp/claude-501/-Users-arankeyhan/ab330a0d-96bf-4eec-a6ed-51d815d3bfd2/scratchpad/guard"
         let root = scratch + "/run-\(getpid())"
@@ -239,6 +240,9 @@ extension SelfTest {
         let rk = RKill()
         let fw = RemoteAccessFirewall(directory: root + "/pf")
         let enforcer = RemoteAccessEnforcer(kill: { p, s in rk.l.lock(); rk.calls.append((p, s)); rk.l.unlock(); return true }, firewall: fw)
+        let savedPath = RemoteAccessEnforcer.processPath
+        RemoteAccessEnforcer.processPath = { _ in "/Applications/TeamViewer.app/Contents/MacOS/TeamViewer" }
+        defer { RemoteAccessEnforcer.processPath = savedPath }
         let plan = enforcer.plan(report: r1, policy: RemoteAccessPolicy(), dryRun: true)
         check(plan.suspendPIDs.sorted() == [555, 556, 600] && plan.killPIDs.isEmpty && plan.signalled.isEmpty && rk.calls.isEmpty, "dryRun plan: suspend, no signals sent")
         check(plan.commands.contains { $0.arguments == ["bootout", "system/com.teamviewer.teamviewer_service"] } && plan.commands.contains { $0.arguments == ["-f", "-setremotelogin", "off"] }
@@ -263,5 +267,22 @@ extension SelfTest {
         check(runnerBlocked.launchFailed && runnerBlocked.stderr.contains("RAMPART_NO_PRIVILEGED_TOOLS"), "runner refuses privileged tools in dev")
         let quiet = RemoteAccessProbe.live().sharing()
         check(quiet == SharingServiceState(), "live probe stays silent under RAMPART_NO_PRIVILEGED_TOOLS")
+    }
+}
+
+extension SelfTest {
+    /// Regression: Apple's MDM framework (organisation-managed Macs) must never be treated as remote access.
+    static func guardMDMRegression() {
+        let e = RemoteAccessEnforcer(kill: { _, _ in true })
+        let saved = RemoteAccessEnforcer.processPath
+        RemoteAccessEnforcer.processPath = { _ in "/System/Library/PrivateFrameworks/RemoteManagement.framework/remotemanagementd" }
+        _ = e
+        RemoteAccessEnforcer.processPath = saved
+        let mdm = ["/System/Library/PrivateFrameworks/RemoteManagement.framework/remotemanagementd",
+                   "/System/Library/PrivateFrameworks/RemoteManagement.framework/XPCServices/ExtensibleSSOSubscriber.xpc/Contents/MacOS/ExtensibleSSOSubscriber",
+                   "/System/Library/PrivateFrameworks/RemoteManagement.framework/RemoteManagementAgent"]
+        for path in mdm { check(RemoteToolCatalogue.identify(signingID: nil, teamID: nil, path: path) == nil, "MDM not remote access: \(path)") }
+        check(RemoteToolCatalogue.identify(signingID: nil, teamID: nil,
+              path: "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent")?.0.id == "apple.ard", "real ARD agent still identified")
     }
 }
