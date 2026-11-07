@@ -209,6 +209,9 @@ public final class ScanCoordinator: @unchecked Sendable {
     private func scanWalked(_ f: WalkedFile, opts: ScanOptions, version: String, pipeline: Pipeline,
                             depth: Int, displayPath: String?) -> FileScanOutcome {
         let shownPath = displayPath ?? f.path
+        if depth == 0, OwnData.contains(f.path) {
+            return FileScanOutcome(path: shownPath, cacheHit: false, hashedBytes: 0, skippedReason: "RamPart data folder")
+        }
         if f.isDataless && opts.walk.skipDataless {
             return FileScanOutcome(path: shownPath, cacheHit: false, hashedBytes: 0, skippedReason: "dataless")
         }

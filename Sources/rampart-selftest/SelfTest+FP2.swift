@@ -88,6 +88,7 @@ extension SelfTest {
             var st = stat(); return lstat(p, &st) != 0
         }
         check(isStale(gone) && !isStale(here), "fp2: detection with a deleted file is stale, existing file is not")
+        fp2OwnDataChecks()
 
         // Optional: dry-run the triage over an exported detection list (`rampart detections --json`), read-only.
         if let file = ProcessInfo.processInfo.environment["RAMPART_FP2_DETECTIONS"],
@@ -122,5 +123,41 @@ extension SelfTest {
         check(w.isExcluded("/Library/Application Support/Rampart/Quarantine/x"), "system data folder excluded")
         check(!w.isExcluded("/Users/someone/Library/Application Support/RampartOther/x"), "similar names not excluded")
         check(!w.isExcluded("/Users/someone/Downloads/eicar.com"), "normal paths still scanned")
+    }
+}
+
+// FP2b: RamPart's own data folders (quarantine vault, state) are never scanned or reported.
+extension SelfTest {
+    static func fp2OwnDataChecks() {
+        let home = NSHomeDirectory()
+        let userQ = home + "/Library/Application Support/Rampart/Quarantine/ABC.quarantine"
+        check(OwnData.contains(userQ), "fp2: this user's quarantine item is own data")
+        check(OwnData.contains("/Library/Application Support/Rampart/Quarantine/x.rqf"), "fp2: system quarantine item is own data")
+        check(OwnData.contains("/Users/someoneelse/Library/Application Support/Rampart/Quarantine/x.rqf"), "fp2: another user's vault is own data (root daemon)")
+        check(OwnData.contains("/private/var/root/Library/Application Support/Rampart/state.json"), "fp2: root's own folder is own data")
+        check(OwnData.contains(home + "/LIBRARY/Application Support/rampart/q.rqf"), "fp2: case-insensitive match (APFS)")
+        check(OwnData.contains("/private/tmp/rampart.test.root/q/x", extra: ["/tmp/rampart.test.root"]), "fp2: custom --root is own data")
+        check(!OwnData.contains(home + "/Library/Application Support/RampartEvil/x"), "fp2: look-alike folder is not own data")
+        check(!OwnData.contains(home + "/Downloads/Rampart/x"), "fp2: a Downloads folder named Rampart is not own data")
+        check(OwnData.roots().contains(Paths.supportRoot.path) && OwnData.roots().contains(Paths.userRoot.path), "fp2: both roots always listed")
+
+        // The engine refuses to scan an EICAR file inside an own-data folder, whoever asks, and still finds it elsewhere.
+        let fm = FileManager.default
+        // A home-shaped folder in temp (never the real vault): <tmp>/home/Library/Application Support/Rampart/Quarantine.
+        let base = NSTemporaryDirectory() + "rampart.test.owndata-\(getpid())"
+        let own = base + "/home/Library/Application Support/Rampart/Quarantine"
+        let other = base + "/elsewhere"
+        defer { try? fm.removeItem(atPath: base) }
+        try? fm.createDirectory(atPath: own, withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: other, withIntermediateDirectories: true)
+        let eicar = Data((["X5O!P%@AP[4\\PZX54(P^)7CC)7}$", "EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"]).joined().utf8)
+        fm.createFile(atPath: own + "/com.rampart.test.eicar.quarantine", contents: eicar)
+        fm.createFile(atPath: other + "/com.rampart.test.eicar.com", contents: eicar)
+        let coord = ScanCoordinator(database: nil)
+        coord.register(EICARDetector())
+        let inside = coord.scanFile(at: own + "/com.rampart.test.eicar.quarantine")
+        check(inside.detection == nil && inside.skippedReason == "RamPart data folder", "fp2: EICAR inside RamPart's data folder is not scanned")
+        check(coord.scan(paths: [own]).detections.isEmpty, "fp2: explicit scan of RamPart's data folder reports nothing")
+        check(coord.scanFile(at: other + "/com.rampart.test.eicar.com").detection?.name == EICAR.detectionName, "fp2: EICAR elsewhere is still detected")
     }
 }

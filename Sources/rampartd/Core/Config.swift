@@ -178,5 +178,4 @@ final class Runtime {
     /// RamPart's own data folders, for every user plus this run's root (always excluded, see `OwnData`).
     var ownDataRoots: [String] { OwnData.roots(extra: [root.path, quarantineDir.path]) }
     func isOwnData(_ path: String) -> Bool { OwnData.contains(path, extra: [root.path, quarantineDir.path]) }
-    }
 }

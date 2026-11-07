@@ -396,6 +396,8 @@ struct PrivacySettings: View {
                 Label("Scanning happens on this Mac. Your files are never uploaded.", systemImage: "internaldrive")
                 Label("Definition updates download public threat lists; nothing about you is sent.", systemImage: "arrow.down.circle")
                 Label("The password breach check sends only the first 5 characters of a fingerprint.", systemImage: "key")
+                Label("AI tools are off unless you turn them on. Then only what you send (redacted) goes to Google Gemini.", systemImage: "sparkles")
+                Label("With web protection on, website lookups go to an encrypted DNS service (Cloudflare or Quad9).", systemImage: "globe")
             } header: { Text("What leaves your Mac") }
         }
     }
