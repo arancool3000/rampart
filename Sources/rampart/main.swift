@@ -100,7 +100,7 @@ func locateApp(_ explicit: String?) -> String? {
     if bundle.pathExtension == "app", FileManager.default.fileExists(atPath: bundle.appendingPathComponent("Contents/Resources/rampart-setup.sh").path) {
         return bundle.path
     }
-    for c in ["/Applications/Rampart.app", "/Applications/\(Product.name).app"]
+    for c in ["/Applications/\(Product.name).app", "/Applications/Rampart.app"]
     where FileManager.default.fileExists(atPath: c + "/Contents/Resources/rampart-setup.sh") { return c }
     return nil
 }
@@ -112,16 +112,28 @@ case "install", "uninstall":
     let guiAuth = flag("--gui-auth"), dry = flag("--dry-run"), keepData = flag("--keep-data")
     let appArg = option("--app")
     guard let src = locateApp(appArg) else { fail("can't find Rampart.app (pass --app /path/to/Rampart.app)") }
-    let dest = "/Applications/Rampart.app"
+    // Destination: if the source is already in /Applications, install in place (never delete it).
+    // Names are compared by real file identity, because APFS is case-insensitive ("RamPart.app" == "Rampart.app").
+    func realPath(_ p: String) -> String { (p as NSString).resolvingSymlinksInPath.lowercased() }
+    func sameFile(_ a: String, _ b: String) -> Bool {
+        var sa = stat(), sb = stat()
+        guard stat(a, &sa) == 0, stat(b, &sb) == 0 else { return false }
+        return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino
+    }
+    let preferred = "/Applications/\(Product.name).app"
+    let srcInApplications = realPath(src).hasPrefix("/applications/")
+    let dest = srcInApplications ? src : preferred
     var script: String
     if command == "install" {
         script = ""
-        if (src as NSString).standardizingPath != dest {
-            script += "/bin/launchctl bootout system/app.rampart.daemon 2>/dev/null; /bin/rm -rf \(shq(dest)) && /usr/bin/ditto \(shq(src)) \(shq(dest)) && /usr/sbin/chown -R root:wheel \(shq(dest)) && /usr/bin/xattr -dr com.apple.quarantine \(shq(dest)) 2>/dev/null; "
+        if !srcInApplications && !sameFile(src, dest) && realPath(src) != realPath(dest) {
+            // Copy to a temporary name first, then swap, so a failed copy never leaves the user without the app.
+            let tmp = "/Applications/.\(Product.name)-installing.app"
+            script += "/bin/launchctl bootout system/app.rampart.daemon 2>/dev/null; /bin/rm -rf \(shq(tmp)) && /usr/bin/ditto \(shq(src)) \(shq(tmp)) && /bin/rm -rf \(shq(dest)) && /bin/mv \(shq(tmp)) \(shq(dest)) && /usr/sbin/chown -R root:wheel \(shq(dest)) && /usr/bin/xattr -dr com.apple.quarantine \(shq(dest)) 2>/dev/null; "
         }
         script += "RAMPART_APP=\(shq(dest)) /bin/bash \(shq(dest + "/Contents/Resources/rampart-setup.sh")) install"
     } else {
-        let setup = FileManager.default.fileExists(atPath: dest + "/Contents/Resources/rampart-setup.sh") ? dest + "/Contents/Resources/rampart-setup.sh" : src + "/Contents/Resources/rampart-setup.sh"
+        let setup = src + "/Contents/Resources/rampart-setup.sh"
         script = "/bin/bash \(shq(setup)) uninstall\(keepData ? " --keep-data" : "")"
     }
     let prompt = command == "install"

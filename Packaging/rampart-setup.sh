@@ -104,7 +104,7 @@ uninstall_rampart() {
 
   echo "==> Removing files"
   run rm -f "$DAEMON_PLIST" "$AGENT_PLIST" "$HELPER" "$SOCKET"
-  if [ -L "$CLI_LINK" ] && readlink "$CLI_LINK" | grep -q "Rampart.app"; then run rm -f "$CLI_LINK"; fi
+  if [ -L "$CLI_LINK" ] && readlink "$CLI_LINK" | grep -qi "Rampart.app"; then run rm -f "$CLI_LINK"; fi
   run rm -rf "$APP" "$LOGS"
   if [ "$KEEP_DATA" = 0 ]; then run rm -rf "$SUPPORT"; else echo "    keeping $SUPPORT (--keep-data)"; fi
   for home in /Users/*; do
@@ -126,7 +126,7 @@ verify_removed() {
   local paths=("$DAEMON_PLIST" "$AGENT_PLIST" "$HELPER" "$SOCKET" "$APP" "$LOGS")
   [ "$KEEP_DATA" = 0 ] && paths+=("$SUPPORT")
   for p in "${paths[@]}"; do [ -e "$p" ] || [ -L "$p" ] && left+=("$p"); done
-  if [ -L "$CLI_LINK" ] && readlink "$CLI_LINK" | grep -q "Rampart.app"; then left+=("$CLI_LINK"); fi
+  if [ -L "$CLI_LINK" ] && readlink "$CLI_LINK" | grep -qi "Rampart.app"; then left+=("$CLI_LINK"); fi
   for home in /Users/*; do
     for p in "$home/Library/LaunchAgents/$LABEL_A.plist" "$home/Library/Preferences/$BUNDLE_ID.plist"; do
       [ -e "$p" ] && left+=("$p")
