@@ -89,7 +89,9 @@ struct SidebarFooter: View {
     @Environment(AppModel.self) private var model
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button { model.selection = destination } label: {
+            Button {
+                if footerTitle == "Needs Full Disk Access" { FullDiskAccessRequest.start() } else { model.selection = destination }
+            } label: {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Image(systemName: footerSymbol).foregroundStyle(footerTint).symbolRenderingMode(.hierarchical)

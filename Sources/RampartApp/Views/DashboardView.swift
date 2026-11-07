@@ -91,7 +91,7 @@ struct DashboardView: View {
         case .recommendations: model.selection = .posture
         case .threat: model.selection = .threats
         case .off, .paused: model.setRealtime(true)
-        case .limited: openURL(FDAProbe.settingsURL)
+        case .limited: FullDiskAccessRequest.start()
         case .starting, .serviceDown: Task { await model.retry() }
         }
     }

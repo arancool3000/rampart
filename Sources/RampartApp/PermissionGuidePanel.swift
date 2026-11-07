@@ -145,3 +145,32 @@ private struct PermissionGuideView: View {
         .accessibilityLabel("\(Product.name) row with its switch turned on")
     }
 }
+
+/// One click: open System Settings › Full Disk Access, show the floating guide, and close it automatically
+/// (with a tick) as soon as RamPart has access. macOS does not allow any app to grant itself Full Disk Access;
+/// this gets the user to the single switch they need to turn on.
+@MainActor
+enum FullDiskAccessRequest {
+    private static var timer: Timer?
+    static func start() {
+        guard !Headless.active else { return }
+        if FDAProbe.check() { return }
+        NSWorkspace.shared.open(FDAProbe.settingsURL)
+        PermissionGuidePanel.shared.show()
+        timer?.invalidate()
+        var ticks = 0
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { t in
+            MainActor.assumeIsolated {
+                ticks += 1
+                if FDAProbe.check() {
+                    t.invalidate(); timer = nil
+                    AppModel.shared.hasFullDiskAccess = true
+                    PermissionGuidePanel.shared.finish()
+                } else if ticks > 300 {
+                    t.invalidate(); timer = nil
+                    PermissionGuidePanel.shared.close()
+                }
+            }
+        }
+    }
+}
