@@ -1,5 +1,6 @@
 import Foundation
 import RampartShared
+import RampartEngine
 
 /// Daemon/CLI configuration (`<root>/config.json`). Every field is optional on disk; missing keys get defaults.
 struct RampartConfig: Codable, Equatable {
@@ -171,6 +172,11 @@ final class Runtime {
     var exclusions: [String] {
         ["/System", "/dev", "/private/var/vm", "/private/var/db/uuidtext", "/private/var/db/diagnostics",
          "/Volumes", "/cores", "/.Spotlight-V100", "/.fseventsd", "/System/Volumes",
-         quarantineDir.path, root.path] + config.exclusions + allowFolders
+         quarantineDir.path, root.path] + ownDataRoots + config.exclusions + allowFolders
+    }
+
+    /// RamPart's own data folders, for every user plus this run's root (always excluded, see `OwnData`).
+    var ownDataRoots: [String] { OwnData.roots(extra: [root.path, quarantineDir.path]) }
+    func isOwnData(_ path: String) -> Bool { OwnData.contains(path, extra: [root.path, quarantineDir.path]) }
     }
 }

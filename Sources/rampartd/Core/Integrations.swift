@@ -155,7 +155,8 @@ final class EngineScanService: ScanService {
         func under(_ p: String, _ prefix: String) -> Bool { p == prefix || p.hasPrefix(prefix.hasSuffix("/") ? prefix : prefix + "/") }
         // Our exclusions, minus those that contain an explicitly requested root (the vault is always excluded).
         let ours = runtime.exclusions.filter { ex in !roots.contains { under($0, ex) } }
-        o.walk.excludedPrefixes = Array(Set(WalkOptions.defaultExcludedPrefixes + ours + [runtime.quarantineDir.path]))
+        // Our own data folders are excluded even when a request names them (or a parent) explicitly.
+        o.walk.excludedPrefixes = Array(Set(WalkOptions.defaultExcludedPrefixes + ours + runtime.ownDataRoots))
         o.walk.maxFileSize = UInt64(runtime.config.maxFileSizeMB) << 20
         o.unpackArchives = runtime.config.scanArchives
         return o
@@ -171,6 +172,7 @@ final class EngineScanService: ScanService {
     }
 
     func scanFile(_ path: String) -> Detection? {
+        if runtime.isOwnData(path) { return nil }
         var o = options(for: [path]); o.unpackDiskImages = false
         guard let d = coord.scanFile(at: path, options: o).detection, d.confidence >= 30 else { return nil }
         return d

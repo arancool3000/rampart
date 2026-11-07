@@ -170,6 +170,10 @@ public final class ScanCoordinator: @unchecked Sendable {
     /// cache key includes mtime/ctime). Directories are scanned recursively and the strongest detection returned.
     public func scanFile(at path: String, options: ScanOptions? = nil) -> FileScanOutcome {
         let opts = options ?? self.options
+        // RamPart's own data (quarantine vault, state) is never scanned, whoever asks.
+        if OwnData.contains(path) {
+            return FileScanOutcome(path: path, cacheHit: false, hashedBytes: 0, skippedReason: "RamPart data folder")
+        }
         var st = stat()
         guard lstat(path, &st) == 0 else {
             return FileScanOutcome(path: path, cacheHit: false, hashedBytes: 0, skippedReason: "not found")

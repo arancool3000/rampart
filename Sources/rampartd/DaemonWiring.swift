@@ -48,7 +48,7 @@ enum DaemonWiring {
             if isRoot { hub.add(EsloggerSource()) }   // needs root + Full Disk Access
             hub.add(FSEventsSource(paths: runtime.watchPaths,
                                    stateURL: runtime.root.appendingPathComponent("fsevents-state.json"),
-                                   excludedPrefixes: [runtime.root.path, runtime.quarantineDir.path]))
+                                   excludedPrefixes: runtime.ownDataRoots))
             hub.add(ProcessSweepSource(interval: isRoot ? 0.5 : 1.0))
             hub.add(UnifiedLogSource())
             hub.add(ExecWatchSource())

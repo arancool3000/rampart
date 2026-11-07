@@ -6,7 +6,14 @@ struct ThreatsView: View {
     enum Segment: String, CaseIterable, Identifiable { case detections = "Detections", quarantine = "Quarantine"; var id: String { rawValue } }
     @Environment(AppModel.self) private var model
     @StateVar private var segment: Segment = .detections
-    @StateVar private var selectedDetection: Detection.ID?
+    @StateVar private var selectedDetections: Set<Detection.ID> = []
+    private var selectedDetection: Detection.ID? {
+        get { selectedDetections.count == 1 ? selectedDetections.first : nil }
+        nonmutating set { selectedDetections = newValue.map { [$0] } ?? [] }
+    }
+    /// Detections the "Not a threat" sheet acts on (one, a selection, or a triage group).
+    @StateVar private var teaching: TeachRequest?
+    @StateVar private var showTriage = false
     @StateVar private var selectedQuarantine: Set<QuarantineRecord.ID> = []
     @StateVar private var notesExpanded = false
     @StateVar private var notesFilter = ""
@@ -70,6 +77,14 @@ struct ThreatsView: View {
                 } else if segment == .quarantine, selectedQuarantine.count == 1, let id = selectedQuarantine.first,
                           let r = visibleQuarantine.first(where: { $0.id == id }) {
                     DetectionInspector(detection: detection(for: r), record: r, onDelete: scheduleDelete, onRestored: offerReQuarantine)
+                } else if segment == .detections, selectedDetections.count > 1 {
+                    let picked = model.detections.filter { selectedDetections.contains($0.id) && !$0.resolved }
+                    VStack(spacing: Spacing.m) {
+                        EmptyStateView(symbol: "checklist", title: "\(selectedDetections.count) items selected",
+                                       detail: "Teach \(Product.name) that these are not threats. Matching findings are resolved at once.")
+                        Button { teaching = TeachRequest(detections: picked) } label: { Label("Not a Threat…", systemImage: "hand.thumbsup") }
+                            .disabled(picked.isEmpty)
+                    }
                 } else {
                     EmptyStateView(symbol: "info.circle", title: segment == .quarantine && selectedQuarantine.count > 1 ? "\(selectedQuarantine.count) items selected" : "Select an item",
                                    detail: segment == .quarantine && selectedQuarantine.count > 1
@@ -79,6 +94,8 @@ struct ThreatsView: View {
             }
             .inspectorColumnWidth(min: 340, ideal: 400, max: 520)
         }
+        .sheet(item: $teaching) { req in TeachSheet(request: req) }
+        .sheet(isPresented: $showTriage) { NotesTriageSheet(notes: notes) { teaching = TeachRequest(detections: $0) } }
         .onAppear {
             if selectedDetection == nil { selectedDetection = decisions.first(where: { !$0.resolved })?.id ?? decisions.first?.id }
             if selectedQuarantine.isEmpty, let f = model.quarantine.first?.id { selectedQuarantine = [f] }
@@ -212,7 +229,7 @@ struct ThreatsView: View {
                     .padding(Spacing.l)
                     if !notesExpanded { Spacer() }
                 } else {
-                    Table(decisions, selection: $selectedDetection, sortOrder: $sortOrder) {
+                    Table(decisions, selection: $selectedDetections, sortOrder: $sortOrder) {
                         TableColumn("Item", value: \.name) { d in itemCell(d) }
                             .width(min: 220, ideal: 300)
                         TableColumn("Type") { d in Badge(text: Self.tag(for: d, note: false)) }.width(min: 110, ideal: 150)
@@ -240,6 +257,11 @@ struct ThreatsView: View {
             Button("Copy Path") { copy(p) }
             if let h = d.sha256 { Button("Copy SHA-256") { copy(h) } }
         }
+        let picked = model.detections.filter { ids.contains($0.id) && !$0.resolved }
+        if !picked.isEmpty {
+            Divider()
+            Button(picked.count == 1 ? "Not a Threat…" : "Not a Threat (\(picked.count) items)…") { teaching = TeachRequest(detections: picked) }
+        }
     }
 
     private var notesSection: some View {
@@ -265,12 +287,14 @@ struct ThreatsView: View {
                 if notesExpanded {
                     TextField("Filter notes", text: $notesFilter).textFieldStyle(.roundedBorder).frame(maxWidth: 180).controlSize(.small)
                 }
+                Button("Review All Notes…") { showTriage = true }.controlSize(.small)
+                    .help("Groups similar notes (for example developer builds) so you can trust each group at once")
                 Button("Dismiss All Notes") { dismissAllNotes() }.controlSize(.small)
                     .help("Hide these notes. New notes will still appear.")
             }
             .padding(.horizontal, Spacing.m).padding(.vertical, Spacing.s)
             if notesExpanded {
-                Table(filteredNotes, selection: $selectedDetection) {
+                Table(filteredNotes, selection: $selectedDetections) {
                     TableColumn("Item") { d in itemCell(d) }.width(min: 220, ideal: 300)
                     TableColumn("Observation") { d in
                         Text(d.evidence.max(by: { $0.score < $1.score })?.title ?? d.name).foregroundStyle(.secondary).lineLimit(1)
@@ -339,8 +363,7 @@ struct DetectionInspector: View {
     @StateVar private var whyExpanded = true
     @StateVar private var showRestore = false
     @StateVar private var showDelete = false
-    @StateVar private var showReport = false
-    @StateVar private var showAllow = false
+    @StateVar private var teaching: TeachRequest?
 
     private var displayName: String {
         if let p = detection?.path ?? record?.originalPath { return (p as NSString).lastPathComponent }
@@ -367,8 +390,7 @@ struct DetectionInspector: View {
         .sheet(isPresented: $showRestore) {
             if let record { RestoreSheet(record: record, detection: detection, onRestored: onRestored) }
         }
-        .sheet(isPresented: $showReport) { ReportSheet(name: displayName) }
-        .sheet(isPresented: $showAllow) { if let detection { AllowSheet(detection: detection) } }
+        .sheet(item: $teaching) { req in TeachSheet(request: req) }
         .confirmationDialog("Delete \"\(displayName)\" permanently?", isPresented: $showDelete) {
             Button("Delete", role: .destructive) { if let record { onDelete(record) } }
             Button("Cancel", role: .cancel) {}
@@ -534,7 +556,6 @@ struct DetectionInspector: View {
         } else if let d = detection, !d.resolved {
             Button { Task { await model.quarantine(d) } } label: { Label("Quarantine", systemImage: "archivebox").fixedSize() }
                 .buttonStyle(GlowButtonStyle())
-            Button { showAllow = true } label: { Label(short ? "Allow" : "Allow…", systemImage: "checkmark.seal").fixedSize() }
         } else if let p = detection?.path {
             Button { NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "") } label: {
                 Label(short ? "Reveal" : "Reveal in Finder", systemImage: "folder").fixedSize()
@@ -543,9 +564,11 @@ struct DetectionInspector: View {
         }
     }
 
-    private func reportButton(short: Bool) -> some View {
-        Button { showReport = true } label: { Label(short ? "Report Safe" : "Report as Safe…", systemImage: "flag").fixedSize() }
-            .help("Tell the \(Product.name) lab this file is safe")
+    @ViewBuilder private func reportButton(short: Bool) -> some View {
+        if let d = detection, !d.resolved, record == nil {
+            Button { teaching = TeachRequest(detections: [d]) } label: { Label(short ? "Not a Threat" : "Not a Threat…", systemImage: "hand.thumbsup").fixedSize() }
+                .help("Trust this file, its app's developer, or its folder. Stays on this Mac; nothing is sent anywhere.")
+        }
     }
 
     private func copyDetails() {
@@ -600,60 +623,183 @@ struct RestoreSheet: View {
     }
 }
 
-struct AllowSheet: View {
-    let detection: Detection
-    @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
-    @StateVar private var scope: AllowRuleSpec.Scope = .fileHash
+/// Detections a "Not a threat" decision applies to.
+struct TeachRequest: Identifiable {
+    let id = UUID()
+    let detections: [Detection]
+}
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: Spacing.l) {
-            Text("Allow \"\(detection.path.map { ($0 as NSString).lastPathComponent } ?? detection.name)\"?").font(.title2.weight(.semibold))
-            Text("\(Product.name) won't flag it again. You can remove this rule anytime in Rules.")
-                .foregroundStyle(.secondary)
-            Picker("", selection: $scope) {
-                Text("This file only (by fingerprint)").tag(AllowRuleSpec.Scope.fileHash)
-                Text("This developer").tag(AllowRuleSpec.Scope.developer)
-                Text("This folder").tag(AllowRuleSpec.Scope.folder)
-            }
-            .pickerStyle(.radioGroup).labelsHidden()
-            HStack {
-                Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Allow") { Task { await model.allow(detection, scope: scope) }; dismiss() }
-            }
+/// Where a finding lives, for suggesting what to trust. Local only: everything becomes an allow rule on this Mac.
+enum TeachTarget {
+    /// Outermost .app bundle containing the path.
+    static func app(_ path: String) -> String? {
+        guard let r = path.range(of: ".app/") ?? (path.hasSuffix(".app") ? path.range(of: ".app", options: .backwards) : nil) else { return nil }
+        return String(path[..<r.upperBound]).trimmingCharacters(in: CharacterSet(charactersIn: "/")).withSlash
+    }
+
+    /// The folder worth trusting: the build dir, agent workspace, app bundle, Application Support folder, or the parent folder.
+    static func folder(_ path: String) -> String {
+        let home = NSHomeDirectory()
+        for m in ["/.build/", "/DerivedData/", "/node_modules/", "/target/"] {
+            if let r = path.range(of: m) { return String(path[..<r.upperBound].dropLast()) }
         }
-        .padding(Spacing.xl).frame(width: 440)
+        if let r = path.range(of: "/.build-"), let end = path[r.upperBound...].firstIndex(of: "/") { return String(path[..<end]) }
+        if path.hasPrefix("/private/tmp/claude-") || path.hasPrefix("/tmp/claude-") {
+            let parts = path.split(separator: "/")
+            let n = path.hasPrefix("/private/") ? 3 : 2
+            return "/" + parts.prefix(n).joined(separator: "/")
+        }
+        if let a = app(path) { return a }
+        for base in [home + "/Library/Application Support/", "/Library/Application Support/"] where path.hasPrefix(base) {
+            if let f = path.dropFirst(base.count).split(separator: "/").first { return base + f }
+        }
+        return (path as NSString).deletingLastPathComponent
+    }
+
+    static func groupLabel(_ folder: String, sample: Detection) -> String {
+        let f = (folder as NSString).abbreviatingWithTildeInPath
+        if ["/.build", "/DerivedData", "/node_modules", "/target"].contains(where: { folder.hasSuffix($0) }) || folder.contains("/.build-")
+            || folder.hasPrefix("/private/tmp/claude-") { return "Developer builds in \(f)" }
+        if folder.hasSuffix(".app") { return "Files inside \((folder as NSString).lastPathComponent)" }
+        if folder.contains("/Application Support/") { return "App data in \(f)" }
+        return "\(sample.evidence.max(by: { $0.score < $1.score })?.title ?? sample.name) in \(f)"
     }
 }
 
-struct ReportSheet: View {
-    let name: String
+private extension String { var withSlash: String { hasPrefix("/") ? self : "/" + self } }
+
+/// "Not a threat": trust the file, its app's developer (Team ID), the app bundle, or the folder.
+/// Creates local allow rules through the daemon, which resolves every matching open finding at once
+/// and suppresses future matches.
+struct TeachSheet: View {
+    enum Choice: Hashable { case file, developer, app, folder }
+    let request: TeachRequest
+    @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
-    @StateVar private var includeFile = false
-    @StateVar private var note = ""
-    @StateVar private var sent = false
+    @StateVar private var choice: Choice = .folder
+    @StateVar private var working = false
+    @StateVar private var error: String?
+
+    private var items: [Detection] { request.detections }
+    private var paths: [String] { items.compactMap(\.path) }
+    private var apps: [String] { Array(Set(paths.compactMap(TeachTarget.app))).sorted() }
+    private var folders: [String] { Array(Set(paths.map(TeachTarget.folder))).sorted() }
+    private var canFile: Bool { items.contains { $0.sha256 != nil } }
+    private var title: String {
+        items.count == 1 ? "\"\(items[0].path.map { ($0 as NSString).lastPathComponent } ?? items[0].name)\" is not a threat" : "\(items.count) items are not threats"
+    }
+    /// Open findings a folder choice would also resolve (preview; the daemon does the real matching).
+    private var alsoResolved: Int {
+        let fs = choice == .folder ? folders : choice == .app ? apps : []
+        guard !fs.isEmpty else { return 0 }
+        let mine = Set(items.map(\.id))
+        return model.detections.filter { d in
+            !d.resolved && !mine.contains(d.id) && d.path.map { p in fs.contains { p == $0 || p.hasPrefix($0 + "/") } } == true
+        }.count
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
-            Text("Report as safe").font(.title2.weight(.semibold))
-            if sent {
-                Label("Thanks — we'll review this within 2 business days.", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.primary)
-                HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
-            } else {
-                Text("We'll send the file's fingerprint and detection details to the \(Product.name) lab. We won't send the file itself unless you choose to.")
-                    .fixedSize(horizontal: false, vertical: true)
-                Toggle("Include the file to help us review it faster", isOn: $includeFile)
-                TextField("Anything we should know? (optional)", text: $note, axis: .vertical).lineLimit(3...5)
-                HStack {
-                    Spacer()
-                    Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                    Button("Send Report") { sent = true }.keyboardShortcut(.defaultAction)
+            Text(title).font(.title2.weight(.semibold)).lineLimit(2)
+            Text("\(Product.name) will remember this on this Mac and stop flagging matching items. You can remove the rule anytime in Rules. Nothing is sent anywhere.")
+                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Picker("", selection: $choice) {
+                Text(items.count == 1 ? "Trust this file (by fingerprint)" : "Trust these files (by fingerprint)").tag(Choice.file).disabled(!canFile)
+                Text(apps.isEmpty ? "Trust this developer (Team ID)" : "Trust the developer of \(apps.map { ($0 as NSString).lastPathComponent }.joined(separator: ", ")) (Team ID)")
+                    .tag(Choice.developer)
+                if !apps.isEmpty {
+                    Text("Trust \(apps.count == 1 ? (apps[0] as NSString).lastPathComponent : "these \(apps.count) apps") (everything inside)").tag(Choice.app)
                 }
+                Text(folders.count == 1 ? "Trust this folder: \((folders[0] as NSString).abbreviatingWithTildeInPath)" : "Trust these \(folders.count) folders")
+                    .tag(Choice.folder)
+            }
+            .pickerStyle(.radioGroup).labelsHidden()
+            if choice == .developer {
+                Text("Works only for code signed by a registered developer. Ad-hoc or unsigned code has no Team ID; trust the app or folder instead.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            if alsoResolved > 0 {
+                Label("Also resolves \(alsoResolved) other open finding\(alsoResolved == 1 ? "" : "s") in the same place.", systemImage: "checkmark.circle")
+                    .font(.callout)
+            }
+            if let error { Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true) }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Not a Threat") { Task { await apply() } }.keyboardShortcut(.defaultAction).disabled(working)
             }
         }
-        .padding(Spacing.xl).frame(width: 460)
+        .padding(Spacing.xl).frame(width: 500)
+        .onAppear { if items.count == 1, canFile, TeachTarget.app(paths.first ?? "") == nil { choice = .file } }
+    }
+
+    private func rules() -> [AllowRuleSpec] {
+        switch choice {
+        case .file:
+            return Array(Set(items.compactMap(\.sha256))).map { h in
+                AllowRuleSpec(scope: .fileHash, value: h.lowercased(), name: items.first { $0.sha256 == h }?.path.map { ($0 as NSString).lastPathComponent } ?? "File")
+            }
+        case .developer:
+            // The daemon reads the Team ID from the signature of this path (or its app); the app never guesses it.
+            let targets = apps.isEmpty ? Array(Set(paths)) : apps
+            return targets.map { AllowRuleSpec(scope: .developer, value: $0, name: ($0 as NSString).lastPathComponent) }
+        case .app: return apps.map { AllowRuleSpec(scope: .folder, value: $0, name: ($0 as NSString).lastPathComponent) }
+        case .folder: return folders.map { AllowRuleSpec(scope: .folder, value: $0, name: ($0 as NSString).lastPathComponent) }
+        }
+    }
+
+    private func apply() async {
+        working = true; defer { working = false }
+        model.lastError = nil
+        var failed: [String] = []
+        for r in rules() where !(await model.addAllowRule(r)) { failed.append(model.lastError ?? r.value) }
+        await model.refresh(heavy: false)
+        if failed.isEmpty { dismiss() } else { error = failed.joined(separator: "\n") }
+    }
+}
+
+/// "Review all notes": groups similar notes by where they live ("64 developer builds: trust all?").
+struct NotesTriageSheet: View {
+    let notes: [Detection]
+    var teach: ([Detection]) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private struct Group: Identifiable { let id: String; let label: String; let items: [Detection] }
+    private var groups: [Group] {
+        let by = Dictionary(grouping: notes.filter { !$0.resolved && $0.path != nil }) { TeachTarget.folder($0.path!) }
+        return by.map { Group(id: $0.key, label: TeachTarget.groupLabel($0.key, sample: $0.value[0]), items: $0.value) }
+            .sorted { $0.items.count != $1.items.count ? $0.items.count > $1.items.count : $0.label < $1.label }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            Text("Review notes").font(.title2.weight(.semibold))
+            Text("Similar notes are grouped. Trust a group to resolve all of it and stop future matches, or leave it as a note.")
+                .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if groups.isEmpty {
+                Text("No open notes.").foregroundStyle(.secondary)
+            } else {
+                List(groups) { g in
+                    HStack(spacing: Spacing.s) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(g.items.count) · \(g.label)").lineLimit(2)
+                            Text(Set(g.items.compactMap { $0.evidence.max(by: { $0.score < $1.score })?.title }).sorted().joined(separator: ", "))
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        Button(g.items.count == 1 ? "Not a Threat…" : "Trust All \(g.items.count)…") {
+                            let items = g.items
+                            dismiss()
+                            DispatchQueue.main.async { teach(items) }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .frame(minHeight: 260)
+            }
+            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+        }
+        .padding(Spacing.xl).frame(width: 560)
     }
 }
 

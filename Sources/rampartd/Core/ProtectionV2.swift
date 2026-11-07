@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import RampartShared
+import RampartEngine
 
 /// Pause/cancel for running scans. Pausing blocks scan workers at the next file (see `ScanGate`).
 final class ScanControl {
@@ -49,9 +50,16 @@ extension Protection {
         let path = Util.realPath(raw)
         if rules.contains(where: { $0.scope == .folder && (path == $0.value || path.hasPrefix($0.value + "/")) }) { return true }
         let needsSigning = rules.contains { $0.scope == .developer || $0.scope == .signingID }
-        if needsSigning, let info = services.signingLookup?(path) {
-            if let t = info.teamID, rules.contains(where: { $0.scope == .developer && $0.value == t }) { return true }
-            if let s = info.signingID, rules.contains(where: { $0.scope == .signingID && $0.value == s }) { return true }
+        if needsSigning {
+            // The file itself, then its enclosing app bundle (helpers and dylibs of a trusted app).
+            var targets = [path]
+            if let app = FindingTriage.outermostApp(path), app != path { targets.append(app) }
+            for t in targets {
+                guard let info = services.signingLookup?(t), info.status != .revoked else { continue }
+                if let team = info.teamID, rules.contains(where: { $0.scope == .developer && $0.value == team }) { return true }
+                if info.status != .adHoc && info.status != .unsigned,
+                   let s = info.signingID, rules.contains(where: { $0.scope == .signingID && $0.value == s }) { return true }
+            }
         }
         return false
     }
@@ -65,9 +73,51 @@ extension Protection {
         }
         runtime.allowFolders = rules.filter { $0.scope == .folder }.map(\.value)
         services.behaviour?.setAllowRules(rules)
+        resolveAllowedDetections()
     }
 
-    func addAllowRule(_ r: AllowRuleSpec) throws -> AllowRuleSpec {
+    /// Resolves every open detection that an allow rule now covers. Returns how many.
+    @discardableResult
+    func resolveAllowedDetections() -> Int {
+        var n = 0
+        for d in store.all() where !d.resolved && isAllowedByRule(d) {
+            _ = store.update(d.id) { $0.resolved = true }; n += 1
+        }
+        if n > 0 { logInfo("allow rules resolved \(n) open detection(s)") }
+        return n
+    }
+
+    /// Context for `FindingTriage` (signing via the cached inspector).
+    func triageContext() -> FindingTriage.Context {
+        let lookup = services.signingLookup
+        return FindingTriage.Context(signing: { lookup?($0) })
+    }
+
+    /// The app may send a developer / signing-ID rule whose value is a file path ("teach from this file"):
+    /// resolve it to the Team ID (or signing ID) of the file's enclosing app, never guessing.
+    func resolveRuleTarget(_ r: AllowRuleSpec) throws -> AllowRuleSpec {
+        guard r.scope == .developer || r.scope == .signingID, r.value.hasPrefix("/") else { return r }
+        let path = Util.realPath(r.value)
+        let target = FindingTriage.outermostApp(path) ?? path
+        guard let info = services.signingLookup?(target) ?? services.signingLookup?(path) else {
+            throw ServiceError.failed("could not read the code signature of \(path)")
+        }
+        var out = r
+        if r.scope == .developer {
+            guard let t = info.teamID, !t.isEmpty else { throw ServiceError.failed("\((target as NSString).lastPathComponent) has no Team ID (not signed by a registered developer); trust the file or its folder instead") }
+            out.value = t
+        } else {
+            guard let s = info.signingID, !s.isEmpty, info.status != .adHoc, info.status != .unsigned else {
+                throw ServiceError.failed("\((target as NSString).lastPathComponent) has no stable signing identity; trust the file or its folder instead")
+            }
+            out.value = s
+        }
+        if out.name.isEmpty || out.name.hasPrefix("/") { out.name = (target as NSString).lastPathComponent }
+        return out
+    }
+
+    func addAllowRule(_ rule: AllowRuleSpec) throws -> AllowRuleSpec {
+        let r = try resolveRuleTarget(rule)
         if let why = AllowRuleStore.validate(r) { throw ServiceError.failed(why) }
         let saved = allowRules.add(r)
         applyAllowRules()

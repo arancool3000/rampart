@@ -1,5 +1,6 @@
 import Foundation
 import RampartShared
+import RampartEngine
 
 /// Central coordinator: owns the store and services, applies remediation policy, fans detections out to subscribers.
 final class Protection {
@@ -57,8 +58,17 @@ final class Protection {
     func handle(_ detection: Detection) -> Detection? {
         if let h = detection.sha256, runtime.config.allowlist.contains(h) { return nil }
         if isAllowedByRule(detection) { return nil }
+        if Self.isOwnDataFinding(detection, runtime: runtime) {
+            logInfo("ignored \(detection.name) inside \(Product.name)'s own data folder: \(detection.path ?? "-")")
+            return nil
+        }
         if let path = detection.path, let h = detection.sha256, state.value.restored?[path] == h { return nil }
-        var d = store.add(detection)
+        let (triaged, outcome) = FindingTriage.apply(detection, triageContext())
+        guard let triaged else {
+            if case .notAFinding(let why) = outcome { logInfo("not a finding: \(detection.name) at \(detection.path ?? "-"): \(why)") }
+            return nil
+        }
+        var d = store.add(triaged)
         let cfg = runtime.config
         if remediate && d.confidence >= 90 && !d.resolved {
             var actions: [String] = []
@@ -92,6 +102,13 @@ final class Protection {
         return d
     }
 
+    /// A file-engine finding (hash / YARA / XProtect / heuristic incl. EICAR / signing) on a path inside our own
+    /// data folders: the vault and state, never a threat to report. Tamper / behaviour findings are kept.
+    static func isOwnDataFinding(_ d: Detection, runtime: Runtime) -> Bool {
+        guard let p = d.path, !d.evidence.isEmpty, runtime.isOwnData(p) else { return false }
+        return d.evidence.allSatisfy { [.hash, .yara, .xprotect, .heuristic, .signing].contains($0.source) }
+    }
+
     private func isRegularFile(_ p: String) -> Bool {
         var st = stat(); return lstat(p, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG
     }
@@ -108,6 +125,7 @@ final class Protection {
         activity.add(.scan, quick ? "Quick scan started" : "Scan started", detail: targets.prefix(5).joined(separator: ", ") + (targets.count > 5 ? " …" : ""))
         var out = services.scanner.scan(paths: targets, progress: progress, cancelled: { cancelled() || self.scanControl.isCancelled(token) })
         out.detections = out.detections.compactMap { handle($0) }
+        DetectionReevaluator.resolveStale(self)
         let wasCancelled = scanControl.isCancelled(token)
         activity.add(.scan, wasCancelled ? "Scan cancelled" : (quick ? "Quick scan finished" : "Scan finished"),
                      detail: "\(out.scanned) files in \(String(format: "%.1f", out.seconds)) s",

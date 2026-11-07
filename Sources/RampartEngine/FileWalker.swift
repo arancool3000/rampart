@@ -56,12 +56,16 @@ public struct WalkOptions: Sendable {
     public static let defaultExcludedPrefixes: [String] = [
         "/System", "/dev", "/private/var/vm", "/private/var/db/uuidtext", "/private/var/db/diagnostics",
         "/.Spotlight-V100", "/.fseventsd", "/.DocumentRevisions-V100", "/.MobileBackups", "/Volumes/com.apple.TimeMachine.localsnapshots",
-        Paths.quarantineDir.path, Paths.userRoot.appendingPathComponent("Quarantine").path,
+        // All of RamPart's own data (quarantine vault, journals, state): never scan our own files.
+        Paths.supportRoot.path, Paths.userRoot.path,
     ]
     public static let defaultExcludedNames: Set<String> = [".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100", ".TemporaryItems", ".Trashes"]
 
     /// True if `path` is equal to or below one of `excludedPrefixes`.
     public func isExcluded(_ path: String) -> Bool {
+        // RamPart's per-user data folder in ANY user's home (the root daemon's own home is /var/root).
+        if path.range(of: "/Library/Application Support/Rampart/", options: .caseInsensitive) != nil
+            || path.lowercased().hasSuffix("/library/application support/rampart") { return true }
         for p in excludedPrefixes where path.hasPrefix(p) {
             let pu = p.utf8.count
             if p.hasSuffix("/") || path.utf8.count == pu || path.utf8[path.utf8.index(path.utf8.startIndex, offsetBy: pu)] == UInt8(ascii: "/") {
