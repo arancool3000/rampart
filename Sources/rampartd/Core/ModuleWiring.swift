@@ -182,6 +182,11 @@ enum PersistenceWiringPolicy {
         var byPath: [String: PersistenceRecord] = [:]
         for r in records { byPath[r.item.location] = r; if let t = r.item.target { byPath[t] = byPath[t] ?? r } }
         return ds.compactMap { d in
+            // Login items: resolve `btm:<uid>:<uuid>` to the real program and signer; only real indicators are threats.
+            if let p = d.path, let r = byPath[p], [.btm, .loginItem].contains(r.item.kind) {
+                let home = Util.homeDirectories().first { r.item.target?.hasPrefix($0 + "/") == true } ?? Util.homeDirectories().first ?? "/nonexistent"
+                return LaunchItemPolicy.applyLoginItem(d, record: r, home: home, signing: r.item.signing)
+            }
             guard let p = d.path, let r = byPath[p], [.launchAgent, .launchDaemon].contains(r.item.kind) else { return d }
             if LaunchItemPolicy.isGenuineOwnPlist(r.item.location, trustedCDHashes: pins, ownTeamID: nil) { return nil }
             let home = Util.homeDirectories().first { r.item.location.hasPrefix($0 + "/") } ?? "/nonexistent"

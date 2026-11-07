@@ -71,6 +71,12 @@ public struct Detection: Codable, Hashable, Identifiable, Sendable {
     public var confidence: Int         // 0...100
     public var evidence: [Evidence]
     public var resolved: Bool
+    /// Occurrences folded into this row (same rule + same subject); nil = 1. See `DetectionPolicy`.
+    public var count: Int? = nil
+    public var firstSeen: Date? = nil
+    public var lastSeen: Date? = nil
+    /// Why it was resolved without the user (e.g. "Re-checked with improved rules: not a threat").
+    public var resolution: String? = nil
     public init(id: UUID = UUID(), date: Date = Date(), path: String? = nil, pid: Int32? = nil,
                 sha256: String? = nil, name: String, category: ThreatCategory, severity: Severity,
                 confidence: Int, evidence: [Evidence], resolved: Bool = false) {

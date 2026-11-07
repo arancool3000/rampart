@@ -449,9 +449,9 @@ struct SidebarRow: View {
         .onChange(of: model.selection) { _, new in
             if new == item && !reduceMotion { bounceTick += 1 }
         }
-        .badge(item == .threats && !model.openDetections.isEmpty ? model.openDetections.count : 0)
-        .help(item == .threats && !model.openDetections.isEmpty
-              ? "\(item.title): \(model.openDetections.count) open"
+        .badge(item == .threats ? model.needsYouCount : 0)
+        .help(item == .threats && model.needsYouCount > 0
+              ? "\(item.title): \(model.needsYouCount) need you"
               : item.title)
     }
 }

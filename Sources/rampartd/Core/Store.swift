@@ -19,14 +19,23 @@ final class DetectionStore {
         }
     }
 
-    /// Adds a detection. If an unresolved detection with the same path+name (or pid+name) exists,
-    /// it is updated in place and the existing id is returned (so repeated scans don't pile up duplicates).
+    /// Adds a detection. An unresolved detection with the same id (a growing behaviour story) or the same rule +
+    /// subject (`DetectionPolicy.dedupeKey`, or the old path+name / pid+name match) is folded into one row with a
+    /// count and first/last seen, and the existing id is returned (so repeats don't pile up).
     @discardableResult
     func add(_ d: Detection) -> Detection {
         lock.lock(); defer { lock.unlock() }
-        if let i = items.firstIndex(where: { !$0.resolved && $0.name == d.name &&
-            ((d.path != nil && $0.path == d.path && $0.sha256 == d.sha256) || (d.path == nil && d.pid != nil && $0.pid == d.pid)) }) {
-            var merged = d; merged.id = items[i].id
+        let key = DetectionPolicy.dedupeKey(d)
+        if let i = items.firstIndex(where: { !$0.resolved && $0.id == d.id }) {
+            var merged = d; merged.count = items[i].count; merged.firstSeen = items[i].firstSeen ?? items[i].date
+            merged.lastSeen = d.date
+            items[i] = merged
+            saveLocked()
+            return merged
+        }
+        if let i = items.firstIndex(where: { !$0.resolved && (DetectionPolicy.dedupeKey($0) == key || ($0.name == d.name &&
+            ((d.path != nil && $0.path == d.path && $0.sha256 == d.sha256) || (d.path == nil && d.pid != nil && $0.pid == d.pid)))) }) {
+            let merged = DetectionPolicy.merge(items[i], d)
             items[i] = merged
             saveLocked()
             return merged
@@ -49,7 +58,14 @@ final class DetectionStore {
 
     func get(_ id: UUID) -> Detection? { lock.lock(); defer { lock.unlock() }; return items.first { $0.id == id } }
     func all() -> [Detection] { lock.lock(); defer { lock.unlock() }; return items.sorted { $0.date > $1.date } }
-    var openCount: Int { lock.lock(); defer { lock.unlock() }; return items.filter { !$0.resolved && $0.confidence >= 60 }.count }
+    /// "Needs you" rows only (the sidebar badge and the "Needs attention" footer).
+    var openCount: Int { lock.lock(); defer { lock.unlock() }; return DetectionPolicy.needsYouCount(items) }
+
+    /// Replaces the whole list (re-evaluation after an upgrade). Quarantine is a separate store and is never touched.
+    func replaceAll(_ list: [Detection]) {
+        lock.lock(); defer { lock.unlock() }
+        items = list; saveLocked()
+    }
 
     func resolveAll(sha256: String) {
         lock.lock(); defer { lock.unlock() }

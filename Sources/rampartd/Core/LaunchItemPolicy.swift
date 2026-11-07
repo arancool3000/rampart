@@ -83,6 +83,92 @@ enum LaunchItemPolicy {
         return true
     }
 
+    // MARK: login items (Background Task Management)
+
+    enum LoginItemVerdict: Equatable {
+        /// Real malicious indicators (each a plain sentence).
+        case threat([String])
+        /// A new login item worth knowing about, not a threat.
+        case note(String)
+        /// The program couldn't be identified (`btm:<uid>:<uuid>` with no path).
+        case unresolved
+    }
+
+    static let tempRoots = ["/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/", "/var/folders/", "/private/var/folders/", "/Users/Shared/"]
+    static let allowedDot: Set<String> = [".local", ".nvm", ".pyenv", ".rbenv", ".cargo", ".deno", ".bun", ".config", ".venv", ".npm-global", ".volta"]
+
+    /// Human name for a login item: its BTM name unless that is just an id, else the app or program name.
+    static func displayName(label: String, target: String?) -> String {
+        let uuidLike = label.range(of: #"^[0-9A-Fa-f-]{32,36}$"#, options: .regularExpression) != nil
+        if !label.isEmpty, !uuidLike, !label.hasPrefix("btm:") { return label }
+        guard let t = target else { return "Unidentified login item" }
+        if let r = t.range(of: ".app", options: .backwards) { return ((String(t[..<r.lowerBound])) as NSString).lastPathComponent }
+        return (t as NSString).lastPathComponent
+    }
+
+    /// Only real malicious indicators make a login item a threat: hidden or obfuscated, running from a temp folder or
+    /// Downloads, download-and-run arguments, an unsigned program in an odd location, a revoked signature, or a
+    /// `com.apple.` name on code Apple didn't sign. Signed and notarized developers and the user's own scripts in their
+    /// home folder are notes.
+    static func assessLoginItem(label: String, target: String?, arguments: [String], home: String, signing: SigningInfo?) -> LoginItemVerdict {
+        guard let exe = target, exe.hasPrefix("/") else { return .unresolved }
+        let p = exe.hasPrefix("/tmp/") ? "/private" + exe : exe
+        let all = ([exe] + arguments).joined(separator: " ")
+        var bad: [String] = []
+        if tempRoots.contains(where: { all.contains($0) }) { bad.append("runs from a temporary or shared folder") }
+        if p.contains("/Downloads/") { bad.append("runs from Downloads") }
+        if all.split(whereSeparator: { $0 == "/" || $0 == " " }).contains(where: { $0.hasPrefix(".") && $0.count > 1 && $0 != ".." && !allowedDot.contains(String($0)) }) {
+            bad.append("hidden path")
+        }
+        if maliciousArg.firstMatch(in: all, range: NSRange(location: 0, length: (all as NSString).length)) != nil || all.count > 4000 {
+            bad.append("downloads and runs code, or uses obfuscated arguments")
+        }
+        let status = signing?.status
+        if status == .revoked { bad.append("Apple revoked its signature") }
+        let normalPlace = ["/Applications/", "/System/", "/usr/", "/opt/homebrew/", "/opt/local/", "/Library/Application Support/"].contains { p.hasPrefix($0) }
+            || (p.hasPrefix(home + "/") && !p.contains("/Downloads/"))
+        if [.unsigned, .adHoc, .invalid].contains(status), !normalPlace { bad.append("unsigned program in an unusual location") }
+        let appleName = label.lowercased().hasPrefix("com.apple.") || (signing?.signingID?.hasPrefix("com.apple.") == true)
+        if appleName, status != nil, status != .apple { bad.append("uses an Apple name but isn't signed by Apple") }
+        if !bad.isEmpty { return .threat(bad) }
+        if let s = signing, s.status == .apple || s.status == .appStore || (s.status == .developerID && s.notarized == true) {
+            return .note(s.status == .apple ? "signed by Apple" : "signed and notarized" + (s.teamID.map { " (team \($0))" } ?? ""))
+        }
+        if p.hasPrefix(home + "/") { return .note("your own program or script in your home folder") }
+        return .note("new login item with no warning signs")
+    }
+
+    /// Applies the login-item verdict to a finding about a BTM / login item record.
+    static func applyLoginItem(_ d: Detection, record r: PersistenceRecord, home: String, signing: SigningInfo?) -> Detection {
+        let name = displayName(label: r.item.label, target: r.item.target)
+        let signer = signing.map { s in s.teamID.map { "\(s.status.rawValue), team \($0)" } ?? s.status.rawValue } ?? "unknown"
+        switch assessLoginItem(label: r.item.label, target: r.item.target, arguments: r.arguments, home: home, signing: signing) {
+        case .unresolved:
+            var n = asNote(d)
+            n.name = "Login item (program unknown): \(name)"
+            n.evidence.append(Evidence(source: .persistence, title: "Note", detail: "macOS lists this background item without a program path, so \(Product.name) can't check it. Not a threat decision.", score: 0))
+            return n
+        case .note(let why):
+            var n = asNote(d)
+            n.path = r.item.target ?? d.path
+            n.name = "New login item: \(name)"
+            n.evidence.append(Evidence(source: .persistence, title: "Note", detail: "\(name) runs \(r.item.target ?? "?") (signer: \(signer)); \(why). Not a threat decision.", score: 0))
+            return n
+        case .threat(let reasons):
+            var t = d
+            t.path = r.item.target ?? d.path
+            t.name = "Login item with warning signs: \(name)"
+            t.evidence.append(Evidence(source: .persistence, title: "Login item warning signs",
+                                       detail: "\(name) runs \(r.item.target ?? "?") (signer: \(signer)): \(reasons.joined(separator: "; ")).",
+                                       score: min(90, 60 + 10 * reasons.count)))
+            var remain = 1.0
+            for e in t.evidence { remain *= 1 - Double(min(100, max(0, e.score))) / 100 }
+            t.confidence = max(t.confidence, Int((100 * (1 - remain)).rounded()))
+            t.severity = max(t.severity, t.confidence >= 75 ? .high : .medium)
+            return t
+        }
+    }
+
     /// The note version of a persistence finding (kept for "Review notes", not a decision).
     static func asNote(_ d: Detection) -> Detection {
         var n = d

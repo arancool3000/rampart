@@ -46,6 +46,7 @@ extension SelfTest {
             ("b5x", SelfTest.b5xChecks),
             ("activity", SelfTest.activityChecks),
             ("compress", SelfTest.compressChecks),
+            ("snr", SelfTest.signalNoiseChecks),
         ]
     }
 }

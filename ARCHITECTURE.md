@@ -31,6 +31,7 @@ an XProtect engine called "Bastion"). Research lives in `docs/research/01..10-*.
 ## Interfaces
 - Detectors implement `FileDetector` (RampartShared). Event producers implement `EventSource`. Results are `Detection` with `Evidence` list.
 - Scoring: each Evidence has a 0–100 score; combined confidence = 100·(1 − Π(1 − s/100)). Thresholds: ≥90 auto-quarantine (if enabled), ≥60 alert, ≥30 log only. Hash/YARA-XProtect/EICAR hits are ≥95. Signing heuristics alone never exceed 50.
+- **Signal-to-noise policy (2026-11-07, `RampartShared/DetectionPolicy.swift`) is applied after scoring**, in `Protection.handle` before storing and on upgrade by `DetectionReevaluator`. Confirmed (100 % allowed) only for a known-bad hash, XProtect, a vetted YARA rule on a non-test file, an Apple-revoked signature or the R40 stealer chain. One uncorroborated heuristic is capped at 70 %, corroborated heuristics at 89 %, developer / own / bait-opened contexts at 45 %. Tiers: "Needs you" (Likely/Confirmed, open) is the only thing the badge, footer and notifications count; "Handled automatically"; "FYI". Only Confirmed, or Likely with an independent second signal and raw score ≥ 90, may quarantine / kill / reach `Emergency.consider` (EICAR may still be auto-quarantined). Identical findings are merged into one row (count, first/last seen).
 - False positives are a release blocker: Apple platform binaries and notarized Developer ID apps get a strong negative prior; heuristics must not fire on `/usr/bin`, `/System`, `/Applications` (Apple-signed).
 
 ## Building without colliding

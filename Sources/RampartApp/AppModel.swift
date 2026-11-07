@@ -398,7 +398,14 @@ final class AppModel {
     /// True when the numbers on screen are real (or explicit developer demo data).
     var hasData: Bool { mode == .live || mode == .demo }
     static let demoRequested = CommandLine.arguments.contains("--demo")
-    var openDetections: [Detection] { detections.filter { !$0.resolved } }
+    /// "Needs you" only: open, likely or confirmed threats (see `DetectionPolicy`). Possible findings, notes, test files
+    /// and quarantined items are not counted anywhere (badge, "Needs attention" footer, menu bar).
+    var openDetections: [Detection] { detections.filter { DetectionPolicy.tier($0, quarantined: isQuarantined($0)) == .needsYou } }
+    /// Rows in "Needs you" (one per file, process or login item): the sidebar badge number.
+    var needsYouCount: Int { DetectionPolicy.needsYouCount(detections, quarantined: isQuarantined) }
+    func isQuarantined(_ d: Detection) -> Bool {
+        quarantine.contains { ($0.sha256 == d.sha256 && d.sha256 != nil) || $0.originalPath == d.path }
+    }
     var isScanning: Bool { if case .running = scanPhase { return true }; return false }
     var scanProgress: ScanProgress? { if case .running(let p) = scanPhase { return p }; return nil }
     var fullDiskAccess: Bool { mode == .live ? status.fullDiskAccess : hasFullDiskAccess || isDemo }
@@ -674,7 +681,8 @@ final class AppModel {
         if let i = detections.firstIndex(where: { $0.id == d.id }) { detections[i] = d } else { detections.insert(d, at: 0) }
         if mode == .live { scheduleActivityFetch() }   // the service logged it; show it within a second or two
         else { recordActivity(Self.activityEntry(for: d)) }
-        if d.confidence >= 60 { Notifier.shared.threat(d) }
+        // Notify only for "Needs you" (likely or confirmed); possible findings and notes stay quiet in FYI.
+        if DetectionPolicy.tier(d) == .needsYou { Notifier.shared.threat(d) }
     }
 
     /// PasteGuard runs in the app: its decisions are recorded here (reasons only, never the command text).
@@ -701,7 +709,7 @@ final class AppModel {
     /// Entry for a detection seen while the service isn't connected (offline/demo).
     static func activityEntry(for d: Detection) -> ActivityEntry {
         let top = d.evidence.filter { $0.score > 0 }.max { $0.score < $1.score }
-        return ActivityEntry(date: d.date, kind: .detection, title: d.name, detail: d.path ?? "", outcome: d.resolved ? "contained" : (d.confidence >= 60 ? "needs review" : "logged"),
+        return ActivityEntry(date: d.date, kind: .detection, title: d.name, detail: d.path ?? "", outcome: d.resolved ? "contained" : (DetectionPolicy.tier(d) == .needsYou ? "needs review" : "logged"),
                              severity: d.severity, detectionID: d.id, event: d.name.hasPrefix("Tampering with ") ? .tamper : .detection,
                              process: d.pid.map { ActivityProcess(pid: $0) }, target: d.path, rule: top?.title,
                              reason: top.map { $0.detail.isEmpty ? $0.title : $0.detail }, score: d.confidence, sha256: d.sha256,
@@ -778,7 +786,7 @@ final class AppModel {
     var overall: Overall {
         if mode == .connecting { return .starting }
         if mode == .offline { return .serviceDown }
-        if !openDetections.isEmpty { return .threat(openDetections.count) }
+        if needsYouCount > 0 { return .threat(needsYouCount) }
         if let p = pausedUntil, p > Date() { return .paused(p) }
         if !status.realtimeOn { return .off }
         if !fullDiskAccess { return .limited }

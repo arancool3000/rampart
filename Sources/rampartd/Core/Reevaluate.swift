@@ -14,7 +14,7 @@ enum DetectionReevaluator {
         let body = rules.rules.map { "\($0.id):\($0.score)" }.joined(separator: ",")
         var h: UInt64 = 1469598103934665603
         for b in body.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
-        return "\(Product.version)|\(build)|\(rules.version)|\(String(h, radix: 16))|triage\(FindingTriage.policyVersion)"
+        return "\(Product.version)|\(build)|\(rules.version)|\(String(h, radix: 16))|triage\(FindingTriage.policyVersion)|snr\(DetectionPolicy.version)"
     }
 
     static func buildStamp(executable: String = Bundle.main.executablePath ?? CommandLine.arguments[0]) -> String {
@@ -126,8 +126,17 @@ enum DetectionReevaluator {
             guard let engine else { return ["R07"] }   // can't re-check: keep it
             return Set(engine.reviewPersistence([r]).map(\.finding.ruleID))
         }) {
-            _ = p.store.update(d.id) { $0.resolved = true }
+            _ = p.store.update(d.id) { $0.resolved = true; $0.resolution = $0.resolution ?? DetectionPolicy.recheckedReason }
             n += 1
+        }
+        // Signal-to-noise policy: recalibrate, resolve what no longer qualifies (with a reason), merge duplicates.
+        if upgraded {
+            let r = DetectionPolicy.reevaluate(p.store.all().reversed())
+            p.store.replaceAll(r.items)
+            n += r.resolved
+            if r.resolved + r.merged + r.downgraded > 0 {
+                logInfo("signal-to-noise re-check: \(r.resolved) resolved, \(r.merged) duplicate(s) merged, \(r.downgraded) moved out of Needs you")
+            }
         }
         if upgraded {
             n += p.resolveAllowedDetections()

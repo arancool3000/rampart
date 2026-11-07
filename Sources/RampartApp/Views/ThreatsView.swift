@@ -20,7 +20,7 @@ struct ThreatsView: View {
     /// Notes the user dismissed (per-viewer convenience; comma-separated UUIDs).
     @AppStorage("threats.dismissedNotes") private var dismissedNotesRaw = ""
     @StateVar private var showInspector = true
-    @StateVar private var sortOrder = [KeyPathComparator(\Detection.date, order: .reverse)]
+    @StateVar private var handledExpanded = false
     /// Records the user deleted but whose permanent delete hasn't run yet (undo window).
     @StateVar private var pendingDeletes: Set<QuarantineRecord.ID> = []
     @StateVar private var undo: UndoNote?
@@ -73,7 +73,8 @@ struct ThreatsView: View {
         .inspector(isPresented: $showInspector) {
             Group {
                 if segment == .detections, let id = selectedDetection, let d = model.detections.first(where: { $0.id == id }) {
-                    DetectionInspector(detection: d, record: record(for: d), onDelete: scheduleDelete, onRestored: offerReQuarantine)
+                    DetectionInspector(detection: d, record: record(for: d), related: group(for: d)?.members.filter { $0.id != d.id } ?? [],
+                                       onDelete: scheduleDelete, onRestored: offerReQuarantine)
                 } else if segment == .quarantine, selectedQuarantine.count == 1, let id = selectedQuarantine.first,
                           let r = visibleQuarantine.first(where: { $0.id == id }) {
                     DetectionInspector(detection: detection(for: r), record: r, onDelete: scheduleDelete, onRestored: offerReQuarantine)
@@ -97,7 +98,7 @@ struct ThreatsView: View {
         .sheet(item: $teaching) { req in TeachSheet(request: req) }
         .sheet(isPresented: $showTriage) { NotesTriageSheet(notes: notes) { teaching = TeachRequest(detections: $0) } }
         .onAppear {
-            if selectedDetection == nil { selectedDetection = decisions.first(where: { !$0.resolved })?.id ?? decisions.first?.id }
+            if selectedDetection == nil { selectedDetection = needsYou(tierGroups).first?.primary.id }
             if selectedQuarantine.isEmpty, let f = model.quarantine.first?.id { selectedQuarantine = [f] }
         }
     }
@@ -156,36 +157,49 @@ struct ThreatsView: View {
             ?? model.detections.first { $0.name == r.detectionName }
     }
 
-    // MARK: Decisions vs notes
+    // MARK: Tiers: Needs you / Handled automatically / FYI
 
-    /// Needs a decision (or already handled): alert level (>= 60) or quarantined. Everything else is a note.
-    private func isNote(_ d: Detection) -> Bool { d.confidence < 60 && record(for: d) == nil }
-    private var decisions: [Detection] { model.detections.filter { !isNote($0) }.sorted(using: sortOrder) }
-    private var dismissedNotes: Set<UUID> { Set(dismissedNotesRaw.split(separator: ",").compactMap { UUID(uuidString: String($0)) }) }
-    private var notes: [Detection] {
-        let gone = dismissedNotes
-        return model.detections.filter { isNote($0) && !gone.contains($0.id) }.sorted { $0.date > $1.date }
+    /// One row per file, process or login item, in three tiers (see `DetectionPolicy`).
+    private var tierGroups: [DetectionTier: [DetectionGroup]] {
+        DetectionPolicy.groups(model.detections, quarantined: { record(for: $0) != nil })
     }
-    private var filteredNotes: [Detection] {
+    private var dismissedNotes: Set<UUID> { Set(dismissedNotesRaw.split(separator: ",").compactMap { UUID(uuidString: String($0)) }) }
+    private func needsYou(_ g: [DetectionTier: [DetectionGroup]]) -> [DetectionGroup] { g[.needsYou] ?? [] }
+    private func handled(_ g: [DetectionTier: [DetectionGroup]]) -> [DetectionGroup] { g[.handled] ?? [] }
+    private func fyi(_ g: [DetectionTier: [DetectionGroup]]) -> [DetectionGroup] {
+        let gone = dismissedNotes
+        return (g[.fyi] ?? []).filter { !gone.contains($0.primary.id) }
+    }
+    /// FYI detections (for "Review All Notes").
+    private var notes: [Detection] { fyi(tierGroups).flatMap(\.members) }
+    private func filtered(_ gs: [DetectionGroup]) -> [DetectionGroup] {
         let q = notesFilter.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !q.isEmpty else { return notes }
-        return notes.filter { d in
+        guard !q.isEmpty else { return gs }
+        return gs.filter { g in g.members.contains { d in
             [d.name, d.path ?? "", Self.tag(for: d, note: true)].contains { $0.lowercased().contains(q) }
                 || d.evidence.contains { $0.title.lowercased().contains(q) }
-        }
+        } }
+    }
+    /// The group a detection belongs to (for the inspector's "All signals on this item").
+    private func group(for d: Detection) -> DetectionGroup? {
+        tierGroups.values.lazy.flatMap { $0 }.first { g in g.members.contains { $0.id == d.id } }
     }
 
     private func dismissAllNotes() {
-        var ids = dismissedNotes.union(notes.map(\.id))
+        var ids = dismissedNotes.union(fyi(tierGroups).map(\.primary.id))
         let live = Set(model.detections.map(\.id))
         ids = ids.intersection(live)            // forget ids that no longer exist
         dismissedNotesRaw = ids.prefix(3000).map(\.uuidString).joined(separator: ",")
-        if let s = selectedDetection, ids.contains(s) { selectedDetection = decisions.first?.id }
+        if let s = selectedDetection, ids.contains(s) { selectedDetection = needsYou(tierGroups).first?.primary.id }
     }
 
-    /// Calm, accurate tag. Notes are "Note"; generic "suspicious" items name what was actually seen.
+    /// Calm, accurate tag. FYI items say what they are; generic "suspicious" items name what was actually seen.
     static func tag(for d: Detection, note: Bool) -> String {
-        if note { return "Note" }
+        if note {
+            if d.category == .test { return "Test file" }
+            if d.category == .persistence || d.name.hasPrefix("New login item") || d.name.hasPrefix("Login item") { return "New login item" }
+            return DetectionPolicy.level(d) == .possible ? "Possible" : "Note"
+        }
         guard d.category == .suspicious else { return d.category.label }
         switch d.evidence.max(by: { $0.score < $1.score })?.source {
         case .signing?: return "Code signing"
@@ -198,11 +212,21 @@ struct ThreatsView: View {
         }
     }
 
-    private func itemCell(_ d: Detection) -> some View {
-        HStack(spacing: Spacing.s) {
+    private func itemCell(_ g: DetectionGroup) -> some View {
+        let d = g.primary
+        return HStack(spacing: Spacing.s) {
             FileIcon(path: d.path)
             VStack(alignment: .leading, spacing: 1) {
-                Text(SafeText.line(d.path.map { ($0 as NSString).lastPathComponent } ?? d.name)).lineLimit(1)
+                HStack(spacing: 4) {
+                    Text(SafeText.line(d.path.map { ($0 as NSString).lastPathComponent }.flatMap { $0.hasPrefix("btm:") ? nil : $0 } ?? d.name)).lineLimit(1)
+                    if g.count > 1 {
+                        Text("×\(g.count)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                            .help("Seen \(g.count) times, first \(Fmt.ago(g.firstSeen)), last \(Fmt.ago(g.lastSeen))")
+                    }
+                    if g.members.count > 1 {
+                        Text("\(g.members.count) signals").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 Text(d.path.map { SafeText.path(($0 as NSString).abbreviatingWithTildeInPath) } ?? "—")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
@@ -210,6 +234,8 @@ struct ThreatsView: View {
     }
 
     @ViewBuilder private var detectionsTable: some View {
+        let g = tierGroups
+        let needs = needsYou(g), done = handled(g), info = fyi(g)
         if model.detections.isEmpty {
             EmptyStateView(symbol: "checkmark.shield", title: "No threats found",
                            detail: model.mode == .live
@@ -217,39 +243,57 @@ struct ThreatsView: View {
                                : "When \(Product.name) finds something, it will appear here with an explanation.", brand: true)
         } else {
             VStack(spacing: 0) {
-                if decisions.isEmpty {
+                if needs.isEmpty {
                     HStack(spacing: Spacing.m) {
                         Image(systemName: "checkmark.shield").font(.title2).foregroundStyle(Color.statusProtected).accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Nothing needs your attention").font(.headline)
-                            Text("\(Product.name) only logged a few notes for reference.").font(.callout).foregroundStyle(.secondary)
+                            Text("Nothing needs you").font(.headline)
+                            Text(done.isEmpty && info.isEmpty ? "No open findings."
+                                 : "Everything below was handled automatically or is for your information only.")
+                                .font(.callout).foregroundStyle(.secondary)
                         }
                         Spacer()
                     }
                     .padding(Spacing.l)
-                    if !notesExpanded { Spacer() }
+                    if !handledExpanded && !notesExpanded { Spacer() }
                 } else {
-                    Table(decisions, selection: $selectedDetections, sortOrder: $sortOrder) {
-                        TableColumn("Item", value: \.name) { d in itemCell(d) }
+                    HStack(spacing: Spacing.s) {
+                        Text("Needs you (\(needs.count))").font(.headline)
+                        Text("likely or confirmed threats, most serious first").font(.callout).foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, Spacing.m).padding(.vertical, Spacing.s)
+                    Table(needs.map(\.primary), selection: $selectedDetections) {
+                        TableColumn("Item") { d in rowCell(d, in: needs) }
                             .width(min: 220, ideal: 300)
                         TableColumn("Type") { d in Badge(text: Self.tag(for: d, note: false)) }.width(min: 110, ideal: 150)
-                        TableColumn("Severity", value: \.severity.rawValue) { d in
+                        TableColumn("Confidence") { d in ConfidenceTag(level: DetectionPolicy.level(d), confidence: d.confidence) }
+                            .width(min: 90, ideal: 110)
+                        TableColumn("Severity") { d in
                             Label { Text(d.severity.label) } icon: { Image(systemName: d.severity.symbol).foregroundStyle(d.severity.tint) }
                         }
                         .width(min: 80, ideal: 90)
                         TableColumn("Status") { d in DetectionStatus(detection: d, quarantined: record(for: d) != nil) }.width(min: 110, ideal: 130)
-                        TableColumn("Detected", value: \.date) { d in Text(Fmt.ago(d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
+                        TableColumn("Last seen") { d in Text(Fmt.ago(d.lastSeen ?? d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
                     }
                     .scrollContentBackground(.hidden)
                     .contextMenu(forSelectionType: Detection.ID.self) { ids in detectionMenu(ids) }
                 }
-                if !notes.isEmpty { notesSection }
+                if !done.isEmpty { handledSection(done, roomy: needs.isEmpty) }
+                if !info.isEmpty { fyiSection(info, roomy: needs.isEmpty) }
             }
         }
     }
 
+    private func rowCell(_ d: Detection, in gs: [DetectionGroup]) -> some View {
+        Group {
+            if let g = gs.first(where: { $0.primary.id == d.id }) { itemCell(g) }
+            else { itemCell(DetectionGroup(id: d.id.uuidString, tier: .fyi, primary: d, members: [d])) }
+        }
+    }
+
     @ViewBuilder private func detectionMenu(_ ids: Set<Detection.ID>) -> some View {
-        if let id = ids.first, let d = model.detections.first(where: { $0.id == id }), let p = d.path {
+        if let id = ids.first, let d = model.detections.first(where: { $0.id == id }), let p = d.path, p.hasPrefix("/") {
             if FileManager.default.fileExists(atPath: p) {
                 Button("Reveal in Finder") { NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "") }
                 Divider()
@@ -257,54 +301,93 @@ struct ThreatsView: View {
             Button("Copy Path") { copy(p) }
             if let h = d.sha256 { Button("Copy SHA-256") { copy(h) } }
         }
-        let picked = model.detections.filter { ids.contains($0.id) && !$0.resolved }
+        // A grouped row acts on every open signal about that item.
+        let rows = model.detections.filter { ids.contains($0.id) }
+        let picked = rows.flatMap { d in group(for: d)?.members ?? [d] }.filter { !$0.resolved }
         if !picked.isEmpty {
             Divider()
             Button(picked.count == 1 ? "Not a Threat…" : "Not a Threat (\(picked.count) items)…") { teaching = TeachRequest(detections: picked) }
         }
     }
 
-    private var notesSection: some View {
+    private func sectionHeader(_ title: String, count: Int, subtitle: String, help: String, expanded: Bool, toggle: @escaping () -> Void) -> some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { toggle() }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right").rotationEffect(.degrees(expanded ? 90 : 0)).font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text("\(title) (\(count))").font(.headline)
+                Text(subtitle).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(title), \(count), \(subtitle)")
+        .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+        .help(help)
+    }
+
+    private func handledSection(_ gs: [DetectionGroup], roomy: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Divider()
             HStack(spacing: Spacing.s) {
-                Button {
-                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { notesExpanded.toggle() }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "chevron.right").rotationEffect(.degrees(notesExpanded ? 90 : 0)).font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        Text("Notes (\(notes.count))").font(.headline)
-                        Text("logged for reference, no action needed").font(.callout).foregroundStyle(.secondary)
+                sectionHeader("Handled automatically", count: gs.count, subtitle: "quarantined, blocked or resolved",
+                              help: "Already dealt with. Quarantined files stay in Quarantine until you delete them.",
+                              expanded: handledExpanded) { handledExpanded.toggle() }
+                Spacer()
+            }
+            .padding(.horizontal, Spacing.m).padding(.vertical, Spacing.s)
+            if handledExpanded {
+                Table(gs.map(\.primary), selection: $selectedDetections) {
+                    TableColumn("Item") { d in rowCell(d, in: gs) }.width(min: 220, ideal: 300)
+                    TableColumn("What happened") { d in
+                        Text(SafeText.line(record(for: d) != nil ? "Quarantined" : d.resolution ?? "Resolved"))
+                            .foregroundStyle(.secondary).lineLimit(1)
                     }
-                    .contentShape(Rectangle())
+                    .width(min: 160, ideal: 260)
+                    TableColumn("When") { d in Text(Fmt.ago(d.lastSeen ?? d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Notes, \(notes.count), logged for reference, no action needed")
-                .accessibilityValue(notesExpanded ? "Expanded" : "Collapsed")
-                .help("Low-confidence observations, such as ad-hoc or unsigned code. Kept for reference; nothing was changed.")
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: 140, idealHeight: roomy ? 300 : 200, maxHeight: roomy ? .infinity : 240)
+                .contextMenu(forSelectionType: Detection.ID.self) { ids in detectionMenu(ids) }
+                .transition(.opacity)
+            }
+        }
+        .background(Color.primary.opacity(0.02))
+    }
+
+    private func fyiSection(_ all: [DetectionGroup], roomy: Bool) -> some View {
+        let gs = filtered(all)
+        return VStack(alignment: .leading, spacing: 0) {
+            Divider()
+            HStack(spacing: Spacing.s) {
+                sectionHeader("FYI", count: all.count, subtitle: "possible findings and notes, no action needed",
+                              help: "Single warning signs with nothing to confirm them, new login items, test files and status notes. Kept for reference; nothing was changed and they don't count as threats.",
+                              expanded: notesExpanded) { notesExpanded.toggle() }
                 Spacer()
                 if notesExpanded {
-                    TextField("Filter notes", text: $notesFilter).textFieldStyle(.roundedBorder).frame(maxWidth: 180).controlSize(.small)
+                    TextField("Filter", text: $notesFilter).textFieldStyle(.roundedBorder).frame(maxWidth: 180).controlSize(.small)
                 }
-                Button("Review All Notes…") { showTriage = true }.controlSize(.small)
-                    .help("Groups similar notes (for example developer builds) so you can trust each group at once")
-                Button("Dismiss All Notes") { dismissAllNotes() }.controlSize(.small)
-                    .help("Hide these notes. New notes will still appear.")
+                Button("Review All…") { showTriage = true }.controlSize(.small)
+                    .help("Groups similar items (for example developer builds) so you can trust each group at once")
+                Button("Dismiss All") { dismissAllNotes() }.controlSize(.small)
+                    .help("Hide these. New ones will still appear here.")
             }
             .padding(.horizontal, Spacing.m).padding(.vertical, Spacing.s)
             if notesExpanded {
-                Table(filteredNotes, selection: $selectedDetections) {
-                    TableColumn("Item") { d in itemCell(d) }.width(min: 220, ideal: 300)
+                Table(gs.map(\.primary), selection: $selectedDetections) {
+                    TableColumn("Item") { d in rowCell(d, in: gs) }.width(min: 220, ideal: 300)
                     TableColumn("Observation") { d in
-                        Text(SafeText.line(d.evidence.max(by: { $0.score < $1.score })?.title ?? d.name)).foregroundStyle(.secondary).lineLimit(1)
+                        Text(SafeText.line(d.evidence.filter { !DetectionPolicy.isContextOnly($0) }.max(by: { $0.score < $1.score })?.title ?? d.name))
+                            .foregroundStyle(.secondary).lineLimit(1)
                     }
                     .width(min: 140, ideal: 200)
-                    TableColumn("Type") { d in Badge(text: Self.tag(for: d, note: true)) }.width(min: 60, ideal: 70)
-                    TableColumn("Logged") { d in Text(Fmt.ago(d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
+                    TableColumn("Type") { d in Badge(text: Self.tag(for: d, note: true)) }.width(min: 70, ideal: 100)
+                    TableColumn("Last seen") { d in Text(Fmt.ago(d.lastSeen ?? d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
                 }
                 .scrollContentBackground(.hidden)
-                .frame(minHeight: 160, idealHeight: decisions.isEmpty ? 400 : 220, maxHeight: decisions.isEmpty ? .infinity : 260)
+                .frame(minHeight: 160, idealHeight: roomy ? 400 : 220, maxHeight: roomy ? .infinity : 260)
                 .contextMenu(forSelectionType: Detection.ID.self) { ids in detectionMenu(ids) }
                 .transition(.opacity)
             }
@@ -356,6 +439,8 @@ struct FileIcon: View {
 struct DetectionInspector: View {
     let detection: Detection?
     let record: QuarantineRecord?
+    /// Other signals about the same file, process or login item (grouped into one row).
+    var related: [Detection] = []
     var onDelete: (QuarantineRecord) -> Void = { _ in }
     var onRestored: (QuarantineRecord, Detection?) -> Void = { _, _ in }
     @Environment(AppModel.self) private var model
@@ -377,6 +462,7 @@ struct DetectionInspector: View {
                 VStack(alignment: .leading, spacing: Spacing.l) {
                     header
                     if let d = detection { why(d) }
+                    if !related.isEmpty { relatedSignals }
                     whatWeDid
                     details
                     links
@@ -407,7 +493,7 @@ struct DetectionInspector: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(SafeText.line(displayName, max: 160)).font(.title3.weight(.semibold)).lineLimit(2)
                 HStack(spacing: 6) {
-                    if let d = detection { Badge(text: ThreatsView.tag(for: d, note: d.confidence < 60 && record == nil)) }
+                    if let d = detection { Badge(text: ThreatsView.tag(for: d, note: DetectionPolicy.tier(d, quarantined: record != nil) == .fyi)) }
                     if record != nil { Badge(text: "Quarantined", tint: .gray) }
                 }
             }
@@ -427,7 +513,7 @@ struct DetectionInspector: View {
                             HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
                                 Text(SafeText.line(e.title)).font(.body.weight(.medium))
                                 Spacer(minLength: 0)
-                                SignalStrength(score: e.score)
+                                SignalStrength(score: e.score, definitive: DetectionPolicy.isDefinitive(e), context: DetectionPolicy.isContextOnly(e))
                             }
                             EvidenceDetail(detail: e.detail)
                             Text(e.source.label).font(.caption).foregroundStyle(.tertiary)
@@ -438,7 +524,7 @@ struct DetectionInspector: View {
                     .accessibilityElement(children: .combine)
                     .modifier(Cascade(index: idx, trigger: d.id))
                 }
-                confidence(d.confidence)
+                confidence(d)
             }
             .padding(.top, Spacing.s)
         } label: {
@@ -446,12 +532,16 @@ struct DetectionInspector: View {
         }
     }
 
-    private func confidence(_ c: Int) -> some View {
+    /// Honest wording: Confirmed only for definitive evidence; heuristics say Likely / Possible.
+    private func confidence(_ d: Detection) -> some View {
+        let c = d.confidence
+        let level = DetectionPolicy.level(d)
         let text: String
-        switch c {
-        case 90...: text = "High confidence (\(c)%)"
-        case 60..<90: text = "Medium confidence (\(c)%): this may be a false positive."
-        default: text = "Low confidence (\(c)%): logged for your review."
+        switch level {
+        case .confirmed: text = "Confirmed (\(c)%): matched a known threat."
+        case .likely: text = "Likely (\(c)%): several warning signs, or one strong one. It could still be a false positive."
+        case .possible: text = "Possible (\(c)%): a single warning sign with nothing to confirm it. Often harmless."
+        case .informational: text = d.category == .test ? "Test file: harmless by design." : "Informational (\(c)%): logged for reference."
         }
         return HStack(spacing: Spacing.s) {
             Gauge(value: Double(c), in: 0...100) { EmptyView() }
@@ -462,13 +552,29 @@ struct DetectionInspector: View {
         .accessibilityLabel(text)
     }
 
+    /// Every other signal RamPart has about this item (one row per subject in the list).
+    private var relatedSignals: some View {
+        VStack(alignment: .leading, spacing: Spacing.s) {
+            Text("Other signals on this item (\(related.count))").font(.headline)
+            ForEach(related) { r in
+                HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
+                    ConfidenceTag(level: DetectionPolicy.level(r), confidence: r.confidence)
+                    Text(SafeText.line(r.name)).lineLimit(2)
+                    Spacer(minLength: 0)
+                    Text(Fmt.ago(r.lastSeen ?? r.date)).font(.caption).foregroundStyle(.secondary)
+                }
+                .font(.callout)
+            }
+        }
+    }
+
     @ViewBuilder private var whatWeDid: some View {
         VStack(alignment: .leading, spacing: Spacing.xs) {
             Text("What \(Product.name) did").font(.headline)
             if let r = record {
                 Text("Moved to quarantine on \(r.date.formatted(date: .abbreviated, time: .shortened)). The file is encrypted and can't run.")
             } else if detection?.resolved == true {
-                Text("This item was resolved and is no longer flagged.")
+                Text(detection?.resolution.map { "\($0)." } ?? "This item was resolved and is no longer flagged.")
             } else {
                 if processStopped {
                     Text("\(Product.name) stopped the process. The file is still in place. Choose what to do next.")
@@ -485,7 +591,13 @@ struct DetectionInspector: View {
             Text("Details").font(.headline)
             Grid(alignment: .leading, horizontalSpacing: Spacing.m, verticalSpacing: 6) {
                 if let p = detection?.path ?? record?.originalPath { row("Location", (p as NSString).abbreviatingWithTildeInPath, mono: true) }
-                if let d = detection { row("First seen", d.date.formatted(date: .abbreviated, time: .shortened)) }
+                if let d = detection {
+                    row("First seen", (d.firstSeen ?? d.date).formatted(date: .abbreviated, time: .shortened))
+                    if let n = d.count, n > 1 {
+                        row("Last seen", (d.lastSeen ?? d.date).formatted(date: .abbreviated, time: .shortened))
+                        row("Times seen", String(n))
+                    }
+                }
                 if let pid = detection?.pid { row("Process ID", String(pid), mono: true) }
                 if let r = record { row("Size", Fmt.bytes(r.size)) }
                 if let sha {
@@ -576,7 +688,7 @@ struct DetectionInspector: View {
         if let p = detection?.path ?? record?.originalPath { s += "Path: \(p)\n" }
         if let sha { s += "SHA-256: \(sha)\n" }
         if let d = detection {
-            s += "Confidence: \(d.confidence)%\n"
+            s += "Confidence: \(DetectionPolicy.level(d).label) (\(d.confidence)%)\n"
             for e in d.evidence { s += "- [\(e.source.rawValue)] \(e.title): \(e.detail) (\(e.score))\n" }
         }
         NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string)
@@ -594,10 +706,10 @@ struct RestoreSheet: View {
 
     var body: some View {
         let name = (record.originalPath as NSString).lastPathComponent
-        let conf = (detection?.confidence ?? 0) >= 90 ? "high" : "medium"
+        let conf = detection.map { DetectionPolicy.level($0).label.lowercased() } ?? "unknown"
         VStack(alignment: .leading, spacing: Spacing.l) {
             Text("Restore \"\(SafeText.line(name))\"?").font(.title2.weight(.semibold))
-            Text("\(Product.name) flagged this as \(detection?.category.label ?? record.detectionName) (\(conf) confidence). Restore it only if you trust where it came from.")
+            Text("\(Product.name) flagged this as \(detection?.category.label ?? record.detectionName) (confidence: \(conf)). Restore it only if you trust where it came from.")
                 .fixedSize(horizontal: false, vertical: true)
             Picker("", selection: $choice) {
                 Text("Restore and always allow this file").tag(Choice.allowFile)
@@ -823,10 +935,13 @@ struct Cascade: ViewModifier {
 }
 
 /// How much one piece of evidence contributed, in words rather than raw numbers.
+/// Per-evidence strength. "Definitive" only for a known-threat match; a heuristic is at most a "Warning sign".
 struct SignalStrength: View {
     let score: Int
-    private var label: String { score >= 70 ? "Strong signal" : score >= 40 ? "Moderate signal" : "Weak signal" }
-    private var bars: Int { score >= 70 ? 3 : score >= 40 ? 2 : 1 }
+    var definitive = false
+    var context = false
+    private var label: String { context ? "Context" : definitive ? "Definitive" : score >= 60 ? "Warning sign" : "Weak sign" }
+    private var bars: Int { context ? 0 : definitive ? 3 : score >= 60 ? 2 : 1 }
     var body: some View {
         HStack(spacing: 4) {
             HStack(alignment: .bottom, spacing: 2) {
@@ -925,5 +1040,18 @@ struct EvidenceDetail: View {
             .lineLimit(pathy ? 1 : nil).truncationMode(.middle)
             .fixedSize(horizontal: false, vertical: !pathy)
             .help(t.count > 60 ? t : "")
+    }
+}
+
+/// "Confirmed 98%", "Likely 70%", "Possible 45%", "Info".
+struct ConfidenceTag: View {
+    let level: ConfidenceLevel
+    let confidence: Int
+    var body: some View {
+        let text = level == .informational ? "Info" : "\(level.label) \(confidence)%"
+        Text(text).font(.callout.monospacedDigit())
+            .foregroundStyle(level == .confirmed ? Color.statusAction : level == .likely ? Color.statusAttention : Color.secondary)
+            .help(level.explanation)
+            .accessibilityLabel("\(level.label), \(confidence) percent")
     }
 }

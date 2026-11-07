@@ -75,13 +75,17 @@ final class Protection {
             if case .notAFinding(let why) = outcome { logInfo("not a finding: \(detection.name) at \(detection.path ?? "-"): \(why)") }
             return nil
         }
-        var d = store.add(triaged)
+        // Signal-to-noise policy: cap heuristic confidence, decide the tier, and whether anything may happen automatically.
+        let assessment = DetectionPolicy.assess(triaged)
+        var d = store.add(DetectionPolicy.calibrate(triaged))
+        let tier = DetectionPolicy.tier(d)
         let cfg = runtime.config
         // Activity facts: resolved now, while the process may still be running.
         let proc = d.confidence >= 30 ? ActivityFacts.process(pid: d.pid) : nil
         let rr = ActivityFacts.ruleAndReason(d)
         var remediationSummary: String?
-        if remediate && d.confidence >= 90 && !d.resolved {
+        // Only Confirmed findings, or Likely ones with an independent second signal, are remediated automatically.
+        if remediate && assessment.autoRemediate && !d.resolved {
             var actions: [String] = []
             if cfg.killMaliciousProcesses, let pid = d.pid, pid > 1, let killer = services.processes {
                 let r = killer.terminate(pid: pid, expectedPath: d.path)
@@ -90,7 +94,8 @@ final class Protection {
             }
             // Files are quarantined only on file-engine evidence. Behaviour/persistence findings point at
             // plists, scripts or apps that need a reviewed, journaled remediation instead.
-            let fileEvidence = d.evidence.contains { [.hash, .yara, .xprotect].contains($0.source) || ($0.source == .heuristic && $0.score >= 90) }
+            // (A heuristic alone never quarantines; the EICAR test signature does, as every antivirus does.)
+            let fileEvidence = d.evidence.contains { [.hash, .yara, .xprotect].contains($0.source) && $0.score >= 90 } || DetectionPolicy.isTestSignature(d)
             if cfg.autoQuarantine, fileEvidence, let path = d.path, isRegularFile(path) {
                 do {
                     let rec = try services.quarantine.quarantine(path: path, detection: d)
@@ -121,15 +126,19 @@ final class Protection {
             let tamper = ActivityFacts.tamperKind(d)
             activity.add(ev == .tamper ? .tamper : ev == .remoteAccessAttempt ? .remoteAccess : .detection, d.name,
                          detail: d.path ?? d.pid.map { "process \($0)" } ?? "",
-                         outcome: d.resolved ? "contained" : (d.confidence >= 60 ? "needs review" : "logged"),
+                         outcome: d.resolved ? "contained" : (tier == .needsYou ? "needs review" : "logged"),
                          severity: d.severity, detectionID: d.id, event: ev, actor: .system, process: proc, target: d.path,
                          rule: tamper ?? rr.rule, reason: rr.reason, score: d.confidence,
                          action: remediationSummary.map { "Automatic response: \($0)." }, sha256: d.sha256,
                          facts: ["threat": d.name, "category": d.category.rawValue])
         }
         logInfo("detection \(d.name) conf=\(d.confidence) path=\(d.path ?? "-") resolved=\(d.resolved)")
-        if d.confidence >= 60 || d.category == .test { broadcast(.event(d)) }
-        Emergency.consider(d, protection: self)
+        if tier == .needsYou || d.category == .test { broadcast(.event(d)) }
+        // A Possible or heuristic finding never triggers an emergency; corroborated ones go in with their raw score.
+        if assessment.autoRemediate {
+            var raw = d; raw.confidence = assessment.rawConfidence; raw.severity = max(d.severity, triaged.severity)
+            Emergency.consider(raw, protection: self)
+        }
         return d
     }
 
