@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import RampartVault
+import RampartShared
 
 /// Root of the "Passwords" sidebar section: create / lock screen, then the vault with its tabs.
 struct PasswordsView: View {
@@ -48,6 +49,7 @@ struct PasswordsView: View {
 
     private var unlocked: some View {
         VStack(spacing: 0) {
+            if model.offerTouchID { TouchIDOfferBanner() }
             if let e = model.error {
                 HStack {
                     StatusLabel(text: e, symbol: "exclamationmark.triangle.fill", tint: .orange)
@@ -83,6 +85,44 @@ struct PasswordsView: View {
 
 // MARK: - Lock / create screen
 
+/// Plain-language explanation of how the vault is protected (no algorithm names, on purpose).
+struct VaultProtectionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            Text("How is my vault protected?").font(.title2.weight(.semibold))
+            ForEach([
+                ("lock.fill", "Your passwords are scrambled with strong, modern encryption before they're saved. The file on disk is unreadable without your master password."),
+                ("hourglass", "Turning your master password into the key is deliberately slow, so guessing it is very expensive for an attacker."),
+                ("checkmark.seal", "The vault detects tampering: if the file is changed or damaged, it refuses to open instead of showing wrong data."),
+                ("touchid", "With Touch ID on, the key is protected by your Mac's security chip and needs your current fingerprint."),
+                ("internaldrive", "Everything stays on this Mac. Nothing is uploaded, and locking wipes the decrypted items from memory."),
+                ("exclamationmark.triangle", "\(Product.name) can't recover a forgotten master password. Keep it somewhere safe."),
+            ], id: \.1) { symbol, text in
+                Label { Text(text).fixedSize(horizontal: false, vertical: true) } icon: { Image(systemName: symbol).foregroundStyle(Color.rampartTeal) }
+            }
+            HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
+        }
+        .padding(Spacing.xl).frame(width: 460)
+    }
+}
+
+/// Offered right after a master-password unlock when Touch ID is available but off.
+struct TouchIDOfferBanner: View {
+    @Bindable private var model = PasswordsModel.shared
+    var body: some View {
+        HStack {
+            Image(systemName: "touchid").foregroundStyle(Color.rampartTeal)
+            Text("Unlock faster next time with \(model.availability.biometryName)?")
+            Spacer()
+            Button("Not Now") { model.touchIDOfferDismissed = true }.controlSize(.small)
+            Button("Turn On") { model.setTouchID(true); model.touchIDOfferDismissed = true }.controlSize(.small).buttonStyle(GlowButtonStyle())
+        }
+        .padding(.horizontal, Spacing.l).padding(.vertical, Spacing.s)
+        .background(Color.rampartTeal.opacity(0.1))
+    }
+}
+
 struct VaultLockScreen: View {
     let creating: Bool
     @Bindable private var model = PasswordsModel.shared
@@ -90,6 +130,7 @@ struct VaultLockScreen: View {
     @StateVar private var confirm = ""
     @StateVar private var reveal = false
     @FocusState private var focused: Bool
+    @StateVar private var showProtection = false
 
     var body: some View {
         ScrollView {
@@ -99,10 +140,12 @@ struct VaultLockScreen: View {
                 VStack(spacing: 6) {
                     Text(creating ? "Create your password vault" : "Your vault is locked")
                         .font(.largeTitle.weight(.semibold)).fontDesign(.rounded)
-                    Text(creating
-                         ? "Everything is encrypted on this Mac with AES-256. Only your master password, or your fingerprint once you turn on Touch ID, can open it. RamPart can't recover a forgotten master password."
-                         : "Encrypted at rest with AES-256-GCM. Unlock with Touch ID or your master password.")
-                        .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 460)
+                    if creating {
+                        Text("Everything is encrypted on this Mac. Only your master password, or your fingerprint once you turn on Touch ID, can open it. \(Product.name) can't recover a forgotten master password.")
+                            .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 460)
+                    }
+                    Button("How is my vault protected?") { showProtection = true }
+                        .buttonStyle(.link).font(.callout)
                 }
                 form.frame(maxWidth: 380)
                 Spacer(minLength: Spacing.xl)
@@ -110,10 +153,22 @@ struct VaultLockScreen: View {
             .frame(maxWidth: .infinity)
             .padding(Spacing.xl)
         }
+        .sheet(isPresented: $showProtection) { VaultProtectionSheet() }
         .onAppear {
+            // Load the vault and Touch ID enrolment state before the button is drawn (first screen after launch).
+            model.refreshPhase()
             focused = true
-            // Offer Touch ID straight away, but only when the user can see the window.
-            if !creating && model.touchIDEnabled && !Headless.active && NSApp.isActive { Task { await model.unlockWithTouchID() } }
+        }
+        .task {
+            // Offer Touch ID once on first appear, only if it's on and RamPart is frontmost. At launch the app may
+            // not be active yet when this screen appears, so wait (briefly) for it to become active.
+            guard !creating, !Headless.active, !PasswordsModel.didAutoPromptTouchID else { return }
+            model.refreshPhase()
+            guard model.touchIDEnabled else { return }
+            for _ in 0..<20 where !NSApp.isActive { try? await Task.sleep(for: .milliseconds(250)) }
+            guard NSApp.isActive, model.phase == .locked, !Task.isCancelled else { return }
+            PasswordsModel.didAutoPromptTouchID = true
+            await model.unlockWithTouchID()
         }
     }
 
@@ -124,7 +179,11 @@ struct VaultLockScreen: View {
                     Label("Unlock with \(model.availability.biometryName)", systemImage: "touchid").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(GlowButtonStyle()).controlSize(.large)
+                if let r = model.availability.reason { Text(r).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center) }
                 HStack { line; Text("or").font(.caption).foregroundStyle(.secondary); line }
+            } else if !creating && model.availability.biometryAvailable {
+                Label("\(model.availability.biometryName) unlock is off. Unlock once with your master password and you can turn it on.", systemImage: "touchid")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             field("Master password", text: $password)
                 .onSubmit(submit)

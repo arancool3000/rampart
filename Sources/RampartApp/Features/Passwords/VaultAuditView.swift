@@ -45,7 +45,7 @@ struct VaultAuditView: View {
             if audit.loginCount > 0 && audit.problemItemCount == 0 {
                 StatusLabel(text: "No problems found in \(audit.loginCount) logins.", symbol: "checkmark.seal.fill", tint: .green).card()
             }
-            Text("Breach monitoring uses Have I Been Pwned's k-anonymity range API: only the first 5 characters of each password's SHA-1 hash leave this Mac, never the password or the full hash. Each password is re-checked at most once a day; results are stored hashed inside the encrypted vault. Turn it off in Settings. Two-factor and passkey suggestions use a small built-in list of sites, which may be out of date.")
+            Text("Breach monitoring uses Have I Been Pwned's Pwned Passwords service: only the first 5 characters of a scrambled fingerprint of each password leave this Mac, never the password itself. Each password is re-checked at most once a day; results are stored hashed inside the encrypted vault. Turn it off in Settings. Two-factor and passkey suggestions use a small built-in list of sites, which may be out of date.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
@@ -123,7 +123,7 @@ struct BreachBadge: View {
             }
         }
         .font(.caption)
-        .help("Only the first 5 characters of the password's SHA-1 hash are sent (k-anonymity).")
+        .help("Only the first 5 characters of a scrambled fingerprint leave your Mac. Your password is never sent.")
         .task(id: password) {
             guard model.meta.settings.breachCheckEnabled, !password.isEmpty else { state = .off; return }
             try? await Task.sleep(for: .milliseconds(700))

@@ -32,9 +32,9 @@ struct VaultSettingsView: View {
             if let r = model.availability.reason { StatusLabel(text: r, symbol: "info.circle.fill", tint: .blue).font(.callout) }
             Group {
                 if model.touchIDMode == .keychainGated {
-                    Text("Keychain mode (this Mac has no usable Secure Enclave): the vault key is stored in your login keychain and RamPart asks for Touch ID before reading it. That check is enforced by RamPart, not by hardware, so it is weaker than the master password: an app you allow to access the keychain item could read the key without Touch ID.")
+                    Text("Compatibility mode (this Mac's security chip couldn't be used): the vault key is stored in your login keychain and RamPart asks for Touch ID before reading it. That check is enforced by RamPart, not by hardware, so it is weaker than the master password: an app you allow to access the keychain item could read the key without Touch ID.")
                 } else {
-                    Text("Hardware-protected: the vault key is wrapped by a key that lives inside this Mac's Secure Enclave and can only be used after a Touch ID match with your current fingerprints. Adding or removing a fingerprint switches Touch ID off until you unlock once with your master password. Nothing is stored in the keychain. Anyone who can pass Touch ID on this Mac can open the vault, and your master password always works.")
+                    Text("Hardware-protected: the vault key is locked by a key that lives inside this Mac's security chip and can only be used after a Touch ID match with your current fingerprints. Adding or removing a fingerprint switches Touch ID off until you unlock once with your master password. Nothing is stored in the keychain. Anyone who can pass Touch ID on this Mac can open the vault, and your master password always works.")
                 }
             }
             .font(.caption).foregroundStyle(.secondary)
@@ -48,7 +48,7 @@ struct VaultSettingsView: View {
             Toggle("Check passwords against known breaches automatically", isOn: Binding(get: { model.meta.settings.breachCheckEnabled },
                                                                             set: { v in model.updateSettings { $0.breachCheckEnabled = v } }))
                 .toggleStyle(.switch)
-            Text("When on, \(Product.name) checks each password when you save it, after you unlock (at most once a day per password), and as you type or generate one. Privacy: it uses Have I Been Pwned's k-anonymity range API, so only the first 5 characters of the password's SHA-1 hash leave this Mac. The password and the full hash never do, and the server can't tell which of the hundreds of matching hashes was yours. Results are kept hashed inside the encrypted vault.")
+            Text("When on, \(Product.name) checks each password when you save it, after you unlock (at most once a day per password), and as you type or generate one. Privacy: it uses Have I Been Pwned's Pwned Passwords service. Only the first 5 characters of a scrambled fingerprint of the password leave this Mac; the password never does, and the service can't tell which of the hundreds of matching fingerprints was yours. Results are kept scrambled inside the encrypted vault.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .card()
@@ -118,7 +118,7 @@ struct VaultSettingsView: View {
             if !newMaster.isEmpty { StrengthMeter(strength: PasswordStrength.evaluate(newMaster)) }
             Text("Encrypted backups: \(model.store.backups().count) of the last \(VaultStore.maxBackups) kept in \(model.store.backupDirectory.path(percentEncoded: false)). Each opens with the master password that was current when it was made.")
                 .font(.caption).foregroundStyle(.secondary)
-            Text("Key derivation: PBKDF2-HMAC-SHA256, \((model.store.kdfIterations ?? 0).formatted()) iterations (tuned to about 0.3 s on this Mac). Items: AES-256-GCM, each sealed separately; the file is authenticated with HMAC-SHA256.")
+            Text("Each item is encrypted separately, the whole file is checked for tampering, and your master password is stretched so guessing it is slow.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .card()

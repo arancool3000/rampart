@@ -3,6 +3,7 @@ import AppKit
 import Observation
 import UniformTypeIdentifiers
 import RampartVault
+import RampartShared
 import LocalAuthentication
 
 /// State for the Passwords screen. One shared instance so the lock state survives sidebar navigation.
@@ -11,6 +12,8 @@ import LocalAuthentication
 @Observable
 final class PasswordsModel {
     static let shared = PasswordsModel()
+    /// The lock screen auto-offers Touch ID once per launch.
+    static var didAutoPromptTouchID = false
 
     enum Phase { case noVault, locked, unlocked }
     enum Tab: String, CaseIterable, Identifiable {
@@ -42,6 +45,12 @@ final class PasswordsModel {
     var touchIDEnabled = false
     var touchIDMode: TouchIDUnlock.Mode?
     var availability = TouchIDUnlock.availability()
+    /// Set after a master-password unlock while Touch ID is available but off (cleared by "Not Now").
+    var touchIDOfferDismissed = false
+    @ObservationIgnored private var unlockedWithMaster = false
+    /// Touch ID passed but the security-chip key failed: switch to compatibility mode after the next master unlock.
+    @ObservationIgnored private var touchIDNeedsRepair = false
+    var offerTouchID: Bool { phase == .unlocked && unlockedWithMaster && !touchIDEnabled && availability.biometryAvailable && !touchIDOfferDismissed && !Headless.active }
     var audit: VaultAudit?
     var auditRunning = false
     var auditNote: String?
@@ -71,6 +80,8 @@ final class PasswordsModel {
         phase = !store.exists ? .noVault : (store.isUnlocked ? .unlocked : .locked)
         touchIDEnabled = touchID.isEnabled
         touchIDMode = touchID.mode
+        // Re-check each time (lid closed, keyboard connected, fingers enrolled since launch). No prompt.
+        if !Headless.active { availability = TouchIDUnlock.availability() }
     }
 
     // MARK: Lock / unlock
@@ -94,14 +105,32 @@ final class PasswordsModel {
         }.value
         busy = false
         if let result { error = result.localizedDescription; return }
+        unlockedWithMaster = true
         didUnlock()
+        repairTouchIDIfNeeded()
+    }
+
+    /// After the security chip refused the key, re-enrol Touch ID in compatibility (keychain) mode.
+    private func repairTouchIDIfNeeded() {
+        guard touchIDNeedsRepair, !Headless.active else { return }
+        touchIDNeedsRepair = false
+        do {
+            _ = try touchID.enable(forceMode: .keychainGated)
+            flash("Touch ID was switched to compatibility mode, so it works on this Mac.")
+        } catch { self.error = "Touch ID couldn't be set up: \(error.localizedDescription)" }
+        refreshPhase()
     }
 
     func unlockWithTouchID() async {
         guard !Headless.active else { return }
         error = nil
-        do { try await touchID.unlock(); didUnlock() }
+        do { try await touchID.unlock(); unlockedWithMaster = false; didUnlock() }
         catch VaultError.cancelled { }
+        catch VaultError.secureEnclaveFailed(let why) {
+            touchIDNeedsRepair = true
+            self.error = "Touch ID recognised you, but this Mac's security chip couldn't open the vault key (\(why)). Unlock with your master password once and \(Product.name) will fix Touch ID automatically."
+            refreshPhase()
+        }
         catch { self.error = error.localizedDescription; refreshPhase() }
     }
 
@@ -121,7 +150,7 @@ final class PasswordsModel {
         generatorHistory.clear(); clipboardDeadline = nil
         ClipboardGuard.shared.clearIfOurs()
         store.lock()
-        items = []; editing = nil; selection = nil; audit = nil; search = ""
+        items = []; editing = nil; selection = nil; audit = nil; search = ""; unlockedWithMaster = false
         meta = VaultMeta()
         refreshPhase()
     }
@@ -303,7 +332,7 @@ final class PasswordsModel {
         if on {
             do {
                 let mode = try touchID.enable()
-                flash(mode == .secureEnclave ? "Touch ID is on, protected by the Secure Enclave." : "Touch ID is on (keychain mode).")
+                flash(mode == .secureEnclave ? "Touch ID is on, protected by your Mac's security chip." : "Touch ID is on (compatibility mode).")
             } catch { self.error = error.localizedDescription }
         } else {
             touchID.disable()
@@ -413,7 +442,7 @@ final class PasswordsModel {
     func exportAuthenticator(password: String) async {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "RamPart Authenticator.rpexport"
-        panel.message = "The export is encrypted with the password you chose (AES-256-GCM, PBKDF2)."
+        panel.message = "The export is encrypted with the password you chose."
         guard panel.runModal() == .OK, let url = panel.url else { return }
         busy = true
         let auth = authenticatorItems
@@ -450,7 +479,7 @@ final class PasswordsModel {
     func exportEncrypted(password: String) async {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "RamPart Passwords.rpexport"
-        panel.message = "The export is encrypted with the password you chose (AES-256-GCM, PBKDF2)."
+        panel.message = "The export is encrypted with the password you chose."
         guard panel.runModal() == .OK, let url = panel.url else { return }
         busy = true
         let items = items, folders = meta.folders

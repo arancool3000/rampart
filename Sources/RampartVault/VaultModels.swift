@@ -218,7 +218,7 @@ public struct VaultMeta: Codable, Hashable, Sendable {
 
 public enum VaultError: Error, LocalizedError, Equatable {
     case noVault, alreadyExists, locked, wrongPassword, tampered, unsupportedVersion(Int), badFormat(String)
-    case attachmentTooLarge, io(String), weakMasterPassword, biometry(String), biometryChanged, keychain(Int32), cancelled
+    case attachmentTooLarge, io(String), weakMasterPassword, biometry(String), biometryChanged, keychain(Int32), cancelled, secureEnclaveFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -236,6 +236,7 @@ public enum VaultError: Error, LocalizedError, Equatable {
         case .biometryChanged: return "Your Touch ID fingerprints changed, so Touch ID unlock was turned off. Unlock with your master password to turn it on again."
         case .keychain(let s): return "Keychain error \(s): " + ((SecCopyErrorMessageString(s, nil) as String?) ?? "unknown")
         case .cancelled: return "Cancelled."
+        case .secureEnclaveFailed(let s): return "This Mac's security chip couldn't open the vault key (\(s)). Unlock with your master password."
         }
     }
 }

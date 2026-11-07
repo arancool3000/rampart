@@ -178,10 +178,9 @@ public final class TouchIDUnlock: @unchecked Sendable {
                 try await ctx.evaluatePolicy(policy, localizedReason: reason)
             }
         } catch let e as LAError {
-            switch e.code {
-            case .userCancel, .userFallback, .systemCancel, .appCancel: throw VaultError.cancelled
-            default: throw VaultError.biometry(e.localizedDescription)
-            }
+            throw Self.plain(e)
+        } catch {
+            throw VaultError.biometry("Touch ID didn't work: \(error.localizedDescription)")
         }
         if let saved = r.domainState, let now = Self.domainState(ctx), saved != now {
             disable(); throw VaultError.biometryChanged
@@ -200,8 +199,12 @@ public final class TouchIDUnlock: @unchecked Sendable {
                 key = SecretKeyBytes(data: raw)
                 secureZero(&raw)
             } catch {
-                // The SE refuses invalidated keys (fingerprints changed) — fall back to the master password.
-                disable(); throw VaultError.biometryChanged
+                // Invalidated keys (fingerprints changed) are refused by the SE. If the enrolment is unchanged,
+                // it's a different runtime failure (e.g. an ad-hoc build the SE won't serve): keep the record and
+                // report it, so the app can switch to keychain mode after a master-password unlock.
+                let now = Self.domainState(ctx)
+                if let saved = r.domainState, let now, saved != now { disable(); throw VaultError.biometryChanged }
+                throw VaultError.secureEnclaveFailed((error as NSError).localizedDescription)
             }
         case .keychainGated:
             guard var raw = try Keychain.readGeneric(service: Self.keychainService, account: r.vaultID.uuidString) else {
@@ -211,6 +214,19 @@ public final class TouchIDUnlock: @unchecked Sendable {
             secureZero(&raw)
         }
         try store.unlock(vaultKey: key)
+    }
+
+    /// Touch ID errors in plain words.
+    static func plain(_ e: LAError) -> VaultError {
+        switch e.code {
+        case .userCancel, .userFallback, .systemCancel, .appCancel: return .cancelled
+        case .biometryLockout: return .biometry("Touch ID is locked after too many tries. Unlock your Mac with its password, then try again, or use your master password.")
+        case .biometryNotEnrolled: return .biometry("No fingerprints are set up. Add one in System Settings › Touch ID & Password.")
+        case .biometryNotAvailable: return .biometry("Touch ID isn't available right now (is the lid closed or the Touch ID keyboard disconnected?). Use your master password.")
+        case .authenticationFailed: return .biometry("Touch ID didn't recognise that fingerprint. Try again or use your master password.")
+        case .notInteractive: return .biometry("Touch ID can't ask right now because RamPart isn't the active window. Click the window and try again.")
+        default: return .biometry("Touch ID didn't work (\(e.localizedDescription)). Use your master password.")
+        }
     }
 
     /// Self-test helper: SE wrap/unwrap round trip with an access control WITHOUT biometry flags,
