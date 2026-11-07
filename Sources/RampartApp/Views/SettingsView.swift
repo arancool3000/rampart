@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UserNotifications
 import RampartShared
 
 enum SettingsTab: String, CaseIterable, Identifiable {
@@ -16,7 +17,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .notifications: return "alerts sounds threats finished"
         case .updates: return "definitions xprotect version automatic check"
         case .privacy: return "data statistics upload breach"
-        case .account: return "plan subscription renew price devices"
+        case .account: return "account free version about"
         case .advanced: return "developer logs diagnostics health uninstall allow rules data folder finder full protection"
         }
     }
@@ -165,6 +166,23 @@ extension AppModel {
     func resetSettings(_ apply: @escaping (inout RampartSettings, RampartSettings) -> Void) {
         let d = RampartSettings()
         updateSettings { apply(&$0, d) }
+    }
+
+    /// App-only preferences cleared by "Reset all settings". Onboarding, login-item state and internal
+    /// bookkeeping (rate limits, splash) are deliberately left alone.
+    static let resettableDefaultsKeys = [
+        "general.showDock", "general.textSize", ChromeState.menuBarKey, "notif.sounds", "scan.lowImpact",
+        "dashboard.basicCardDismissed", "sidebar.toolsExpanded", "safari.autoReenable", "safari.jsControl",
+        PermissionsModel.networkScanEnabledKey, PermissionsModel.safariSetupEnabledKey,
+    ]
+
+    /// Sends a fresh `RampartSettings()` to the service and clears app-only preferences.
+    func resetAllSettings() {
+        updateSettings { $0 = RampartSettings() }
+        let d = UserDefaults.standard
+        for k in Self.resettableDefaultsKeys { d.removeObject(forKey: k) }
+        ChromeState.shared.setMenuBarInserted(true)
+        if !Headless.active { NSApp.setActivationPolicy(.regular) }
     }
 }
 
@@ -316,7 +334,8 @@ struct NotificationSettings: View {
                     HStack {
                         Label("Notifications are off for \(Product.name) in System Settings.", systemImage: "bell.slash")
                         Spacer()
-                        Button("Allow…") { Task { authorized = await Notifier.shared.requestAuthorization() } }
+                        Button("Allow…") { Task { authorized = await Notifier.shared.allowOrOpenSettings() } }
+                            .help("Asks macOS for permission, or opens Notifications in System Settings if you turned them off there.")
                     }
                 }
             }
@@ -334,6 +353,15 @@ struct NotificationSettings: View {
                 }
             }
         }
+        .task { await refreshAuthorization() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await refreshAuthorization() }
+        }
+    }
+
+    private func refreshAuthorization() async {
+        guard let st = await Notifier.shared.authorizationStatus() else { return }
+        authorized = st == .authorized || st == .provisional
     }
 }
 
@@ -373,22 +401,17 @@ struct PrivacySettings: View {
     }
 }
 
-/// The only place in the app where plans or pricing appear.
+/// No accounts, plans or prices: RamPart is free while it's in development.
 struct AccountSettings: View {
-    @Environment(\.openURL) private var openURL
     var body: some View {
         Form {
-            Section("Plan") {
-                LabeledContent("Plan", value: "\(Product.name) Personal")
-                LabeledContent("Price", value: "$29.99 per year")
-                LabeledContent("Renews", value: Calendar.current.date(byAdding: .month, value: 10, to: Date())!.formatted(date: .long, time: .omitted))
-                LabeledContent("Devices", value: "1 of 3 Macs")
-            }
             Section {
-                Button("Manage Subscription…") { openURL(URL(string: "https://rampart.app/account")!) }
-                Button("Turn Off Auto-Renew…") { openURL(URL(string: "https://rampart.app/account/renewal")!) }
-            } footer: {
-                Text("Your protection and Security Score never depend on your plan.").foregroundStyle(.secondary)
+                Label("\(Product.name) is free while in development.", systemImage: "heart")
+                Text("There's no account, subscription or sign-in. Every feature is available, and nothing is limited.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            Section("About") {
+                LabeledContent("Version", value: Product.version).textSelection(.enabled)
             }
         }
     }
@@ -397,6 +420,7 @@ struct AccountSettings: View {
 struct AdvancedSettings: View {
     @Environment(AppModel.self) private var model
     @StateVar private var confirmReset = false
+    @StateVar private var confirmResetAll = false
     @StateVar private var showUninstall = false
     @StateVar private var showInstall = false
     private var dataFolder: URL {
@@ -432,11 +456,18 @@ struct AdvancedSettings: View {
                 }
             }
             Section {
+                Button("Reset All Settings to Defaults…") { confirmResetAll = true }
+                    .help("Puts every setting back the way it was when you installed \(Product.name). Your rules, quarantine and history are kept.")
                 Button("Remove All Allow Rules…", role: .destructive) { confirmReset = true }.disabled(model.allowRules.isEmpty)
                 Button("Uninstall \(Product.name)…") { showUninstall = true }
             }
         }
         .sheet(isPresented: $showInstall) { InstallFullProtectionSheet() }
+        .confirmationDialog("Reset all settings to defaults?", isPresented: $confirmResetAll) {
+            Button("Reset All Settings", role: .destructive) { model.resetAllSettings() }
+        } message: {
+            Text("Protection, scan, notification, network and app settings go back to their defaults, and scan exclusions are cleared. Allow rules, quarantined items and history are kept.")
+        }
         .confirmationDialog("Remove all allow rules?", isPresented: $confirmReset) {
             Button("Remove All", role: .destructive) { Task { for r in model.allowRules { await model.removeAllowRule(r) } } }
         } message: { Text("Every allowed file, developer and folder will be checked normally again. This can't be undone.") }

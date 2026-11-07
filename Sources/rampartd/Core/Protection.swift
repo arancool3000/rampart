@@ -123,12 +123,14 @@ final class Protection {
     func status() -> ProtectionStatus {
         let rt = services.realtime
         let st = state.value
-        return ProtectionStatus(realtimeOn: rt?.isRunning ?? false, sources: rt?.sources ?? [:],
+        var status = ProtectionStatus(realtimeOn: rt?.isRunning ?? false, sources: rt?.sources ?? [:],
                                 webProtectionOn: services.web?.isOn ?? false,
                                 fullDiskAccess: Util.hasFullDiskAccess, lastScan: st.lastScan,
                                 signatureVersion: services.scanner.signatureVersion,
                                 xprotectVersion: Util.xprotectVersion, securityScore: st.securityScore,
                                 openDetections: store.openCount)
+        status.definitionsUpdated = st.lastUpdate
+        return status
     }
 
     func posture() throws -> [PostureCheck] {
@@ -166,8 +168,14 @@ final class Protection {
     func updateSignatures() -> String {
         guard let u = services.updater else { return "no updatable engines in this build" }
         let summary = u.update()
-        state.update { $0.lastUpdate = Date(); $0.lastUpdateSummary = summary }
-        activity.add(.update, "Protection updated", detail: summary, outcome: summary.contains("failed") ? "partial" : "ok")
+        let failed: Bool = {
+            let s = summary.lowercased()
+            return s.contains("failed") || s.contains("offline") || s.contains("could not connect") || s.contains("timed out")
+        }()
+        // Only record a successful update time, so "updated never" stays accurate after offline attempts.
+        state.update { if !failed { $0.lastUpdate = Date() }; $0.lastUpdateSummary = summary }
+        activity.add(.update, failed ? "Protection partly updated" : "Protection updated", detail: summary,
+                     outcome: failed ? "will retry" : "ok", severity: .info)
         logInfo("update: \(summary)")
         return summary
     }

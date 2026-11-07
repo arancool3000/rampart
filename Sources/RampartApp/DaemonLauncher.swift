@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import ServiceManagement
 import RampartShared
 
@@ -40,6 +41,39 @@ final class DaemonLauncher {
         if Headless.active && Self.rootOverride == nil { return nil }
         let u = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/rampartd")
         return FileManager.default.isExecutableFile(atPath: u.path) ? u : nil
+    }
+
+    /// Where the bundled helper should be. Used to say exactly what's missing.
+    var expectedHelperPath: String { Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/rampartd").path }
+    var helperMissing: Bool { Self.arg("--helper") == nil && !Headless.active && helperURL == nil }
+
+    var missingHelperMessage: String {
+        let path = (expectedHelperPath as NSString).abbreviatingWithTildeInPath
+        return "The protection service file is missing from this copy of \(Product.name): \(path). It may have been deleted or not copied. Reinstalling \(Product.name) puts it back."
+    }
+
+    /// A downloaded RamPart disk image, newest first: in Downloads or next to this copy of the app.
+    var installerDMG: URL? {
+        let fm = FileManager.default
+        let dirs = [fm.homeDirectoryForCurrentUser.appendingPathComponent("Downloads"), Bundle.main.bundleURL.deletingLastPathComponent()]
+        var found: [(URL, Date)] = []
+        for d in dirs {
+            guard let items = try? fm.contentsOfDirectory(at: d, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            for u in items where u.pathExtension.lowercased() == "dmg" && u.lastPathComponent.lowercased().hasPrefix("rampart") {
+                let date = (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                found.append((u, date))
+            }
+        }
+        return found.max { $0.1 < $1.1 }?.0
+    }
+
+    /// "Reinstall RamPart": reveals the disk image in Finder when we can find one. Returns false otherwise,
+    /// so the caller can explain how to get a fresh copy.
+    @discardableResult
+    func revealInstaller() -> Bool {
+        guard let dmg = installerDMG else { return false }
+        NSWorkspace.shared.activateFileViewerSelecting([dmg])
+        return true
     }
 
     var isInstalledCopy: Bool { Bundle.main.bundlePath.hasPrefix("/Applications/") }

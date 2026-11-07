@@ -192,3 +192,45 @@ public struct PasswordStrength: Hashable, Sendable {
         return d
     }()
 }
+
+extension PasswordStrength {
+    /// Long-form duration: "about 3 million years", "longer than the age of the universe".
+    public static func describeLong(seconds s: Double) -> String {
+        let year = 86400 * 365.25
+        if s < 1 { return "instantly" }
+        if s < 100 * year { return "about " + describe(seconds: s) }
+        let y = s / year
+        if y > 1.4e10 { return "longer than the age of the universe" }
+        for (scale, word) in [(1e9, "billion"), (1e6, "million"), (1e3, "thousand")] where y >= scale {
+            return "about \(Int(y / scale)) \(word) years"
+        }
+        return "about \(Int(y)) years"
+    }
+
+    /// Plain-language explanation against a fast offline attack (10 billion guesses a second).
+    public var crackTimeSentence: String {
+        let t = Self.describeLong(seconds: offlineFastSeconds)
+        return t == "instantly"
+            ? "Could be cracked instantly by a computer guessing 10 billion times a second."
+            : "Would take \(t) to crack at 10 billion guesses a second (a stolen, fast-hashed database)."
+    }
+}
+
+/// The last 10 generated passwords, in memory only (never written to disk; cleared on lock).
+public struct GeneratorHistory: Sendable {
+    public struct Entry: Hashable, Sendable, Identifiable {
+        public var id = UUID()
+        public var password: String
+        public var date: Date
+    }
+    public static let capacity = 10
+    public private(set) var entries: [Entry] = []
+    public init() {}
+    public mutating func add(_ password: String, date: Date = Date()) {
+        guard !password.isEmpty else { return }
+        entries.removeAll { $0.password == password }
+        entries.insert(Entry(password: password, date: date), at: 0)
+        if entries.count > Self.capacity { entries.removeLast(entries.count - Self.capacity) }
+    }
+    public mutating func clear() { entries = [] }
+}

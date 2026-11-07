@@ -44,8 +44,18 @@ final class Scheduler {
            Date().timeIntervalSince(started) > 600, Self.dailyDue(hour: cfg.scheduledScanHour, last: st.lastQuickScan) {
             run("quickScan") { [p] in _ = p.scan(paths: [], quick: true, progress: { _, _, _ in }) }
         }
-        if allowNetworkUpdates, cfg.autoUpdate, due("update", every: cfg.signatureUpdateHours * 3600, last: st.lastUpdate, initialDelay: 120) {
-            run("update") { [p] in _ = p.updateSignatures() }
+        // Definitions: soon after the first start (never updated yet), then at least daily. Network
+        // failures are quiet: logged, retried within the hour, never shown as an alert.
+        let updateEvery = Self.updateInterval(hours: cfg.signatureUpdateHours)
+        if allowNetworkUpdates, cfg.autoUpdate, updateEvery > 0,
+           due("update", every: updateEvery, last: st.lastUpdate, initialDelay: st.lastUpdate == nil ? 45 : 120) {
+            run("update") { [weak self, p] in
+                let summary = p.updateSignatures()
+                if Self.updateFailed(summary) {
+                    logInfo("definitions update incomplete (network?); retrying within the hour")
+                    self?.q.async { self?.lastRun["update"] = Date().addingTimeInterval(min(3600, updateEvery) - updateEvery) }
+                }
+            }
         }
         if due("persistence", every: cfg.persistenceCheckMinutes * 60, last: nil, initialDelay: 60) {
             run("persistence") { [p] in _ = try? p.persistence() }
@@ -57,6 +67,17 @@ final class Scheduler {
         if due("purge", every: 86400, last: nil, initialDelay: 300) {
             run("purge") { [p] in p.services.quarantine.purgeExpired() }
         }
+    }
+
+    /// Update cadence in seconds: the configured hours, capped at daily; 0 disables.
+    static func updateInterval(hours: Double) -> TimeInterval {
+        guard hours > 0 else { return 0 }
+        return min(hours, 24) * 3600
+    }
+
+    static func updateFailed(_ summary: String) -> Bool {
+        let s = summary.lowercased()
+        return s.contains("failed") || s.contains("offline") || s.contains("could not connect") || s.contains("timed out")
     }
 
     /// True when the most recent occurrence of `hour`:00 is after `last` (missed runs catch up once).

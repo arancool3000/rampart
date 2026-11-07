@@ -129,6 +129,9 @@ struct DashboardView: View {
                         }
                     }
                     .controlSize(.large)
+                    if case .serviceDown = model.overall, DaemonLauncher.shared.helperMissing {
+                        ReinstallButton().controlSize(.large)
+                    }
                     Text("Definitions \(model.status.signatureVersion == "0" ? "" : model.status.signatureVersion + " · ")updated \(Fmt.ago(model.definitionsUpdated).lowercased())")
                         .font(.callout).foregroundStyle(.secondary)
                         .help(model.definitionsUpdated.map { "Definitions last updated \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "Definitions haven't been updated yet")

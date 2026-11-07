@@ -6,9 +6,11 @@ import RampartShared
 /// module can't import): only the first 5 hex characters of the SHA-1 leave the Mac, and
 /// `Add-Padding: true` hides the true response size. Opt-in only.
 public final class BreachChecker: @unchecked Sendable {
+    /// Fetches the range body for a 5-hex-character SHA-1 prefix. Injectable for tests (no network).
+    public typealias RangeFetcher = @Sendable (_ prefix: String) async throws -> String
     public let baseURL: URL
-    private let session: URLSession
-    private var cache: [String: String] = [:]   // prefix -> body
+    private let fetcher: RangeFetcher
+    private var cache: [String: String] = [:]   // prefix -> body (in memory only)
     private let lock = NSLock()
 
     public init(baseURL: URL = URL(string: "https://api.pwnedpasswords.com/range/")!) {
@@ -16,8 +18,25 @@ public final class BreachChecker: @unchecked Sendable {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 15
         cfg.urlCache = nil
-        session = URLSession(configuration: cfg)
+        let session = URLSession(configuration: cfg)
+        fetcher = { prefix in
+            var req = URLRequest(url: baseURL.appendingPathComponent(prefix))
+            req.setValue("true", forHTTPHeaderField: "Add-Padding")
+            req.setValue("RamPart/\(Product.version)", forHTTPHeaderField: "User-Agent")
+            let (data, resp) = try await session.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                throw VaultError.io("Breach check failed (HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)).")
+            }
+            return String(decoding: data, as: UTF8.self)
+        }
     }
+
+    public init(fetcher: @escaping RangeFetcher) {
+        baseURL = URL(string: "https://invalid.test/")!
+        self.fetcher = fetcher
+    }
+
+    public func clearCache() { lock.withLock { cache = [:] } }
 
     public static func sha1Hex(_ password: String) -> String {
         Insecure.SHA1.hash(data: Data(password.utf8)).map { String(format: "%02X", $0) }.joined()
@@ -38,15 +57,9 @@ public final class BreachChecker: @unchecked Sendable {
     public func breachCount(for password: String) async throws -> Int {
         let hash = Self.sha1Hex(password)
         let prefix = String(hash.prefix(5)), suffix = String(hash.dropFirst(5))
+        precondition(prefix.count == 5)
         if let body = lock.withLock({ cache[prefix] }) { return Self.count(in: body, suffix: suffix) }
-        var req = URLRequest(url: baseURL.appendingPathComponent(prefix))
-        req.setValue("true", forHTTPHeaderField: "Add-Padding")
-        req.setValue("RamPart/\(Product.version)", forHTTPHeaderField: "User-Agent")
-        let (data, resp) = try await session.data(for: req)
-        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-            throw VaultError.io("Breach check failed (HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)).")
-        }
-        let body = String(decoding: data, as: UTF8.self)
+        let body = try await fetcher(prefix)
         guard let first = body.split(whereSeparator: \.isNewline).first, first.split(separator: ":").first?.count == 35 else {
             throw VaultError.io("Breach check got an unexpected response (a web filter may be blocking api.pwnedpasswords.com).")
         }
@@ -58,7 +71,7 @@ public final class BreachChecker: @unchecked Sendable {
 /// Security audit of the vault and its health score.
 public struct VaultAudit: Sendable {
     public enum Issue: String, Sendable, CaseIterable, Identifiable {
-        case breached, weak, reused, old, no2FA
+        case breached, weak, reused, old, no2FA, passkey
         public var id: String { rawValue }
         public var title: String {
             switch self {
@@ -67,6 +80,7 @@ public struct VaultAudit: Sendable {
             case .reused: return "Reused passwords"
             case .old: return "Not changed in over a year"
             case .no2FA: return "Two-factor available but not set up"
+            case .passkey: return "Passkeys available"
             }
         }
         public var symbol: String {
@@ -76,10 +90,11 @@ public struct VaultAudit: Sendable {
             case .reused: return "arrow.triangle.2.circlepath"
             case .old: return "calendar.badge.clock"
             case .no2FA: return "person.badge.key"
+            case .passkey: return "person.badge.shield.checkmark"
             }
         }
         public var weight: Double {
-            switch self { case .breached: return 1.0; case .weak: return 0.8; case .reused: return 0.7; case .old: return 0.25; case .no2FA: return 0.2 }
+            switch self { case .breached: return 1.0; case .weak: return 0.8; case .reused: return 0.7; case .old: return 0.25; case .no2FA: return 0.2; case .passkey: return 0 }
         }
         public var advice: String {
             switch self {
@@ -88,6 +103,7 @@ public struct VaultAudit: Sendable {
             case .reused: return "If one site leaks, every account sharing the password is at risk. Give each its own."
             case .old: return "Consider rotating important passwords you haven't changed in a year."
             case .no2FA: return "These sites support two-factor authentication. Turn it on and store the code here."
+            case .passkey: return "These sites let you sign in with a passkey instead of a password. Optional, but phishing-resistant."
             }
         }
     }
@@ -102,6 +118,18 @@ public struct VaultAudit: Sendable {
     public func items(_ issue: Issue) -> [UUID] { findings[issue] ?? [] }
 
     public static let oldAfter: TimeInterval = 365 * 86400
+
+    /// Issues that count as problems (passkey availability is an opportunity, not a problem).
+    public static let problems: [Issue] = [.breached, .weak, .reused, .old, .no2FA]
+    public var problemItemCount: Int { Set(Self.problems.flatMap { items($0) }).count }
+
+    /// Sites known to support passkeys (a small built-in list that may be out of date; absent ≠ unsupported).
+    public static let passkeyDomains: Set<String> = [
+        "google.com", "gmail.com", "youtube.com", "apple.com", "icloud.com", "microsoft.com", "live.com", "outlook.com",
+        "github.com", "amazon.com", "paypal.com", "ebay.com", "x.com", "twitter.com", "tiktok.com", "yahoo.com",
+        "dropbox.com", "nintendo.com", "playstation.com", "uber.com", "coinbase.com", "binance.com", "shopify.com",
+        "kayak.com", "linkedin.com", "adobe.com", "cloudflare.com", "npmjs.com", "roblox.com", "whatsapp.com",
+        "1password.com", "bitwarden.com", "docusign.com", "okta.com", "gitlab.com"]
 
     /// Sites known to offer 2FA (a small built-in list; absent ≠ unsupported).
     public static let twoFactorDomains: Set<String> = [
@@ -131,6 +159,7 @@ public struct VaultAudit: Sendable {
             if now.timeIntervalSince(i.passwordModified ?? i.created) > oldAfter { f[.old, default: []].append(i.id) }
             if let d = i.primaryDomain, twoFactorDomains.contains(d), i.totp == nil { f[.no2FA, default: []].append(i.id) }
             if (breachCounts[i.id] ?? 0) > 0 { f[.breached, default: []].append(i.id) }
+            if let d = i.primaryDomain, passkeyDomains.contains(d) { f[.passkey, default: []].append(i.id) }
         }
         f[.reused] = byPassword.values.filter { $0.count > 1 }.flatMap { $0 }
         if f[.reused]?.isEmpty == true { f[.reused] = nil }

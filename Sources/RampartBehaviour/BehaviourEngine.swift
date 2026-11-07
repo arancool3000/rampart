@@ -117,6 +117,13 @@ public final class BehaviourEngine: @unchecked Sendable {
         return dedupe(out)
     }
 
+    /// Assesses records without scoring or touching story state (baseline review lists).
+    public func reviewPersistence(_ records: [PersistenceRecord]) -> [(record: PersistenceRecord, finding: PersistenceFinding)] {
+        lock.lock(); defer { lock.unlock() }
+        let assessor = PersistenceAssessor(trust: { [trustEval] in trustEval.trust(path: $0) }, knownTeamIDs: config.knownTeamIDs)
+        return records.flatMap { r in assessor.assess(r).map { (r, $0) } }
+    }
+
     /// Scores persistence records found by a scheduled scan (added and changed items from the differ).
     public func evaluatePersistence(added: [PersistenceRecord], changed: [PersistenceChange] = [], date: Date = Date()) -> [Detection] {
         lock.lock(); defer { lock.unlock() }
@@ -382,6 +389,15 @@ public final class BehaviourEngine: @unchecked Sendable {
 
     // MARK: built-ins
 
+    /// The user's own signed GUI app (an .app bundle, not root, not unsigned/ad-hoc).
+    func isTrustedGUIActor(_ ctx: Context) -> Bool {
+        guard let ip = ctx.imagePath, ip.contains(".app/Contents/MacOS/") else { return false }
+        if let uid = ctx.event.process?.uid, uid < 500 { return false }
+        let t = trustEval.trust(path: ip, platformHint: ctx.event.process?.isPlatformBinary ?? false,
+                                teamID: ctx.event.process?.teamID, tierHint: ctx.event.detail["signing"])
+        return !t.isUntrusted
+    }
+
     func builtins(_ ctx: Context) -> [PendingHit] {
         let e = ctx.event
         var out: [PendingHit] = []
@@ -398,12 +414,14 @@ public final class BehaviourEngine: @unchecked Sendable {
         // Ransomware family (file events).
         if [.fileWrite, .fileCreate, .fileClose, .fileRename, .fileDelete].contains(e.kind) {
             let key = ctx.node != nil ? ctx.storyKey : "fs"
-            for r in ransomware.observe(e, actorKey: key) { hit(r.ruleID, r.detail, target: r.path, label: r.path) }
+            for r in ransomware.observe(e, actorKey: key, trustedGUIActor: isTrustedGUIActor(ctx)) { hit(r.ruleID, r.detail, target: r.path, label: r.path) }
         }
+        let atomicSave = e.kind == .fileRename && paths.contains(where: RansomwareDetector.isAtomicSaveTemp)
+            && (isTrustedGUIActor(ctx) || e.process == nil)
         // R39 honeytokens.
         if !config.honeytokens.isEmpty {
             let tokens = Set(config.honeytokens.map(PathUtil.canonical))
-            if let t = paths.first(where: { tokens.contains($0) }), e.kind != .exec {
+            if let t = paths.first(where: { tokens.contains($0) }), e.kind != .exec, !atomicSave {
                 hit("R39", "Decoy \(PathUtil.basename(t)) touched (\(e.kind.rawValue)).", label: t)
             } else if e.kind == .exec, let t = tokens.first(where: { ctx.argv.contains($0) }) {
                 hit("R39", "Command line references decoy \(PathUtil.basename(t)).", label: t)
@@ -594,7 +612,8 @@ public final class BehaviourEngine: @unchecked Sendable {
         if nodes.contains(where: { isAllowlisted(node: $0, rule: rule) }) { return nil }
         if h.ctx.node == nil, isAllowlisted(node: nil, rule: rule, path: h.targetPath ?? h.subjectLabel) { return nil }
         let (mult, multWhy, identity) = multiplier(h)
-        let eff = Int(min(100, (Double(rule.score) * mult).rounded()))
+        var eff = Int(min(100, (Double(rule.score) * mult).rounded()))
+        if rule.id == "R07L" { eff = min(eff, 25) }   // log-only by design: never escalated by context multipliers
         guard eff > 0 else { return nil }
         let evidence = Evidence(source: h.source, title: "\(rule.id) \(rule.name)", detail: explain(h, multWhy: multWhy), score: eff)
         let now = h.ctx.event.date

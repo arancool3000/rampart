@@ -113,7 +113,9 @@ extension Protection {
             services.behaviour?.apply(learningMode: cfg.learningMode, developerMode: cfg.developerMode)
             changes.append("learning \(cfg.learningMode ? "on" : "off"), developer mode \(cfg.developerMode ? "on" : "off")")
         }
-        if old.ransomwareCanaries != cfg.ransomwareCanaries { applyCanaries(); changes.append("ransomware canaries \(cfg.ransomwareCanaries ? "on" : "off")") }
+        if old.ransomwareCanaries != cfg.ransomwareCanaries {
+            state.update { $0.canariesOptIn = cfg.ransomwareCanaries ? true : nil }
+            applyCanaries(); changes.append("ransomware canaries \(cfg.ransomwareCanaries ? "on" : "off")") }
         if old.webProtection != cfg.webProtection, let w = services.web {
             do { try w.setOn(cfg.webProtection) } catch { logWarn("web protection: \(error.localizedDescription)") }
             changes.append("web protection \(cfg.webProtection ? "on" : "off")")
@@ -131,24 +133,36 @@ extension Protection {
         return settings()
     }
 
-    /// Plants or removes ransomware canary files according to the setting (opt-in only).
+    /// Plants or removes ransomware canary files according to the setting (explicit opt-in only).
+    /// A config value of `true` without a recorded opt-in (written by an older build) counts as off.
     func applyCanaries() {
+        if runtime.config.ransomwareCanaries && state.value.canariesOptIn != true {
+            runtime.updateConfig { $0.ransomwareCanaries = false }
+            logInfo("ransomware canaries were on without an explicit opt-in; turned off")
+        }
         let on = runtime.config.ransomwareCanaries
         let existing = state.value.canaries ?? []
         if on {
-            guard existing.isEmpty, let b = services.behaviour else {
-                if !existing.isEmpty { _ = services.behaviour?.plantCanaries(in: []) }
-                return
-            }
+            guard let b = services.behaviour else { return }
             let dirs = Util.homeDirectories().flatMap { h in ["Documents", "Desktop", "Pictures"].map { h + "/" + $0 } }
                 .filter { FileManager.default.fileExists(atPath: $0) }
+            // Plants missing ones and (re)registers existing ones so they're watched after a restart.
             let planted = b.plantCanaries(in: dirs)
-            state.update { $0.canaries = planted }
-            logInfo("planted \(planted.count) ransomware canary file(s)")
+            state.update { $0.canaries = Array(Set(existing + planted)).sorted() }
+            logInfo("ransomware canaries active: \(planted.count) file(s)")
         } else if !existing.isEmpty {
-            for p in existing { try? FileManager.default.removeItem(atPath: p) }
+            let removed = services.behaviour?.removeCanaries(existing) ?? Self.removeCanaryFiles(existing)
             state.update { $0.canaries = nil }
-            logInfo("removed \(existing.count) ransomware canary file(s)")
+            logInfo("removed \(removed.count) ransomware canary file(s)")
+        }
+    }
+
+    /// Fallback removal without the behaviour engine: only registry paths still holding the RamPart decoy body.
+    static func removeCanaryFiles(_ paths: [String]) -> [String] {
+        paths.filter { p in
+            guard let d = FileManager.default.contents(atPath: p), String(decoding: d, as: UTF8.self).contains("Rampart ransomware protection file")
+            else { return false }
+            return (try? FileManager.default.removeItem(atPath: p)) != nil
         }
     }
 

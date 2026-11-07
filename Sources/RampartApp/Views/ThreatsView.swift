@@ -426,14 +426,16 @@ struct DetectionInspector: View {
         .font(.callout)
     }
 
-    /// True only when the evidence records that a process stop actually succeeded.
+    /// True only when the evidence records that RamPart's own process stop actually succeeded
+    /// (the daemon's remediation result, e.g. "killed 2 process(es)"). Detector wording such as
+    /// "stopped" in a rule description is not proof, so it doesn't count.
     private var processStopped: Bool {
         guard let d = detection else { return false }
         return d.evidence.contains { e in
             let t = (e.title + " " + e.detail).lowercased()
-            let said = ["stopped", "terminated", "killed"].contains { t.contains($0) }
-            let failed = ["failed", "couldn't", "could not", "unable", "not stopped"].contains { t.contains($0) }
-            return said && !failed
+            if ["not killed", "failed", "couldn't", "could not", "unable", "already gone"].contains(where: { t.contains($0) }) { return false }
+            return t.range(of: #"\bkilled [1-9][0-9]* process"#, options: .regularExpression) != nil
+                || t.range(of: #"\b(process|processes) (was |were )?(stopped|terminated) by "#, options: .regularExpression) != nil
         }
     }
 

@@ -3,7 +3,7 @@
 enum DefaultRules {
     static let json = #"""
 {
-  "version": "2026.11.1",
+  "version": "2026.11.2",
   "lists": {
     "shells": ["(ba|z|da|k|tc|c)?sh", "fish", "pwsh"],
     "interpreters": ["python[0-9.]*", "Python", "perl[0-9.]*", "ruby", "node", "osascript", "php", "tclsh[0-9.]*", "deno", "bun", "lua", "expect"],
@@ -60,6 +60,8 @@ enum DefaultRules {
      ]},
     {"id": "R07", "name": "New launch item runs untrusted code", "type": "strong", "category": "persistence", "score": 70, "stage": "persistence", "subject": "target", "alwaysActive": true, "builtin": true,
      "why": "A new LaunchAgent/LaunchDaemon starts a program that is unsigned, ad-hoc signed, or lives in a temporary or hidden folder."},
+    {"id": "R07L", "name": "Launch item runs your own unsigned script", "type": "weak", "category": "persistence", "score": 25, "stage": "persistence", "subject": "target", "alwaysActive": true, "builtin": true,
+     "why": "A LaunchAgent starts an unsigned script or tool kept in your own home folder, with no sign of malicious behaviour. Logged for review only."},
     {"id": "R08", "name": "Launch item written by a script chain", "type": "sequence", "category": "persistence", "score": 80, "stage": "persistence", "subject": "lineage", "devSensitive": true,
      "why": "A shell or script interpreter descended from a browser, a pasted Terminal command or untrusted code wrote or loaded a launchd plist.",
      "matchers": [

@@ -82,10 +82,10 @@ final class BehaviourControlAdapter: BehaviourControl {
         engine.config.allowlist = BehaviourConfig.defaultAllowlist + entries
     }
     func plantCanaries(in dirs: [String]) -> [String] {
-        let planted = engine.ransomware.plantCanaries(in: dirs)
-        engine.config.honeytokens.formUnion(planted)
-        return planted
+        // Canary documents are covered by R01 (with atomic-save handling); they are not credential honeytokens.
+        engine.ransomware.plantCanaries(in: dirs)
     }
+    func removeCanaries(_ paths: [String]) -> [String] { engine.ransomware.removeCanaries(paths) }
 }
 
 /// RampartBehaviour.PersistenceScanner + snapshot differ + BehaviourEngine.evaluatePersistence.
@@ -142,9 +142,12 @@ final class BehaviourPersistence: PersistenceService {
                 logInfo("persistence diff: +\(diff.added.count) ~\(diff.changed.count) -\(diff.removed.count), \(findings.count) finding(s)")
             }
         } else {
-            // First run: assess everything once so pre-existing risky items surface.
-            findings = engine.evaluatePersistence(added: records)
-            logInfo("persistence baseline: \(records.count) items, \(findings.count) finding(s)")
+            // First run: everything already present is the trusted baseline. Never alert on it; only log
+            // an informational review list (items that would have been flagged as new).
+            let review = engine.reviewPersistence(records)
+            for x in review.prefix(50) { logInfo("persistence baseline review: \(x.finding.ruleID) \(x.record.item.location) (not alerted)") }
+            logInfo("persistence baseline: \(records.count) items trusted, \(review.count) listed for optional review")
+            findings = []
         }
         last = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a }); lastScan = Date()
         do { try current.save(to: snapshotURL) } catch { logWarn("persistence snapshot save failed: \(error)") }

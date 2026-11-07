@@ -13,7 +13,7 @@ final class PasswordsModel {
 
     enum Phase { case noVault, locked, unlocked }
     enum Tab: String, CaseIterable, Identifiable {
-        case vault = "Vault", generator = "Generator", audit = "Security Audit", settings = "Settings"
+        case vault = "Vault", generator = "Generator", audit = "Watchtower", settings = "Settings"
         var id: String { rawValue }
         var symbol: String {
             switch self { case .vault: return "lock.rectangle.stack"; case .generator: return "wand.and.stars"; case .audit: return "checkmark.shield"; case .settings: return "gearshape" }
@@ -44,6 +44,16 @@ final class PasswordsModel {
     var audit: VaultAudit?
     var auditRunning = false
     var auditNote: String?
+    var breachSweepRunning = false
+    /// Last 10 generated passwords, memory only; cleared on lock.
+    var generatorHistory = GeneratorHistory()
+    /// When the copied secret will be cleared from the clipboard (drives the countdown).
+    var clipboardDeadline: Date?
+    var lastBreachSweep: Date?
+    @ObservationIgnored let breachChecker = BreachChecker()
+    @ObservationIgnored private var sweepTask: Task<Void, Never>?
+
+    enum LiveBreach: Equatable { case off, checking, found(Int), clean, failed(String) }
 
     init(store: VaultStore = VaultStore()) {
         self.store = store
@@ -94,10 +104,14 @@ final class PasswordsModel {
         phase = .unlocked
         startAutoLock()
         refreshPhase()
+        startBreachSweep(force: false)
     }
 
     func lock() {
         autoLock?.stop(); autoLock = nil
+        sweepTask?.cancel(); sweepTask = nil; breachSweepRunning = false
+        breachChecker.clearCache()
+        generatorHistory.clear(); clipboardDeadline = nil
         ClipboardGuard.shared.clearIfOurs()
         store.lock()
         items = []; editing = nil; selection = nil; audit = nil; search = ""
@@ -116,6 +130,8 @@ final class PasswordsModel {
     func reload() {
         items = store.items.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         meta = store.meta
+        audit = VaultAudit.run(items: items, breachCounts: BreachMonitor.counts(items: items, cache: meta.breachCache),
+                               checkedBreaches: meta.settings.breachCheckEnabled && !meta.breachCache.entries.isEmpty)
     }
 
     // MARK: Browsing
@@ -153,9 +169,69 @@ final class PasswordsModel {
     func save(_ item: VaultItem) {
         var item = item
         if item.title.trimmingCharacters(in: .whitespaces).isEmpty { item.title = item.primaryDomain ?? item.kind.label }
+        let old = store.item(item.id)?.password
         perform { try self.store.upsert(item) }
         selection = item.id
         editing = nil
+        if !item.password.isEmpty, item.password != old { checkSaved(item.password, title: item.title) }
+    }
+
+    // MARK: Breach monitoring (k-anonymity: only 5 hex chars of the SHA-1 leave the Mac)
+
+    /// Checks every stored password not checked in the last day (or all, when `force`).
+    func startBreachSweep(force: Bool) {
+        guard meta.settings.breachCheckEnabled, phase == .unlocked, !Headless.active, sweepTask == nil else { return }
+        let passwords = BreachMonitor.passwords(in: items), cache = meta.breachCache, checker = breachChecker
+        guard force || !BreachMonitor.due(passwords, cache: cache).isEmpty else { return }
+        breachSweepRunning = true; auditNote = nil
+        sweepTask = Task { [weak self] in
+            let r = await BreachMonitor.sweep(passwords, cache: cache, checker: checker, force: force)
+            guard let self else { return }
+            self.sweepTask = nil; self.breachSweepRunning = false
+            guard !Task.isCancelled, self.phase == .unlocked else { return }
+            self.mergeBreachResults(r.updates)
+            self.lastBreachSweep = Date()
+            if let f = r.failure { self.auditNote = "Breach check incomplete: \(f)" }
+            else if r.found > 0 { self.flash("\(r.found) password\(r.found == 1 ? " was" : "s were") found in known breaches. See Watchtower.") }
+        }
+    }
+
+    private func mergeBreachResults(_ updates: [String: BreachCache.Entry]) {
+        guard !updates.isEmpty, store.isUnlocked else { return }
+        let keep = BreachMonitor.passwords(in: store.items)
+        perform {
+            try self.store.updateMeta { m in
+                for (k, v) in updates { m.breachCache.entries[k] = v }
+                m.breachCache.prune(keeping: keep)
+            }
+        }
+    }
+
+    private func checkSaved(_ password: String, title: String) {
+        guard meta.settings.breachCheckEnabled, !Headless.active, !meta.breachCache.isFresh(password) else { return }
+        let checker = breachChecker, cache = meta.breachCache
+        Task { [weak self] in
+            guard let c = try? await checker.breachCount(for: password), let self, self.phase == .unlocked else { return }
+            self.mergeBreachResults([cache.key(password): .init(count: c, checked: Date())])
+            if c > 0 { self.flash("“\(title)”: \(BreachMonitor.describe(count: c)). Consider changing it.") }
+        }
+    }
+
+    /// Live check while typing. Callers debounce; uses the cache first, never stores the result.
+    func liveBreach(_ password: String) async -> LiveBreach {
+        guard meta.settings.breachCheckEnabled else { return .off }
+        guard !password.isEmpty, !Headless.active else { return .off }
+        if meta.breachCache.isFresh(password), let e = meta.breachCache.result(for: password) { return e.count > 0 ? .found(e.count) : .clean }
+        do { let c = try await breachChecker.breachCount(for: password); return c > 0 ? .found(c) : .clean }
+        catch { return .failed(error.localizedDescription) }
+    }
+
+    /// One-click fix from Watchtower: open the editor with a freshly generated password.
+    func regenerate(_ item: VaultItem) {
+        var i = item
+        i.password = PasswordGenerator.random(meta.settings.generator).password
+        tab = .vault; selection = item.id; editing = i
+        flash("New password generated. Change it on the website too, then Save.")
     }
 
     func delete(_ id: UUID) {
@@ -180,8 +256,11 @@ final class PasswordsModel {
     }
 
     func updateSettings(_ change: @escaping (inout VaultSettings) -> Void) {
+        let wasOn = meta.settings.breachCheckEnabled
         perform { try self.store.updateMeta { change(&$0.settings) } }
         if phase == .unlocked { startAutoLock() }
+        if !meta.settings.breachCheckEnabled { sweepTask?.cancel(); sweepTask = nil; breachSweepRunning = false }
+        else if !wasOn { startBreachSweep(force: false) }
     }
 
     func perform(_ body: () throws -> Void) {
@@ -193,7 +272,17 @@ final class PasswordsModel {
         guard !Headless.active else { return }
         let secs = meta.settings.clipboardClearSeconds
         ClipboardGuard.shared.copy(secret, clearAfter: secs)
+        let deadline: Date? = secs > 0 ? Date().addingTimeInterval(Double(secs)) : nil
+        clipboardDeadline = deadline
+        if let deadline {
+            Task { try? await Task.sleep(for: .seconds(secs)); if clipboardDeadline == deadline { clipboardDeadline = nil } }
+        }
         flash(secs > 0 ? "\(label) copied. Clipboard clears in \(secs) s." : "\(label) copied.")
+    }
+
+    func clearClipboardNow() {
+        guard !Headless.active else { return }
+        ClipboardGuard.shared.clearIfOurs(); clipboardDeadline = nil
     }
 
     func flash(_ text: String) {
@@ -218,15 +307,8 @@ final class PasswordsModel {
     // MARK: Audit
 
     func runAudit(checkBreaches: Bool) async {
-        auditRunning = true; auditNote = nil
-        if checkBreaches && meta.settings.breachCheckEnabled {
-            let (a, failure) = await VaultAudit.runWithBreachCheck(items: items)
-            audit = a
-            auditNote = failure.map { "Breach check incomplete: \($0)" }
-        } else {
-            audit = VaultAudit.run(items: items)
-        }
-        auditRunning = false
+        reload()
+        if checkBreaches { startBreachSweep(force: true) }
     }
 
     // MARK: Import / export

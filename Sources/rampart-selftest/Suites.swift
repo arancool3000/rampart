@@ -16,6 +16,8 @@ extension SelfTest {
             ("vault", SelfTest.vault),
             ("ai", SelfTest.ai),
             ("netscan", SelfTest.netscan),
+            ("publicwifi", SelfTest.publicWiFiChecks),
+            ("fp1", SelfTest.fp1Checks),
         ]
     }
 }

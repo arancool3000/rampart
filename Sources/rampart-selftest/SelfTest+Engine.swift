@@ -81,6 +81,9 @@ extension SelfTest {
         let zipDir = work.appendingPathComponent("com.rampart.test.zipsrc")
         try? fm.createDirectory(at: zipDir, withIntermediateDirectories: true)
         try? eicar.write(to: zipDir.appendingPathComponent("com.rampart.test.inner.txt"))
+        // Unique marker so the cleanup check only looks at unpack dirs this run created.
+        let unpackMarker = "com.rampart.test.run-\(getpid())-\(UUID().uuidString)"
+        try? Data("marker".utf8).write(to: zipDir.appendingPathComponent(unpackMarker))
         let zip = work.appendingPathComponent("com.rampart.test.archive.zip")
         _ = run("/usr/bin/ditto", ["-c", "-k", zipDir.path, zip.path])
         let oz = coord.scanFile(at: zip.path)
@@ -98,9 +101,13 @@ extension SelfTest {
         let tgz = work.appendingPathComponent("com.rampart.test.archive.tgz")
         _ = run("/usr/bin/tar", ["-czf", tgz.path, "-C", zipDir.path, "."])
         check(coord.scanFile(at: tgz.path).detection?.name == EICAR.detectionName, "EICAR inside tar.gz detected")
-        check(FileManager.default.fileExists(atPath: NSTemporaryDirectory() + "rampart-unpack")
-              ? ((try? fm.contentsOfDirectory(atPath: NSTemporaryDirectory() + "rampart-unpack"))?.isEmpty ?? true) : true,
-              "unpack temp dirs cleaned up")
+        let unpackRoot = ArchiveUnpacker().tempRoot
+        let leftovers = ((try? fm.contentsOfDirectory(atPath: unpackRoot)) ?? []).filter { d in
+            let base = (unpackRoot as NSString).appendingPathComponent(d)
+            return [base + "/x/" + unpackMarker, base + "/x/./" + unpackMarker].contains { fm.fileExists(atPath: $0) }
+                || ((fm.enumerator(atPath: base)?.allObjects as? [String]) ?? []).contains { $0.hasSuffix(unpackMarker) }
+        }
+        check(leftovers.isEmpty, "unpack temp dirs cleaned up (\(leftovers.count) left by this run)")
         // DMG (hdiutil create + attach, unprivileged)
         let dmg = work.appendingPathComponent("com.rampart.test.image.dmg")
         if run("/usr/bin/hdiutil", ["create", "-quiet", "-fs", "HFS+", "-srcfolder", zipDir.path, "-format", "UDZO", dmg.path]) == 0 {

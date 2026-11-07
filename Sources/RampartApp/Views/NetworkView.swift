@@ -62,9 +62,30 @@ struct NetworkView: View {
                 }
             }
             Spacer()
+            wifiTrustControls
         }
         .card()
         .accessibilityElement(children: .combine)
+    }
+
+    /// Public Wi-Fi guard controls: "Stay connected" during the grace period, and marking a home network trusted.
+    @ViewBuilder private var wifiTrustControls: some View {
+        let host = PublicWiFiHost.shared
+        VStack(alignment: .trailing, spacing: Spacing.xs) {
+            if let p = host.pendingDisconnect {
+                Text("Disconnecting from \(p.name)…").font(.callout).foregroundStyle(Color.statusAttention)
+                Button("Stay Connected") { host.stayConnected() }.buttonStyle(GlowButtonStyle())
+            }
+            if host.currentNetworkKey != nil {
+                if host.currentIsTrusted {
+                    Button("Not My Home Network") { host.setCurrentTrusted(false) }.buttonStyle(.link).font(.callout)
+                        .help("\(Product.name) will check this network again like any public Wi-Fi.")
+                } else {
+                    Button("This Is My Home Network") { host.setCurrentTrusted(true) }
+                        .help("Trusted networks are never disconnected. Use this only for networks you control.")
+                }
+            }
+        }
     }
 
     private var webProtection: some View {

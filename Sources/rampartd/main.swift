@@ -75,6 +75,7 @@ if let rt = services.realtime as? RealtimePipeline { rt.onPersistenceEvent = { s
 if runtime.config.realtime && !noRealtime { protection.startRealtime() }
 services.behaviour?.apply(learningMode: runtime.config.learningMode, developerMode: runtime.config.developerMode)
 protection.applyCanaries()
+DetectionReevaluator.run(protection, engine: BehaviourWiring.engine)
 if let g = services.guardian {
     g.onDetection = { protection.handle($0) }
     g.startMonitor()

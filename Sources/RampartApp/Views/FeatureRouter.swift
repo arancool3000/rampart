@@ -20,7 +20,7 @@ enum FeatureRouter {
 
 /// Feature services that run in the user session. Kept here so the core app files don't import feature modules.
 enum AppFeatures {
-    @MainActor static func startBackgroundServices() { PasteGuardHost.shared.start(); ScamAIWiring.install() }
+    @MainActor static func startBackgroundServices() { PasteGuardHost.shared.start(); ScamAIWiring.install(); PublicWiFiHost.shared.start() }
     @MainActor static func explain(_ d: Detection) {
         AIChatModel.shared.explain(d)
         AppModel.shared.selection = .aiAssistant

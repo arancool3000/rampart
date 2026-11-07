@@ -9,7 +9,7 @@ import RampartShared
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifier()
 
-    enum Category: String { case threat = "app.rampart.threat", scan = "app.rampart.scan", network = "app.rampart.network", update = "app.rampart.update", weekly = "app.rampart.weekly" }
+    enum Category: String { case threat = "app.rampart.threat", scan = "app.rampart.scan", network = "app.rampart.network", update = "app.rampart.update", weekly = "app.rampart.weekly", wifi = "app.rampart.wifi" }
 
     private let defaults = UserDefaults.standard
     private var lastNonCritical: Date? {
@@ -28,11 +28,35 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let review = UNNotificationAction(identifier: "review", title: "Review", options: [.foreground])
         let allow = UNNotificationAction(identifier: "allow", title: "Allow…", options: [.foreground])
         let threat = UNNotificationCategory(identifier: Category.threat.rawValue, actions: [review, allow], intentIdentifiers: [])
-        center.setNotificationCategories([threat])
+        let stay = UNNotificationAction(identifier: "stayConnected", title: "Stay connected", options: [])
+        let wifi = UNNotificationCategory(identifier: Category.wifi.rawValue, actions: [stay], intentIdentifiers: [])
+        center.setNotificationCategories([threat, wifi])
         center.getNotificationSettings { s in
             let ok = s.authorizationStatus == .authorized || s.authorizationStatus == .provisional
             DispatchQueue.main.async { MainActor.assumeIsolated { Notifier.shared.authorized = ok } }
         }
+    }
+
+    func authorizationStatus() async -> UNAuthorizationStatus? {
+        guard let center else { return nil }
+        return await center.notificationSettings().authorizationStatus
+    }
+
+    /// The "Allow…" button: asks macOS when it hasn't asked yet; otherwise only System Settings can change it.
+    /// Returns true when notifications are now allowed.
+    @discardableResult
+    func allowOrOpenSettings() async -> Bool {
+        let status = await authorizationStatus()
+        if status == .notDetermined { return await requestAuthorization() }
+        if status == .authorized || status == .provisional { authorized = true; return true }
+        let id = Bundle.main.bundleIdentifier ?? "app.rampart.app"
+        let candidates = ["x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(id)",
+                          "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+                          "x-apple.systempreferences:com.apple.preference.notifications"]
+        for c in candidates {
+            if let url = URL(string: c), NSWorkspace.shared.open(url) { break }
+        }
+        return false
     }
 
     func requestAuthorization() async -> Bool {
@@ -83,7 +107,16 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         [.banner, .list]
     }
 
+    /// "Disconnecting from insecure Wi-Fi…" with a "Stay connected" action (PublicWiFiGuard grace period).
+    func wifiDisconnectScheduled(networkName: String, reason: String) {
+        post(.wifi, title: "Disconnecting from insecure Wi-Fi…", body: "\(networkName): \(reason) Choose Stay connected to keep using it.", critical: true)
+    }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        if response.actionIdentifier == "stayConnected" {
+            await MainActor.run { PublicWiFiHost.shared.stayConnected() }
+            return
+        }
         let isThreat = response.notification.request.content.categoryIdentifier == Category.threat.rawValue
         await MainActor.run {
             NSApp.activate(ignoringOtherApps: true)

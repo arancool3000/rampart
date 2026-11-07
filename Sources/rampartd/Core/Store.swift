@@ -76,6 +76,10 @@ struct DaemonState: Codable {
     var restored: [String: String]?
     /// Ransomware canary files we planted (removed when the setting is turned off).
     var canaries: [String]?
+    /// Set only when the user turned canaries on through Settings (explicit opt-in).
+    var canariesOptIn: Bool?
+    /// Product version + rules fingerprint the stored detections were last re-evaluated against.
+    var detectionsEvaluatedFor: String?
     /// DNS blocks per day (yyyy-MM-dd) and the most recent blocked domains.
     var dnsBlocksByDay: [String: Int]?
     var recentBlocks: [String]?

@@ -150,6 +150,64 @@ public struct PersistenceAssessor: Sendable {
         return reasons.joined(separator: ", ")
     }
 
+    /// RamPart's own launch items (app agent, root daemon), by label or target.
+    public static func isRampartOwn(_ r: PersistenceRecord) -> Bool {
+        let label = r.item.label.lowercased()
+        let file = PathUtil.basename(r.item.location).lowercased()
+        let targets = ([r.item.target] + r.arguments.prefix(1).map { Optional($0) }).compactMap { $0 }
+        let ownTarget = targets.allSatisfy { t in
+            t.hasPrefix("/Library/PrivilegedHelperTools/app.rampart.") || t.hasPrefix("/Applications/Rampart.app/Contents/")
+                || t.hasPrefix("/Applications/RamPart.app/Contents/")
+        }
+        return (label.hasPrefix("app.rampart.") || file.hasPrefix("app.rampart.")) && ownTarget && !targets.isEmpty
+    }
+
+    /// True for plain folders in a user's home (not Downloads, hidden, temp or shared).
+    public static func isUserOwnedLocation(_ p: String) -> Bool {
+        switch PathClass.classify(p) {
+        case .home, .developer, .applications: return p.hasPrefix("/Users/") && !p.hasPrefix("/Users/Shared/")
+        default: return false
+        }
+    }
+
+    /// Concrete malicious signs for a launch item target; nil when there are none.
+    func maliciousEvidence(_ r: PersistenceRecord, target t: String) -> String? {
+        let c = PathClass.classify(t)
+        if c.isSuspiciousLocation || c == .downloads || c == .volume || c == .translocated { return "runs from a \(c.rawValue) folder" }
+        if !FileManager.default.fileExists(atPath: t) { return "target missing" }
+        if getxattr(t, "com.apple.quarantine", nil, 0, 0, 0) >= 0 { return "target carries a download quarantine flag" }
+        let label = r.item.label.lowercased()
+        if label.hasPrefix("com.apple.") && trust(t) != .apple { return "Apple-like label with a non-Apple program" }
+        if r.attributes["labelMismatch"] == "1" && label.hasPrefix("com.apple") { return "label imitates Apple" }
+        let line = r.arguments.joined(separator: " ")
+        if let why = PersistenceScanner.shellLineReason(line) { return "command line \(why)" }
+        if let why = Self.scriptContentReason(t) { return why }
+        return nil
+    }
+
+    static let scriptPatterns: [(String, String)] = [
+        (#"\b(curl|wget)\b[^#]*\|\s*(ba|z|da)?sh\b|(ba|z)?sh\s+-c\s+["']?\$\(\s*(curl|wget)\b"#, "pipes a download into a shell"),
+        (#"base64\s+(-d|--decode|-D)[^#]*\|\s*(ba|z)?sh\b"#, "decodes and runs an encoded blob"),
+        (#"/dev/tcp/"#, "opens a raw TCP connection"),
+        (#"\b(nc|ncat|socat)\b.*\s-e\s"#, "opens a reverse shell"),
+    ]
+
+    /// Looks at the first 64 KB of a script target for download-and-run or obfuscation patterns.
+    static func scriptContentReason(_ path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        guard let d = try? fh.read(upToCount: 65536), !d.isEmpty, let s = String(data: d, encoding: .utf8) else { return nil }
+        guard s.hasPrefix("#!") || [".sh", ".py", ".zsh", ".bash", ".command", ".rb", ".pl", ".js"].contains(where: { path.hasSuffix($0) }) else { return nil }
+        for line in s.components(separatedBy: "\n").prefix(2000) {
+            let l = line.trimmingCharacters(in: .whitespaces)
+            if l.hasPrefix("#") && !l.hasPrefix("#!") { continue }
+            for (pat, why) in Self.scriptPatterns where RegexCache.shared.matches(pat, l) { return "script \(why)" }
+            if l.count > 400, l.range(of: "^[A-Za-z0-9+/=\"' ;(]{400,}", options: .regularExpression) != nil,
+               l.contains("base64") || l.contains("b64decode") || l.contains("exec(") || l.contains("eval") { return "script holds an obfuscated payload" }
+        }
+        return nil
+    }
+
     public func assess(_ r: PersistenceRecord, previous: PersistenceRecord? = nil) -> [PersistenceFinding] {
         var out: [PersistenceFinding] = []
         let it = r.item
@@ -157,8 +215,21 @@ public struct PersistenceAssessor: Sendable {
         case .launchAgent, .launchDaemon:
             var targets = [it.target].compactMap { $0 }
             if let s = r.attributes["script"], s.hasPrefix("/") || s.hasPrefix("~") { targets.append(PathUtil.expand(s)) }
+            if Self.isRampartOwn(r) { break }
             for t in targets where t.hasPrefix("/") {
                 if let why = targetProblem(t) {
+                    // The user's own unsigned scripts/tools in their home folder: log only (R07L, score 25)
+                    // unless there is real malicious evidence.
+                    if let evidence = maliciousEvidence(r, target: t) {
+                        out.append(PersistenceFinding(ruleID: "R07",
+                            detail: "Job \(it.label) (\(it.location)) runs \(t) [\(why); \(evidence)].", targetPath: t))
+                        break
+                    }
+                    if Self.isUserOwnedLocation(t) {
+                        out.append(PersistenceFinding(ruleID: "R07L",
+                            detail: "Job \(it.label) (\(it.location)) runs \(t) [\(why)] from your home folder; no malicious signs.", targetPath: t))
+                        break
+                    }
                     var extra = [String]()
                     if r.attributes["runAtLoad"] == "1" { extra.append("RunAtLoad") }
                     if r.attributes["keepAlive"] != nil && r.attributes["keepAlive"] != "0" { extra.append("KeepAlive") }

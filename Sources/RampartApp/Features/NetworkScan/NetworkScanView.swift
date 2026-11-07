@@ -110,6 +110,7 @@ struct NetworkScanView: View {
                     HStack(spacing: Spacing.xl) {
                         Stat(value: r.devices.count, label: "devices")
                         Stat(value: r.findings.filter { $0.severity >= .medium }.count, label: "to review")
+                            .help("Findings of medium severity or higher, such as an open risky service or an unrecognised new device. Select a device to see what to check.")
                         Stat(value: r.newDevices.filter { !$0.trusted }.count, label: "new")
                     }
                     Text("\(r.probesSent) probes · \(Fmt.duration(r.duration))").font(.caption).foregroundStyle(.secondary)
@@ -475,8 +476,9 @@ struct NetworkRadar: View {
                         ctx.fill(sweep, with: .conicGradient(Gradient(colors: [Color.rampartTeal.opacity(0), Color.rampartTeal.opacity(0.35)]), center: c, angle: .degrees(angle - 40)))
                     }
                 }
+                let spots = NetworkRadar.layout(count: others.count, center: c, maxR: maxR)
                 ForEach(Array(others.enumerated()), id: \.element.id) { i, d in
-                    let p = position(index: i, total: others.count, center: c, maxR: maxR)
+                    let p = spots[i]
                     RadarDot(device: d, selected: d.id == selected)
                         .position(p)
                         .onTapGesture { selected = d.id }
@@ -503,18 +505,65 @@ struct NetworkRadar: View {
         .accessibilityLabel("Network map with \(devices.count) devices")
     }
 
-    /// Deterministic placement: ring by index, golden-angle spread so neighbours don't overlap.
-    private func position(index: Int, total: Int, center: CGPoint, maxR: CGFloat) -> CGPoint {
-        let ring = total <= 8 ? 2 : (index % 2 == 0 ? 2 : 3)
-        let r = maxR * CGFloat(ring) / 3 - 6
-        let a = Double(index) * 2.399963 + .pi / 6   // golden angle
-        return CGPoint(x: center.x + cos(a) * r, y: center.y + sin(a) * r)
+    /// Size reserved for one dot plus its label, used to keep labels from overlapping.
+    static let slot = CGSize(width: 74, height: 50)
+
+    /// Deterministic, overlap-free placement. Devices fill the middle ring first, then the outer and inner
+    /// rings, each ring holding only as many as fit around its circumference. Rings are offset in angle so
+    /// neighbours on adjacent rings don't line up, and a final pass nudges any remaining collisions apart.
+    static func layout(count: Int, center c: CGPoint, maxR: CGFloat) -> [CGPoint] {
+        guard count > 0 else { return [] }
+        let radii: [CGFloat] = [maxR * 2 / 3 - 6, maxR - 6, maxR / 3 + 4]       // middle, outer, inner
+        let offsets: [Double] = [-.pi / 2, -.pi / 2 + 0.35, -.pi / 2 + 0.7]
+        let capacities = radii.map { r in max(1, Int((2 * .pi * r) / slot.width)) }
+        var perRing = [0, 0, 0]
+        var left = count
+        for k in 0..<3 where left > 0 { let n = min(left, capacities[k]); perRing[k] = n; left -= n }
+        // More devices than fit: spread the overflow over all rings (labels will be tight but still nudged apart).
+        var k = 0
+        while left > 0 { perRing[k % 3] += 1; left -= 1; k += 1 }
+
+        var points: [CGPoint] = []
+        for ring in 0..<3 where perRing[ring] > 0 {
+            let n = perRing[ring]
+            for j in 0..<n {
+                let a = offsets[ring] + Double(j) * 2 * .pi / Double(n)
+                points.append(CGPoint(x: c.x + cos(a) * radii[ring], y: c.y + sin(a) * radii[ring]))
+            }
+        }
+        // Collision pass: push overlapping label boxes apart (also away from the hub in the centre).
+        let w = slot.width, h = slot.height
+        for _ in 0..<12 {
+            var moved = false
+            for i in points.indices {
+                for j in points.indices where j > i {
+                    let dx = points[j].x - points[i].x, dy = points[j].y - points[i].y
+                    let ox = w - abs(dx), oy = h - abs(dy)
+                    guard ox > 0, oy > 0 else { continue }
+                    moved = true
+                    if ox < oy {
+                        let push = ox / 2 * (dx >= 0 ? 1 : -1)
+                        points[i].x -= push; points[j].x += push
+                    } else {
+                        let push = oy / 2 * (dy >= 0 ? 1 : -1)
+                        points[i].y -= push; points[j].y += push
+                    }
+                }
+            }
+            if !moved { break }
+        }
+        return points
     }
 }
 
 struct RadarDot: View {
     let device: NetDevice
     let selected: Bool
+    /// About 12 characters, so labels never run into their neighbours; the full name is the tooltip.
+    private var shortName: String {
+        let n = device.displayName
+        return n.count > 12 ? String(n.prefix(11)) + "…" : n
+    }
     private var tint: Color {
         if device.isThisMac { return .rampartTeal }
         switch device.worstSeverity {
@@ -530,8 +579,10 @@ struct RadarDot: View {
                 Circle().strokeBorder(tint.opacity(selected ? 1 : 0.55), lineWidth: selected ? 2 : 1).frame(width: selected ? 38 : 30, height: selected ? 38 : 30)
                 Image(systemName: device.type.symbol).font(.system(size: 13, weight: .medium)).foregroundStyle(tint).symbolRenderingMode(.hierarchical)
             }
-            Text(device.displayName).font(.system(size: 9)).lineLimit(1).frame(maxWidth: 64).foregroundStyle(.secondary)
+            Text(shortName).font(.system(size: 9)).lineLimit(1).fixedSize().foregroundStyle(.secondary)
         }
+        .frame(width: NetworkRadar.slot.width)
+        .help(device.displayName)
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: selected)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(device.displayName), \(device.type.label)\(device.openPorts.isEmpty ? "" : ", \(device.openPorts.count) open services")")

@@ -29,10 +29,8 @@ extension SelfTest {
         close(fds[0])
 
         // 2. Live daemon test.
-        let binDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
-        let daemonBin = binDir.appendingPathComponent("rampartd").path
-        guard FileManager.default.isExecutableFile(atPath: daemonBin) else {
-            print("  (skipping live daemon checks: \(daemonBin) not built)")
+        guard let daemonBin = siblingProduct("rampartd", envOverride: "RAMPART_DAEMON") else {
+            print("SKIP daemon: live daemon checks (rampartd unavailable)")
             return
         }
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("rampart-selftest-\(getpid())")

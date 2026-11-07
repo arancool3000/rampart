@@ -414,6 +414,7 @@ struct ItemEditor: View {
             }
             if !item.password.isEmpty {
                 StrengthMeter(strength: PasswordStrength.evaluate(item.password, userInputs: [item.username, item.title]))
+                BreachBadge(password: item.password)
             }
         }
     }

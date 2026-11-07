@@ -67,6 +67,8 @@ protocol BehaviourControl: AnyObject {
     func setAllowRules(_ rules: [AllowRuleSpec])
     /// Plants canary files in `dirs`; returns the paths planted.
     func plantCanaries(in dirs: [String]) -> [String]
+    /// Removes RamPart-created canaries (registry paths only); returns the paths removed.
+    func removeCanaries(_ paths: [String]) -> [String]
 }
 
 protocol PersistenceService: AnyObject {

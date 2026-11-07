@@ -223,6 +223,8 @@ public struct ProtectionStatus: Codable, Sendable {
     public var xprotectVersion: String?
     public var securityScore: Int?
     public var openDetections: Int
+    /// When definitions (hash feeds, blocklists, rules) last updated successfully; nil = never.
+    public var definitionsUpdated: Date? = nil
     public init(realtimeOn: Bool = false, sources: [String: Bool] = [:], webProtectionOn: Bool = false,
                 fullDiskAccess: Bool = false, lastScan: Date? = nil, signatureVersion: String = "0",
                 xprotectVersion: String? = nil, securityScore: Int? = nil, openDetections: Int = 0) {

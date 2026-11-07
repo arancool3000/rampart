@@ -20,6 +20,7 @@ extension SelfTest {
         vaultTOTP()
         vaultCSV(dir)
         vaultAudit()
+        vaultBreachMonitor()
         vaultKeychain()
         vaultTouchID(env)
     }
@@ -195,6 +196,93 @@ extension SelfTest {
         check(VaultAudit.run(items: [c].map { var x = $0; x.passwordModified = Date(); return x }).score == 100, "audit: clean = 100")
         check(BreachChecker.sha1Hex("password") == "5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8", "breach: sha1")
         check(BreachChecker.count(in: "1E4C9B93F3F0682250B6CF8331B7EE68FD8:3861493\r\n0000000000000000000000000000000000A:0", suffix: "1e4c9b93f3f0682250b6cf8331b7ee68fd8") == 3861493, "breach: range parse")
+    }
+
+    /// Automatic breach monitoring with a fake range fetcher (no network).
+    static func vaultBreachMonitor() {
+        final class Log: @unchecked Sendable { let lock = NSLock(); var prefixes: [String] = [] }
+        let log = Log()
+        let pwnedHash = BreachChecker.sha1Hex("password")      // 5BAA6…
+        let checker = BreachChecker(fetcher: { prefix in
+            log.lock.withLock { log.prefixes.append(prefix) }
+            var lines = ["0000000000000000000000000000000000A:0"]
+            if prefix == String(pwnedHash.prefix(5)) { lines.append(String(pwnedHash.dropFirst(5)) + ":3861493") }
+            return lines.joined(separator: "\r\n")
+        })
+        let strong = "Kq8#vW2m!zR4pL9x-unique"
+        var cache = BreachCache()
+        let now = Date()
+        let r = waitTask(Task { await BreachMonitor.sweep(["password", strong, "password"], cache: cache, checker: checker, now: now) })
+        check(r?.checked == 2 && r?.found == 1 && r?.failure == nil, "breach: sweep checks distinct passwords once")
+        let sent = log.lock.withLock { log.prefixes }
+        check(sent.count == 2 && sent.allSatisfy { $0.count == 5 && $0.allSatisfy(\.isHexDigit) }, "breach: only 5 hex chars leave the Mac")
+        for (k, v) in r?.updates ?? [:] { cache.entries[k] = v }
+        check(cache.result(for: "password")?.count == 3861493 && cache.result(for: strong)?.count == 0, "breach: cached results")
+        check(BreachMonitor.describe(count: 3861493).hasPrefix("Found in known breaches") && BreachMonitor.describe(count: 0) == "Not found in known breaches", "breach: wording")
+        // Cache keys are salted HMACs, not the password or its SHA-1.
+        let key = cache.key("password")
+        check(key.count == 64 && !key.uppercased().contains(pwnedHash.prefix(10)) && !key.contains("password"), "breach: cache key is salted hash")
+        check(BreachCache(salt: Data(repeating: 1, count: 32)).key("x") != BreachCache(salt: Data(repeating: 2, count: 32)).key("x"), "breach: per-vault salt")
+        // Throttle: nothing due within a day; due again after 25 h.
+        check(BreachMonitor.due(["password", strong], cache: cache, now: now.addingTimeInterval(3600)).isEmpty, "breach: throttled within a day")
+        check(BreachMonitor.due(["password", strong], cache: cache, now: now.addingTimeInterval(25 * 3600)).count == 2, "breach: due after a day")
+        check(BreachMonitor.due(["new one"], cache: cache, now: now) == ["new one"], "breach: new password is due")
+        // Second sweep in the same day fetches nothing.
+        checker.clearCache()
+        _ = waitTask(Task { await BreachMonitor.sweep(["password", strong], cache: cache, checker: checker, now: now.addingTimeInterval(60)) })
+        check(log.lock.withLock { log.prefixes.count } == 2, "breach: no refetch while fresh")
+        // Item counts feed the dashboard.
+        var a = VaultItem(kind: .login, title: "A"); a.password = "password"
+        var b = VaultItem(kind: .login, title: "B"); b.password = strong
+        let counts = BreachMonitor.counts(items: [a, b], cache: cache)
+        check(counts[a.id] == 3861493 && counts[b.id] == 0, "breach: counts per item")
+        check(VaultAudit.run(items: [a, b], breachCounts: counts).items(.breached) == [a.id], "breach: watchtower breached list")
+        cache.prune(keeping: [strong])
+        check(cache.result(for: "password") == nil && cache.result(for: strong) != nil, "breach: prune removed passwords")
+        // Failures stop the sweep and are reported.
+        let failing = BreachChecker(fetcher: { _ in throw VaultError.io("offline") })
+        let f = waitTask(Task { await BreachMonitor.sweep(["x1", "x2"], cache: BreachCache(), checker: failing) })
+        check(f?.failure != nil && f?.checked == 0, "breach: failure reported")
+        // HTML filter page rejected.
+        let html = BreachChecker(fetcher: { _ in "<html>blocked</html>" })
+        let h = waitTask(Task { await BreachMonitor.sweep(["x1"], cache: BreachCache(), checker: html) })
+        check(h?.failure != nil, "breach: web filter page rejected")
+        // Older vault settings (opt-in era, no new keys) migrate to automatic monitoring; an explicit opt-out sticks.
+        let old = #"{"autoLockMinutes":15,"lockOnSleep":true,"lockOnScreenLock":true,"clipboardClearSeconds":30,"breachCheckEnabled":false,"generator":{"length":20,"lowercase":true,"uppercase":true,"digits":true,"symbols":true,"excludeAmbiguous":false,"requireEachSet":true},"passphrase":{"words":5,"separator":"-","capitalize":true,"includeDigit":true}}"#
+        let migrated = try? JSONDecoder().decode(VaultSettings.self, from: Data(old.utf8))
+        check(migrated?.breachCheckEnabled == true && migrated?.autoLockMinutes == 15, "breach: old settings migrate to on")
+        var off = VaultSettings(); off.breachCheckEnabled = false
+        let rt = (try? JSONEncoder().encode(off)).flatMap { try? JSONDecoder().decode(VaultSettings.self, from: $0) }
+        check(rt?.breachCheckEnabled == false, "breach: opt-out persists")
+        let oldMeta = #"{"folders":[],"settings":\#(old),"created":0}"#
+        check((try? JSONDecoder().decode(VaultMeta.self, from: Data(oldMeta.utf8))) != nil, "breach: old meta without cache decodes")
+        // Strength explanation.
+        check(PasswordStrength.known(entropyBits: 10).crackTimeSentence.contains("instantly"), "strength: weak cracks instantly")
+        check(PasswordStrength.known(entropyBits: 80).crackTimeSentence.contains("million years"), "strength: 80 bits ~ millions of years (\(PasswordStrength.known(entropyBits: 80).crackTimeSentence))")
+        check(PasswordStrength.describeLong(seconds: 1e40).contains("age of the universe"), "strength: astronomically long")
+        // Generator history: memory only, last 10, newest first, no duplicates.
+        var hist = GeneratorHistory()
+        for i in 0..<12 { hist.add("pw\(i)") }
+        hist.add("pw11")
+        check(hist.entries.count == 10 && hist.entries.first?.password == "pw11" && !hist.entries.contains { $0.password == "pw0" }, "generator: history keeps last 10")
+        hist.clear(); check(hist.entries.isEmpty, "generator: history clears")
+        // Pronounceable, presets, site rules.
+        let pr = PasswordGenerator.pronounceable()
+        let letters = Array(pr.password.prefix(14).lowercased())
+        check(pr.password.count == 16 && letters.enumerated().allSatisfy { i, c in (i % 2 == 0 ? PasswordGenerator.syllableConsonants : PasswordGenerator.syllableVowels).contains(c) }
+              && pr.password.suffix(2).allSatisfy(\.isNumber) && pr.entropyBits > 40, "generator: pronounceable (\(Int(pr.entropyBits)) bits)")
+        check(PasswordGenerator.passphrasePresets.count >= 3 && PasswordGenerator.passphrase(PasswordGenerator.passphrasePresets[0].options).password.split(separator: " ").count == 5, "generator: passphrase presets")
+        var go = PasswordGenerator.Options(); go.length = 30
+        let r16 = PasswordGenerator.random(go, rule: PasswordGenerator.siteRules[1])
+        check(r16.password.count == 16, "generator: max-length rule")
+        let noSym = PasswordGenerator.random(go, rule: PasswordGenerator.siteRules[3])
+        check(noSym.password.allSatisfy { $0.isLetter || $0.isNumber }, "generator: no-symbols rule")
+        let lim = PasswordGenerator.random(go, rule: PasswordGenerator.siteRules[4])
+        check(lim.password.allSatisfy { $0.isLetter || $0.isNumber || "!@#$%&*".contains($0) } && lim.password.contains { "!@#$%&*".contains($0) }, "generator: limited-symbols rule")
+        // Passkey suggestions do not count as problems.
+        var g = VaultItem(kind: .login, title: "GitHub"); g.urls = ["https://github.com"]; g.password = strong; g.totpSecret = "JBSWY3DPEHPK3PXP"
+        let pa = VaultAudit.run(items: [g])
+        check(pa.items(.passkey) == [g.id] && pa.problemItemCount == 0 && pa.score == 100, "audit: passkey is an opportunity, not a problem")
     }
 
     static func vaultKeychain() {

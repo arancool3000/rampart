@@ -1,5 +1,6 @@
 import SwiftUI
 import RampartVault
+import RampartShared
 
 struct VaultSettingsView: View {
     @Bindable private var model = PasswordsModel.shared
@@ -12,6 +13,7 @@ struct VaultSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.xl) {
             touchID
+            breachMonitoring
             locking
             importExport
             security
@@ -36,6 +38,18 @@ struct VaultSettingsView: View {
                 }
             }
             .font(.caption).foregroundStyle(.secondary)
+        }
+        .card()
+    }
+
+    private var breachMonitoring: some View {
+        VStack(alignment: .leading, spacing: Spacing.m) {
+            SectionHeader("Breach monitoring")
+            Toggle("Check passwords against known breaches automatically", isOn: Binding(get: { model.meta.settings.breachCheckEnabled },
+                                                                            set: { v in model.updateSettings { $0.breachCheckEnabled = v } }))
+                .toggleStyle(.switch)
+            Text("When on, \(Product.name) checks each password when you save it, after you unlock (at most once a day per password), and as you type or generate one. Privacy: it uses Have I Been Pwned's k-anonymity range API, so only the first 5 characters of the password's SHA-1 hash leave this Mac. The password and the full hash never do, and the server can't tell which of the hundreds of matching hashes was yours. Results are kept hashed inside the encrypted vault.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .card()
     }

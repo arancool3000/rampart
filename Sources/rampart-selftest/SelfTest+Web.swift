@@ -482,7 +482,7 @@ extension SelfTest {
         check(t.reasons?.contains { $0.title.contains("changed after loading") } == true, "tamper observations reported")
 
         // Real binary over stdin/stdout.
-        guard let nmh = findNMH() else { print("   (rampart-nmh binary not found next to the test runner; skipping stdio round-trip)"); return }
+        guard let nmh = findNMH() else { print("SKIP web: nmh stdio round-trip (rampart-nmh unavailable)"); return }
         let p = Process(); p.executableURL = URL(fileURLWithPath: nmh)
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe; p.standardOutput = outPipe; p.standardError = FileHandle.nullDevice
@@ -505,14 +505,7 @@ extension SelfTest {
         check(p.terminationStatus == 0, "nmh exits cleanly on EOF")
     }
 
-    static func findNMH() -> String? {
-        if let env = ProcessInfo.processInfo.environment["RAMPART_NMH"], FileManager.default.isExecutableFile(atPath: env) { return env }
-        let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
-        var candidates = [exe.appendingPathComponent("rampart-nmh").path]
-        let cwd = FileManager.default.currentDirectoryPath
-        candidates += [".build-web/debug/rampart-nmh", ".build-web/arm64-apple-macosx/debug/rampart-nmh", ".build/debug/rampart-nmh"].map { cwd + "/" + $0 }
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }
+    static func findNMH() -> String? { siblingProduct("rampart-nmh", envOverride: "RAMPART_NMH") }
 
     // MARK: Safari "JavaScript from Apple Events" guard: parsers over fixtures only (never touches TCC or the log)
 

@@ -70,11 +70,56 @@ struct ScanProgress: Equatable {
     var started: Date
     var found: Int
     var paused: Bool
-    var fraction: Double? { total > 0 ? min(1, Double(scanned) / Double(total)) : nil }
+    /// True once the file walker has finished discovering files, so `total` is final.
+    /// The daemon's IPC `scanProgress` carries no walk flag yet, so this is inferred: the walker
+    /// discovers files while scanning, and `total` stops growing once it is done.
+    var walkFinished = false
+    var lastTotalChange = Date()
+    /// Smoothed scan rate in files per second (exponential moving average).
+    var rate: Double = 0
+    var rateSampleAt: Date? = nil
+    var rateSampleCount = 0
+    var rateSampleScanned = 0
+
+    /// Seconds `total` must stay unchanged (while files are still being scanned) before it is treated as final.
+    static let totalSettleSeconds: Double = 2.5
+
+    /// A real percentage only once the walk has finished; nil means "Finding files…".
+    var fraction: Double? {
+        guard walkFinished, total > 0 else { return nil }
+        return min(1, Double(scanned) / Double(total))
+    }
+    /// Shown only after walking finishes, at least 5 % is done and the smoothed rate is meaningful.
     var etaSeconds: Double? {
-        guard let f = fraction, f > 0.03 else { return nil }
-        let elapsed = Date().timeIntervalSince(started)
-        return elapsed / f - elapsed
+        guard let f = fraction, f >= 0.05, f < 1, rate > 0.5 else { return nil }
+        let left = Double(max(0, total - scanned)) / rate
+        return left.isFinite ? max(1, left) : nil
+    }
+
+    /// Applies a progress update from the scanner.
+    mutating func update(scanned newScanned: Int, total newTotal: Int, walkDone: Bool? = nil, now: Date = Date()) {
+        if newTotal != total { lastTotalChange = now }
+        // Rate: sample at most twice a second so bursty updates don't swing the estimate.
+        if let at = rateSampleAt {
+            let dt = now.timeIntervalSince(at)
+            if dt >= 0.5 {
+                let inst = Double(max(0, newScanned - rateSampleScanned)) / dt
+                rate = rateSampleCount == 0 ? inst : rate * 0.85 + inst * 0.15
+                rateSampleCount += 1
+                rateSampleAt = now; rateSampleScanned = newScanned
+            }
+        } else {
+            rateSampleAt = now; rateSampleScanned = newScanned
+        }
+        scanned = newScanned
+        total = newTotal
+        if let walkDone, walkDone { walkFinished = true }
+        inferWalk(now: now)
+    }
+
+    private mutating func inferWalk(now: Date) {
+        guard !walkFinished, total > 0 else { return }
+        if now.timeIntervalSince(lastTotalChange) >= Self.totalSettleSeconds { walkFinished = true }
     }
 }
 
@@ -334,8 +379,9 @@ final class AppModel {
             // No sample data: show the honest "service isn't running" state with a Retry button.
             if mode == .live || mode == .demo { clearDemo() }
             mode = .offline
-            if case .failed(let why) = launchState { lastError = why }
-            else if DaemonLauncher.shared.helperURL == nil { lastError = "This build doesn't include the \(Product.name) protection service." }
+            if DaemonLauncher.shared.helperMissing { lastError = DaemonLauncher.shared.missingHelperMessage }
+            else if case .failed(let why) = launchState { lastError = why }
+            else if DaemonLauncher.shared.helperURL == nil { lastError = DaemonLauncher.shared.missingHelperMessage }
         }
     }
 
@@ -383,7 +429,7 @@ final class AppModel {
             if case .connections(let c)? = try? await client.request(.connections) { apply(c) }
             await refreshPosture()
         }
-        let defs = status.lastScan ?? definitionsUpdated
+        let defs = status.definitionsUpdated ?? definitionsUpdated
         if defs != definitionsUpdated { definitionsUpdated = defs }
     }
 
@@ -554,7 +600,7 @@ final class AppModel {
                     let now = Date()
                     if now.timeIntervalSince(lastUI) < 0.1 { return true }   // throttle to 10 Hz
                     lastUI = now
-                    p.scanned = scanned; p.total = total; p.current = current
+                    p.update(scanned: scanned, total: total, now: now); p.current = current
                     m.scanPhase = .running(p)
                     m.noteScanPath(current)
                     return true

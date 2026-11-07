@@ -165,8 +165,7 @@ enum DemoData {
                 tick += 1
                 if tick < 6 { p.current = "Estimating files…"; m.scanPhase = .running(p); return }
                 scanned = min(total, scanned + perTick + Int.random(in: -40...40))
-                p.total = total
-                p.scanned = scanned
+                p.update(scanned: scanned, total: total, walkDone: true)
                 let base = kind == .custom ? (paths.first ?? home) : sample[(tick / 4) % sample.count]
                 p.current = base + "/" + names[tick % names.count]
                 m.scanPhase = .running(p)

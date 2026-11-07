@@ -242,7 +242,7 @@ struct RadarView: View {
                     Image(systemName: "magnifyingglass").font(.system(size: size * 0.12, weight: .semibold))
                 }
                 if size >= 120 {
-                    Text(paused ? "Paused" : (fraction == nil ? "Estimating" : "Scanning"))
+                    Text(paused ? "Paused" : (fraction == nil ? "Finding files" : "Scanning"))
                         .font(.caption.weight(.medium)).foregroundStyle(.secondary).textCase(.uppercase).tracking(1.2)
                 }
             }
@@ -252,7 +252,7 @@ struct RadarView: View {
         .frame(width: size, height: size)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Scan progress")
-        .accessibilityValue(fraction.map { "\(Int($0 * 10) * 10) percent" } ?? "Estimating")
+        .accessibilityValue(fraction.map { "\(Int($0 * 10) * 10) percent" } ?? "Finding files")
     }
 }
 
@@ -270,12 +270,20 @@ struct RunningScanView: View {
                 VStack(alignment: .leading, spacing: Spacing.m) {
                     Label(progress.kind.title, systemImage: progress.kind.symbol)
                         .font(.headline).foregroundStyle(Color.rampartTeal)
-                    if progress.total > 0 {
+                    if progress.walkFinished && progress.total > 0 {
                         (Text(Fmt.count(progress.scanned)).foregroundStyle(.primary) + Text(" of \(Fmt.count(progress.total)) files").foregroundStyle(.secondary))
                             .font(.title.weight(.bold)).fontDesign(.rounded).monospacedDigit()
                             .contentTransition(.numericText())
                     } else {
-                        Text("Estimating files…").font(.title.weight(.bold)).fontDesign(.rounded)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Finding files…").font(.title.weight(.bold)).fontDesign(.rounded)
+                            if progress.total > 0 {
+                                Text("\(Fmt.count(progress.total)) found so far, \(Fmt.count(progress.scanned)) checked")
+                                    .font(.title3).foregroundStyle(.secondary).monospacedDigit()
+                                    .contentTransition(.numericText())
+                            }
+                        }
+                        .help("\(Product.name) checks files while it looks for them. A percentage and time estimate appear once it knows how many there are.")
                     }
                     HStack(spacing: Spacing.l) {
                         Label(Fmt.duration(Date().timeIntervalSince(progress.started)), systemImage: "timer")
@@ -335,7 +343,7 @@ struct RunningScanView: View {
         }
         .toolbar {
             ToolbarItem(placement: .status) {
-                Text("\(progress.kind.title) · \(progress.fraction.map { "\(Int($0 * 100))%" } ?? "Starting")")
+                Text("\(progress.kind.title) · \(progress.fraction.map { "\(Int($0 * 100))%" } ?? "Finding files…")")
                     .foregroundStyle(.secondary).monospacedDigit()
             }
         }

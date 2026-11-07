@@ -190,6 +190,9 @@ struct StrengthMeter: View {
                 Spacer()
                 Text("\(Int(strength.entropyBits.rounded())) bits").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
             }
+            if strength.entropyBits > 0 {
+                Text(strength.crackTimeSentence).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             if !compact {
                 Grid(alignment: .leading, horizontalSpacing: Spacing.m, verticalSpacing: 3) {
                     GridRow { Text("Online attack (10/s)").foregroundStyle(.secondary); Text(PasswordStrength.describe(seconds: strength.onlineSeconds)) }

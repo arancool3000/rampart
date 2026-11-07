@@ -170,14 +170,18 @@ struct OnboardingView: View {
                  body: model.lastError ?? "\(Product.name) couldn't start its background checker, so it can't run a first scan yet.") {
                 HStack {
                     Button("Retry") { Task { await model.retry(); beginFirstScan() } }.buttonStyle(GlowButtonStyle()).controlSize(.large)
+                    if DaemonLauncher.shared.helperMissing { ReinstallButton().controlSize(.large) }
                     Button("Finish Without Scanning") { onFinish() }
                 }
             }
         } else {
             page(symbol: "magnifyingglass", title: "Let's do a quick check",
                  body: "This usually takes about a minute. Feel free to close this window; the scan keeps going.") {
-                ProgressView(value: p?.fraction ?? 0).tint(Color.rampartTeal).frame(maxWidth: 360)
-                Text(p.map { $0.total > 0 ? "\(Fmt.count($0.scanned)) of \(Fmt.count($0.total)) files" : "Estimating files…" } ?? "Starting…")
+                Group {
+                    if let f = p?.fraction { ProgressView(value: f) } else { ProgressView().progressViewStyle(.linear) }
+                }
+                .tint(Color.rampartTeal).frame(maxWidth: 360)
+                Text(p.map { $0.fraction != nil ? "\(Fmt.count($0.scanned)) of \(Fmt.count($0.total)) files" : ($0.total > 0 ? "Finding files… \(Fmt.count($0.total)) so far" : "Finding files…") } ?? "Starting…")
                     .font(.callout).foregroundStyle(.secondary).monospacedDigit()
                 if let cur = p?.current, !cur.isEmpty {
                     Text(cur.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
@@ -202,4 +206,21 @@ struct OnboardingView: View {
 extension Notification.Name {
     /// Posted by onboarding when the user asks how to move the app into Applications.
     static let rampartShowMoveToApplications = Notification.Name("rampartShowMoveToApplications")
+}
+
+/// Shown when this copy of the app is missing its protection service file. Reveals the downloaded disk image
+/// when one can be found; otherwise explains how to get a fresh copy.
+struct ReinstallButton: View {
+    @StateVar private var explain = false
+    var body: some View {
+        Button("Reinstall \(Product.name)…") {
+            if !DaemonLauncher.shared.revealInstaller() { explain = true }
+        }
+        .help("Shows the \(Product.name) disk image in Finder so you can copy a fresh app into Applications.")
+        .alert("Reinstall \(Product.name)", isPresented: $explain) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("\(Product.name) couldn't find its disk image in Downloads. Open the \(Product.name) .dmg you downloaded, drag \(Product.name) to Applications and replace this copy, then open it again. Your settings and quarantine are kept.")
+        }
+    }
 }

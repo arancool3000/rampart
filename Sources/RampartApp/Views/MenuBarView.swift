@@ -91,8 +91,8 @@ struct MenuBarView: View {
             HStack(spacing: Spacing.m) {
             RadarView(fraction: p.fraction, paused: p.paused, size: 74)
             VStack(alignment: .leading, spacing: Spacing.s) {
-                Text("\(p.kind.title) · \(p.fraction.map { "\(Int($0 * 100))%" } ?? "Starting")").font(.headline).monospacedDigit()
-                ProgressView(value: p.fraction ?? 0).tint(Color.rampartTeal)
+                Text("\(p.kind.title) · \(p.fraction.map { "\(Int($0 * 100))%" } ?? "Finding files…")").font(.headline).monospacedDigit()
+                if let f = p.fraction { ProgressView(value: f).tint(Color.rampartTeal) } else { ProgressView().progressViewStyle(.linear).tint(Color.rampartTeal) }
                 Text(p.current).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                 HStack {
                     if model.mode != .live { Button(p.paused ? "Resume" : "Pause") { model.togglePause() } }

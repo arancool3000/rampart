@@ -157,11 +157,34 @@ public struct VaultSettings: Codable, Hashable, Sendable {
     public var lockOnSleep = true
     public var lockOnScreenLock = true
     public var clipboardClearSeconds = 30
-    /// Opt-in: send 5-character SHA-1 prefixes to the Pwned Passwords range API.
-    public var breachCheckEnabled = false
+    /// On by default (opt-out): send 5-character SHA-1 prefixes to the Pwned Passwords range API.
+    public var breachCheckEnabled = true
+    /// 1 = automatic breach monitoring default applied (older vaults had the check off by default).
+    public var breachDefaultsVersion = 1
     public var generator = PasswordGenerator.Options()
     public var passphrase = PasswordGenerator.PassphraseOptions()
     public init() {}
+
+    enum CodingKeys: String, CodingKey {
+        case autoLockMinutes, lockOnSleep, lockOnScreenLock, clipboardClearSeconds, breachCheckEnabled, breachDefaultsVersion, generator, passphrase
+    }
+
+    /// Tolerates settings written by older versions (missing keys keep their defaults).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = VaultSettings()
+        autoLockMinutes = try c.decodeIfPresent(Int.self, forKey: .autoLockMinutes) ?? d.autoLockMinutes
+        lockOnSleep = try c.decodeIfPresent(Bool.self, forKey: .lockOnSleep) ?? d.lockOnSleep
+        lockOnScreenLock = try c.decodeIfPresent(Bool.self, forKey: .lockOnScreenLock) ?? d.lockOnScreenLock
+        clipboardClearSeconds = try c.decodeIfPresent(Int.self, forKey: .clipboardClearSeconds) ?? d.clipboardClearSeconds
+        generator = try c.decodeIfPresent(PasswordGenerator.Options.self, forKey: .generator) ?? d.generator
+        passphrase = try c.decodeIfPresent(PasswordGenerator.PassphraseOptions.self, forKey: .passphrase) ?? d.passphrase
+        let version = try c.decodeIfPresent(Int.self, forKey: .breachDefaultsVersion) ?? 0
+        let stored = try c.decodeIfPresent(Bool.self, forKey: .breachCheckEnabled)
+        // Before version 1 the check was opt-in and off by default; automatic monitoring is now the default.
+        breachCheckEnabled = version >= 1 ? (stored ?? true) : true
+        breachDefaultsVersion = 1
+    }
 }
 
 /// Unencrypted-in-memory metadata that is stored encrypted in the vault file.
@@ -169,7 +192,19 @@ public struct VaultMeta: Codable, Hashable, Sendable {
     public var folders: [VaultFolder] = []
     public var settings = VaultSettings()
     public var created = Date()
+    /// Hashed breach-check results (see BreachCache).
+    public var breachCache = BreachCache()
     public init() {}
+
+    enum CodingKeys: String, CodingKey { case folders, settings, created, breachCache }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        folders = try c.decodeIfPresent([VaultFolder].self, forKey: .folders) ?? []
+        settings = try c.decodeIfPresent(VaultSettings.self, forKey: .settings) ?? VaultSettings()
+        created = try c.decodeIfPresent(Date.self, forKey: .created) ?? Date()
+        breachCache = try c.decodeIfPresent(BreachCache.self, forKey: .breachCache) ?? BreachCache()
+    }
 }
 
 public enum VaultError: Error, LocalizedError, Equatable {

@@ -81,7 +81,29 @@ public final class RansomwareDetector: @unchecked Sendable {
 
     // MARK: event intake
 
-    public func observe(_ e: SecurityEvent, actorKey: String) -> [RansomHit] {
+    /// Atomic-save temp names: `.sb-xxxxxxxx-yyyyyy` (NSDocument/AppKit safe-save), "(A Document Being Saved By X)"
+    /// folders and `~` backup copies.
+    public static func isAtomicSaveTemp(_ p: String) -> Bool {
+        let b = PathUtil.basename(p)
+        return b.contains(".sb-") || p.contains("/(A Document Being Saved By ") || p.contains("/.TemporaryItems/")
+            || b.hasSuffix("~") || p.contains("/NSIRD_")
+    }
+
+    /// Removes canary files RamPart created (only the registered paths given, and only if they still hold
+    /// RamPart's decoy body). Returns the paths removed.
+    @discardableResult
+    public func removeCanaries(_ paths: [String]) -> [String] {
+        var removed: [String] = []
+        for p in paths where Self.canaryNames.contains(PathUtil.basename(p)) {
+            guard let d = FileManager.default.contents(atPath: p), let s = String(data: d, encoding: .utf8),
+                  s.contains("Rampart ransomware protection file") else { continue }
+            if (try? FileManager.default.removeItem(atPath: p)) != nil { removed.append(p) }
+        }
+        lock.lock(); for p in paths { canaries[PathUtil.canonical(p)] = nil }; lock.unlock()
+        return removed
+    }
+
+    public func observe(_ e: SecurityEvent, actorKey: String, trustedGUIActor: Bool = false) -> [RansomHit] {
         guard let raw = e.path else { return [] }
         let path = PathUtil.canonical(raw)
         let dest = e.destPath.map(PathUtil.canonical)
@@ -93,6 +115,15 @@ public final class RansomwareDetector: @unchecked Sendable {
             guard let ref = canaries[p] else { continue }
             let now = FileManager.default.contents(atPath: p)
             let moved = e.kind == .fileRename && p == path
+            // An editor's atomic save (temp file renamed over the canary, or the canary renamed to a backup)
+            // by the user's own GUI app is not ransomware: adopt the new content as the reference.
+            if e.kind == .fileRename, let dest, Self.isAtomicSaveTemp(p == path ? dest : path) {
+                let notRandom = now.map { !Self.looksEncrypted($0, entropyThreshold: config.entropyThreshold, chiMax: config.chiSquareMax) } ?? true
+                if trustedGUIActor || (e.process == nil && notRandom) {
+                    if let now { canaries[p] = now }
+                    continue
+                }
+            }
             if moved || e.kind == .fileDelete || now == nil || now != ref {
                 hits.append(RansomHit(ruleID: "R01", path: p,
                     detail: "Canary \(PathUtil.basename(p)) was \(moved ? "renamed" : (now == nil ? "deleted" : "modified")) (event \(e.kind.rawValue))."))

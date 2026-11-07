@@ -4,14 +4,54 @@ import RampartShared
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Set when another copy was already running and this one is quitting; skips all startup work.
+    private var isDuplicate = false
+    static let revealNotification = Notification.Name("app.rampart.app.reveal")
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         if Headless.active {
             NSApp.setActivationPolicy(.prohibited)
             HeadlessRunner.installWindowGuard()
+            return
+        }
+        // Single instance: two copies would mean two menu bar icons and two background checkers.
+        if let other = Self.otherRunningInstance() {
+            isDuplicate = true
+            NSApp.setActivationPolicy(.prohibited)
+            if !CommandLine.arguments.contains("--background") {
+                DistributedNotificationCenter.default().postNotificationName(Self.revealNotification, object: nil, userInfo: nil, deliverImmediately: true)
+                other.activate()
+            }
+            // Nothing has started yet (no daemon child, no menu bar item), so quitting here is clean.
+            exit(0)
+        }
+        DistributedNotificationCenter.default().addObserver(forName: Self.revealNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { AppDelegate.revealMainWindow() }
         }
     }
 
+    /// Another running app with our bundle ID (any copy, wherever it was launched from).
+    static func otherRunningInstance() -> NSRunningApplication? {
+        guard let id = Bundle.main.bundleIdentifier else { return nil }   // `swift run` builds have no bundle
+        let me = ProcessInfo.processInfo.processIdentifier
+        return NSRunningApplication.runningApplications(withBundleIdentifier: id)
+            .first { $0.processIdentifier != me && !$0.isTerminated }
+    }
+
+    /// A second launch asked us to come forward: show the main window if it exists.
+    static func revealMainWindow() {
+        let showDock = UserDefaults.standard.object(forKey: "general.showDock") as? Bool ?? true
+        if showDock { NSApp.setActivationPolicy(.regular) }
+        NSApp.activate(ignoringOtherApps: true)
+        if let w = NSApp.windows.first(where: { $0.identifier?.rawValue.contains("main") == true || $0.title == Product.name }) {
+            w.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { !isDuplicate }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if isDuplicate { return }
         if Headless.active {
             NSApp.setActivationPolicy(.prohibited)
             for w in NSApp.windows { HeadlessRunner.hide(w) }
@@ -37,7 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-    func applicationWillTerminate(_ notification: Notification) { DaemonLauncher.shared.appWillTerminate() }
+    func applicationWillTerminate(_ notification: Notification) { if !isDuplicate { DaemonLauncher.shared.appWillTerminate() } }
 
     /// Dropping files or folders on the Dock icon starts a Custom Scan.
     func application(_ application: NSApplication, open urls: [URL]) {

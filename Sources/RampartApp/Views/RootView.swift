@@ -88,25 +88,58 @@ extension Notification.Name {
 struct SidebarFooter: View {
     @Environment(AppModel.self) private var model
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Image(systemName: footerSymbol).foregroundStyle(footerTint).symbolRenderingMode(.hierarchical)
-                Text(footerTitle).font(.callout.weight(.medium))
+        VStack(alignment: .leading, spacing: 4) {
+            Button { model.selection = destination } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Image(systemName: footerSymbol).foregroundStyle(footerTint).symbolRenderingMode(.hierarchical)
+                        Text(footerTitle).font(.callout.weight(.medium))
+                    }
+                    if let detail = footerDetail {
+                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                    if model.hasData, model.definitionsUpdated != nil {
+                        Text("Definitions updated \(Fmt.ago(model.definitionsUpdated).lowercased())")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            if model.hasData {
-                Text("Definitions updated \(Fmt.ago(model.definitionsUpdated).lowercased())")
-                    .font(.caption).foregroundStyle(.secondary)
+            .buttonStyle(.plain)
+            .help(destination == .threats ? "Review the items in Threats & Quarantine" : "Open the overview")
+            .accessibilityHint(destination == .threats ? "Opens Threats and Quarantine" : "Opens the overview")
+
+            if model.hasData && model.definitionsUpdated == nil {
+                Button {
+                    Task { await model.updateDefinitions() }
+                } label: {
+                    if model.isUpdatingDefinitions {
+                        HStack(spacing: 4) { ProgressView().controlSize(.mini); Text("Updating definitions…") }
+                    } else {
+                        Label("Update definitions", systemImage: "arrow.down.circle")
+                    }
+                }
+                .buttonStyle(.link).font(.caption)
+                .disabled(model.isUpdatingDefinitions)
+                .help("Definitions haven't been downloaded yet. This fetches the latest public threat lists.")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, Spacing.l).padding(.vertical, Spacing.m)
         .overlay(alignment: .top) { Divider().opacity(0.5).padding(.horizontal, Spacing.l) }
-        .contentShape(Rectangle())
-        .onTapGesture { model.selection = .dashboard }
-        .help("Open Dashboard")
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isButton)
-        .accessibilityHint("Opens the dashboard")
+    }
+    private var destination: SidebarItem {
+        if case .threat = model.overall { return .threats }
+        return .dashboard
+    }
+    private var footerDetail: String? {
+        switch model.overall {
+        case .threat(let n): return n == 1 ? "1 item to review" : "\(n) items to review"
+        case .limited: return "Needs Full Disk Access"
+        case .recommendations(let n): return n == 1 ? "1 setting to review" : "\(n) settings to review"
+        default: return nil
+        }
     }
     private var footerTitle: String {
         switch model.overall {
