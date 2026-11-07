@@ -56,8 +56,7 @@ struct MenuBarView: View {
                     Label(model.pausedUntil == nil ? "Pause Protection" : "Paused · Resume or Extend", systemImage: model.pausedUntil == nil ? "pause.circle" : "play.circle")
                 }
                 .menuStyle(.borderlessButton)
-                .disabled(model.mode == .live)
-                .help(model.mode == .live ? "Pausing is managed by the system service in Settings" : "Temporarily pause real-time protection; it resumes on its own")
+                .help("Temporarily pause real-time protection; it resumes on its own")
                 .accessibilityHint("Real-time protection resumes automatically after the chosen time")
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 MenuRowButton(title: "Settings…", shortcut: "⌘,") { NSApp.activate(ignoringOtherApps: true); openSettings() }

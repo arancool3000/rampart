@@ -197,8 +197,7 @@ struct DashboardView: View {
                 get: { model.status.realtimeOn && model.pausedUntil == nil },
                 set: { on in if on { model.setRealtime(true) } else { confirmOff = true } }))
                 .toggleStyle(.switch).labelsHidden().controlSize(.small)
-                .disabled(model.mode == .live)
-                .help(model.mode == .live ? "Real-time protection is managed by the background service." : "")
+                .help(rtOn ? "Turn real-time protection off (asks first)" : "Turn real-time protection on")
         } chart: {
             if model.filesLast14.contains(where: { $0 > 0 }) { Sparkline(values: model.filesLast14, tint: .statusProtected) }
         }
