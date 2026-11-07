@@ -18,6 +18,7 @@ extension SelfTest {
             ("netscan", SelfTest.netscan),
             ("publicwifi", SelfTest.publicWiFiChecks),
             ("fp1", SelfTest.fp1Checks),
+            ("sandbox", SelfTest.sandboxChecks),
         ]
     }
 }

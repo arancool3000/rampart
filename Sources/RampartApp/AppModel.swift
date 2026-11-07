@@ -7,7 +7,7 @@ import RampartShared
 enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
     case dashboard, scan, threats, activity, network, posture, rules, settings
     // Tools (owned by feature agents; their screens live in Features/<Name>/). One case per feature.
-    case scamCheck, passwords, networkScan, aiAssistant, remoteAccess
+    case scamCheck, passwords, authenticator, passwordChecker, networkScan, aiAssistant, remoteAccess
 
     static let core: [SidebarItem] = [.dashboard, .scan, .threats, .activity, .network, .posture, .rules, .settings]
     static let tools: [SidebarItem] = [.scamCheck, .passwords, .networkScan, .aiAssistant, .remoteAccess]
@@ -24,6 +24,8 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .settings: return "Settings"
         case .scamCheck: return "Scam Check"
         case .passwords: return "Passwords"
+        case .authenticator: return "Authenticator"
+        case .passwordChecker: return "Password Checker"
         case .networkScan: return "Network Scan"
         case .aiAssistant: return "AI Assistant"
         case .remoteAccess: return "Remote Access"
@@ -41,6 +43,8 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .settings: return "gearshape"
         case .scamCheck: return "exclamationmark.bubble"
         case .passwords: return "key.horizontal"
+        case .authenticator: return "clock.badge.checkmark"
+        case .passwordChecker: return "checkmark.shield"
         case .networkScan: return "wifi.router"
         case .aiAssistant: return "sparkles"
         case .remoteAccess: return "rectangle.connected.to.line.below"

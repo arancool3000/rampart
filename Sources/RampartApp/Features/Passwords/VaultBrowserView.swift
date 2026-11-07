@@ -91,7 +91,7 @@ struct VaultBrowserView: View {
                 }
                 .padding().frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                List(items, selection: Binding(get: { model.selection }, set: { model.selection = $0; model.editing = nil })) { i in
+                List(items, selection: Binding(get: { model.selection }, set: { if $0 != model.selection { model.relockItem() }; model.selection = $0; model.editing = nil })) { i in
                     ItemRow(item: i).tag(i.id)
                 }
                 .scrollContentBackground(.hidden)
@@ -102,7 +102,9 @@ struct VaultBrowserView: View {
     // MARK: Column 3
 
     @ViewBuilder private var detail: some View {
-        if let e = model.editing {
+        if let e = model.editing, model.isItemHidden(e), model.store.item(e.id) != nil {
+            LockedItemOverlay(item: e)
+        } else if let e = model.editing {
             ItemEditor(item: e)
                 .id(e.id)
         } else if let i = model.selectedItem {
@@ -121,14 +123,16 @@ struct VaultBrowserView: View {
 
 struct ItemRow: View {
     let item: VaultItem
+    @Bindable private var model = PasswordsModel.shared
     var body: some View {
         HStack(spacing: Spacing.m) {
             IconBadge(symbol: item.kind.symbol, tint: tint, size: 30)
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.title).lineLimit(1)
-                Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(model.isItemHidden(item) && item.kind == .secureNote ? "Locked" : item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
+            if model.meta.requiresItemUnlock(item) { Image(systemName: "lock.fill").font(.caption).foregroundStyle(.secondary).accessibilityLabel("Locked item") }
             if item.favourite { Image(systemName: "star.fill").font(.caption).foregroundStyle(Palette.amber) }
         }
         .padding(.vertical, 2)
@@ -147,6 +151,14 @@ struct ItemDetail: View {
     @StateVar private var confirmDelete = false
 
     var body: some View {
+        if model.isItemHidden(item) {
+            LockedItemOverlay(item: item)
+        } else {
+            content.onDisappear { if model.editing?.id != item.id { model.relockItem() } }
+        }
+    }
+
+    private var content: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Spacing.l) {
                 HStack(spacing: Spacing.m) {
@@ -158,6 +170,10 @@ struct ItemDetail: View {
                     Spacer()
                     Button { model.toggleFavourite(item) } label: { Image(systemName: item.favourite ? "star.fill" : "star") }
                         .buttonStyle(.borderless).foregroundStyle(item.favourite ? Palette.amber : .secondary).help("Favourite")
+                    if model.meta.requiresItemUnlock(item) {
+                        Button { model.relockItem() } label: { Label("Lock", systemImage: "lock.fill") }
+                            .buttonStyle(.borderless).help("Hide this item again")
+                    }
                     Button("Edit") { model.editing = item }.secondaryActionStyle()
                 }
                 VStack(spacing: 0) { fields }.card(padding: Spacing.s)
@@ -321,8 +337,10 @@ struct ItemEditor: View {
     @StateVar private var urlText = ""
     @StateVar private var tagText = ""
     @StateVar private var reveal = true
+    @StateVar private var requireUnlock = false
 
     init(item: VaultItem) {
+        _requireUnlock = StateVar(initialValue: PasswordsModel.shared.meta.lockedItems.contains(item.id))
         _item = StateVar(initialValue: item)
         _urlText = StateVar(initialValue: item.urls.joined(separator: "\n"))
         _tagText = StateVar(initialValue: item.tags.joined(separator: ", "))
@@ -373,6 +391,11 @@ struct ItemEditor: View {
                     }
                     TextField("Tags (comma separated)", text: $tagText)
                     Toggle("Favourite", isOn: $item.favourite)
+                    if item.kind == .secureNote {
+                        LabeledContent("Require Touch ID to view") { Text("Always on for secure notes").foregroundStyle(.secondary) }
+                    } else {
+                        Toggle("Require Touch ID to view", isOn: $requireUnlock)
+                    }
                 }
                 .formStyle(.grouped)
                 .scrollContentBackground(.hidden)
@@ -436,6 +459,46 @@ struct ItemEditor: View {
     private func commit() {
         item.urls = urlText.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         item.tags = tagText.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let id = item.id, lock = requireUnlock, was = model.meta.lockedItems.contains(id)
         model.save(item)
+        if lock != was { model.setItemLock(id, lock) }
+    }
+}
+
+/// Shown instead of a locked item's content. Nothing of the item beyond its title is rendered.
+struct LockedItemOverlay: View {
+    let item: VaultItem
+    @Bindable private var model = PasswordsModel.shared
+    @StateVar private var master = ""
+    @StateVar private var useMaster = false
+
+    var body: some View {
+        VStack(spacing: Spacing.m) {
+            IconBadge(symbol: "lock.fill", size: 56)
+            Text(item.title).font(.title2.weight(.semibold)).fontDesign(.rounded)
+            Text("This item is locked. It locks again when you leave it, hide the window or after a minute idle.")
+                .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 360)
+            Button { Task { await model.unlockItem(item) } } label: {
+                Label("Unlock with \(model.availability.biometryName)", systemImage: "touchid")
+            }
+            .buttonStyle(GlowButtonStyle())
+            if useMaster {
+                HStack {
+                    SecureField("Master password", text: $master).frame(maxWidth: 220)
+                        .onSubmit(submitMaster)
+                    Button("Unlock", action: submitMaster).disabled(master.isEmpty)
+                }
+            } else {
+                Button("Use Master Password") { useMaster = true }.buttonStyle(.borderless)
+            }
+            if let e = model.itemUnlockError { Text(e).font(.caption).foregroundStyle(.orange) }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onDisappear { master = ""; model.itemUnlockError = nil }
+    }
+
+    private func submitMaster() {
+        let pw = master; master = ""
+        Task { await model.unlockItem(item, master: pw) }
     }
 }

@@ -83,6 +83,14 @@ public final class VaultStore: @unchecked Sendable {
         try load(file, key: key)
     }
 
+    /// Re-authentication check (e.g. before revealing setup links). Doesn't change any state.
+    public func verifyMasterPassword(_ password: String) -> Bool {
+        guard let file = try? readFile() else { return false }
+        let kek = VaultCrypto.pbkdf2(password: password, salt: file.header.kdf.salt, iterations: file.header.kdf.iterations)
+        defer { kek.wipe() }
+        return (try? VaultCrypto.open(file.header.wrappedKey, key: VaultCrypto.symmetric(kek), aad: VaultFile.wrapAAD(file.header))) != nil
+    }
+
     /// Unlock with a vault key recovered another way (Touch ID). Verifies the file MAC.
     func unlock(vaultKey key: SecretKeyBytes) throws {
         try load(try readFile(), key: key)

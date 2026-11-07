@@ -75,7 +75,7 @@ struct RootView: View {
         case .posture: PostureView()
         case .rules: RulesView()
         // Tools: see FeatureRouter (one line per feature).
-        case .scamCheck, .passwords, .networkScan, .aiAssistant, .remoteAccess: FeatureRouter.view(for: model.selection ?? .dashboard)
+        case .scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess: FeatureRouter.view(for: model.selection ?? .dashboard)
         case .settings: SettingsView(standalone: false)
         }
     }
@@ -373,12 +373,17 @@ struct SidebarRow: View {
     let item: SidebarItem
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Increments only when this row becomes selected, so only the newly chosen icon bounces.
+    @StateVar private var bounceTick = 0
     var body: some View {
         Label {
             Text(item.title)
         } icon: {
             Image(systemName: item.symbol)
-                .symbolEffect(.bounce, value: reduceMotion ? false : model.selection == item)
+                .symbolEffect(.bounce, value: bounceTick)
+        }
+        .onChange(of: model.selection) { _, new in
+            if new == item && !reduceMotion { bounceTick += 1 }
         }
         .badge(item == .threats && !model.openDetections.isEmpty ? model.openDetections.count : 0)
         .help(item == .threats && !model.openDetections.isEmpty

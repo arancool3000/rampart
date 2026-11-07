@@ -194,9 +194,16 @@ public struct VaultMeta: Codable, Hashable, Sendable {
     public var created = Date()
     /// Hashed breach-check results (see BreachCache).
     public var breachCache = BreachCache()
+    /// Display order of authenticator accounts (item ids); unknown items sort after these.
+    public var authenticatorOrder: [UUID] = []
+    /// Items (besides secure notes, which always are) that require Touch ID or a password to view.
+    public var lockedItems: [UUID] = []
     public init() {}
 
-    enum CodingKeys: String, CodingKey { case folders, settings, created, breachCache }
+    /// Secure notes and items marked "Require Touch ID to view" stay hidden even while the vault is unlocked.
+    public func requiresItemUnlock(_ item: VaultItem) -> Bool { item.kind == .secureNote || lockedItems.contains(item.id) }
+
+    enum CodingKeys: String, CodingKey { case folders, settings, created, breachCache, authenticatorOrder, lockedItems }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -204,6 +211,8 @@ public struct VaultMeta: Codable, Hashable, Sendable {
         settings = try c.decodeIfPresent(VaultSettings.self, forKey: .settings) ?? VaultSettings()
         created = try c.decodeIfPresent(Date.self, forKey: .created) ?? Date()
         breachCache = try c.decodeIfPresent(BreachCache.self, forKey: .breachCache) ?? BreachCache()
+        authenticatorOrder = try c.decodeIfPresent([UUID].self, forKey: .authenticatorOrder) ?? []
+        lockedItems = try c.decodeIfPresent([UUID].self, forKey: .lockedItems) ?? []
     }
 }
 

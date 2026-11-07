@@ -284,6 +284,10 @@ public enum IPCRequest: Codable, Sendable {
     case scamCheck(text: String, kind: String)
     case webLookup(host: String)
     case webVerdict(url: String, verdict: String, score: Int, headline: String)
+    // v5: quarantine manager (restore elsewhere, encrypted export, best-effort sandbox run)
+    case restoreQuarantinedTo(id: UUID, path: String, allow: Bool)
+    case exportQuarantined(id: UUID, path: String)
+    case sandboxRun(id: UUID, confirmation: String)
 }
 
 public enum IPCResponse: Codable, Sendable {
@@ -314,4 +318,7 @@ public enum IPCResponse: Codable, Sendable {
     case urlVerdict(Data)     // JSON of RampartWeb.URLReport
     case scamReport(Data)     // JSON of RampartWeb.ScamReport
     case webLookup(Data?)     // JSON of RampartWeb.BlocklistHit, nil when not listed
+    // v5
+    case exported(path: String, password: String)
+    case sandboxReport(Data)  // JSON of rampartd SandboxReport (mirrored in the app's QuarantineManager.swift)
 }

@@ -362,6 +362,12 @@ private struct MessageRow: View {
                 if r.refused { Badge(text: "Declined: outside safe use", tint: .orange) }
                 else if !r.onTopic { Badge(text: "Off topic", tint: .secondary) }
                 steps(r.steps)
+                if let acts = r.actions, !acts.isEmpty {
+                    VStack(alignment: .leading, spacing: Spacing.s) {
+                        ForEach(acts) { a in ActionCard(proposal: a) }
+                    }
+                    .padding(.top, 2)
+                }
                 if !r.relatedCheckIDs.isEmpty {
                     HStack { ForEach(r.relatedCheckIDs, id: \.self) { Badge(text: $0, tint: .rampartTeal) } }
                 }
@@ -619,5 +625,75 @@ private struct ChatRow: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(chat.title), \(chat.mode)\(chat.pinned ? ", pinned" : ""), \(Fmt.dayTime(chat.updated))")
         .accessibilityHint("Opens this conversation. Use the context menu to pin, rename or delete.")
+    }
+}
+
+
+// MARK: - Proposed action card
+
+/// A change the AI suggested. Nothing runs until the user presses Apply; protection-lowering changes are shown in
+/// red and need a second confirmation.
+private struct ActionCard: View {
+    let proposal: AIProposedAction
+    @Bindable private var chat = AIChatModel.shared
+    @StateVar private var confirmLowering = false
+
+    private var state: AIActionGate.State? { chat.actionStates[proposal.id] }
+    private var tint: Color { proposal.lowersProtection ? .red : .rampartTeal }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: Spacing.s) {
+                Image(systemName: proposal.lowersProtection ? "exclamationmark.shield.fill" : "wand.and.stars")
+                    .foregroundStyle(tint).symbolRenderingMode(.hierarchical)
+                Text(verbatim: proposal.title).font(.callout.weight(.semibold))
+                Spacer(minLength: 0)
+                statusBadge
+            }
+            if !proposal.reason.isEmpty { Text(verbatim: proposal.reason).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            Text(verbatim: proposal.change).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+            if let w = proposal.action.warning {
+                Label { Text(verbatim: w) } icon: { Image(systemName: "exclamationmark.triangle.fill") }
+                    .font(.caption.weight(.medium)).foregroundStyle(.red)
+            }
+            if canAct {
+                HStack(spacing: Spacing.s) {
+                    Button(proposal.lowersProtection ? "Apply Anyway…" : "Apply") {
+                        if proposal.lowersProtection { confirmLowering = true } else { chat.applyAction(proposal, confirmedLowering: false) }
+                    }
+                    .buttonStyle(GlowButtonStyle(tint: tint))
+                    .accessibilityHint(proposal.lowersProtection ? "Lowers protection. Asks you to confirm." : "Makes this change now.")
+                    if state == .pending { Button("Not now") { chat.dismissAction(proposal.id) }.buttonStyle(.borderless) }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(Spacing.m)
+        .background(tint.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(tint.opacity(proposal.lowersProtection ? 0.55 : 0.25)))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Suggested change: \(proposal.title)\(proposal.lowersProtection ? ", lowers protection" : "")")
+        .confirmationDialog("\(proposal.title)?", isPresented: $confirmLowering, titleVisibility: .visible) {
+            Button(proposal.title, role: .destructive) { chat.applyAction(proposal, confirmedLowering: true) }
+            Button("Keep Protection On", role: .cancel) {}
+        } message: { Text(verbatim: (proposal.action.warning ?? "") + " You can change this back in Settings.") }
+    }
+
+    private var canAct: Bool {
+        switch state {
+        case .pending?, .failed?: return true
+        default: return false
+        }
+    }
+
+    @ViewBuilder private var statusBadge: some View {
+        switch state {
+        case .running?: ProgressView().controlSize(.small)
+        case .done?: Badge(text: "Applied", tint: .green)
+        case .dismissed?: Badge(text: "Not applied", tint: .secondary)
+        case .failed?: Badge(text: "Failed", tint: .orange)
+        case .pending?: EmptyView()
+        case nil: Badge(text: "Expired: ask again", tint: .secondary)
+        }
     }
 }

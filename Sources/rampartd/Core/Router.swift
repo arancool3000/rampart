@@ -21,7 +21,8 @@ final class Router {
         switch r {
         case .quarantine, .restore, .deleteQuarantined, .allow, .fixPosture, .setWebProtection, .updateSignatures,
              .setSettings, .setRealtime, .remediate, .addAllowRule, .removeAllowRule,
-             .allowRemoteTool, .revokeRemoteTool, .setRemoteLockdown, .disableProtection, .requestUninstall, .uninstall: return true
+             .allowRemoteTool, .revokeRemoteTool, .setRemoteLockdown, .disableProtection, .requestUninstall, .uninstall,
+             .restoreQuarantinedTo, .exportQuarantined, .sandboxRun: return true
         default: return false
         }
     }
@@ -46,6 +47,8 @@ final class Router {
         case .uninstall: return "uninstall"; case .forwardEvents: return "forwardEvents"
         case .checkURL: return "checkURL"; case .scamCheck: return "scamCheck"; case .webLookup: return "webLookup"
         case .webVerdict: return "webVerdict"
+        case .restoreQuarantinedTo: return "restoreQuarantinedTo"; case .exportQuarantined: return "exportQuarantined"
+        case .sandboxRun: return "sandboxRun"
         }
     }
 
@@ -237,6 +240,12 @@ final class Router {
                     if e.kind == .other, e.detail["type"] == "clipboard" || e.source == "pasteguard" { DaemonHooks.ingestClipboard?(e) } else { rt.inject(e) }
                 }
                 _ = send(.ok)
+            case .restoreQuarantinedTo(let id, let path, let allow):
+                _ = try QuarantineSandbox.restore(p, id: id, to: path, allow: allow, peer: peer); _ = send(.ok)
+            case .exportQuarantined(let id, let path):
+                let r = try QuarantineSandbox.export(p, id: id, to: path, peer: peer); _ = send(.exported(path: r.path, password: r.password))
+            case .sandboxRun(let id, let confirmation):
+                _ = send(.sandboxReport(try JSONEncoder.rampart.encode(QuarantineSandbox.run(p, id: id, confirmation: confirmation, peer: peer))))
             case .subscribeEvents:
                 let token = p.subscribe(send)
                 _ = send(.ok)

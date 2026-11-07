@@ -64,6 +64,10 @@ final class AIChatModel {
 
     @ObservationIgnored let settings = AISettings.shared
     @ObservationIgnored let store = ChatStore()
+    @ObservationIgnored let gate = AIActionGate()
+    /// Proposal states for the cards (mirrors the gate). Proposals restored from saved chats aren't registered
+    /// with the gate, so they can't be applied: they show as expired.
+    var actionStates: [UUID: AIActionGate.State] = [:]
     @ObservationIgnored lazy var service = AIService(settings: settings)
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var revealTask: Task<Void, Never>?
@@ -185,7 +189,7 @@ final class AIChatModel {
         case .error: p = .error(s.text)
         case .text: p = .text(s.text)
         }
-        return Message(id: s.id, isUser: s.isUser, title: s.title, payload: p, date: s.date, sent: s.sent,
+        return Message(id: s.id, isUser: s.isUser, title: s.title, payload: p, date: s.date, sent: s.sent.map(AIService.cleanLegacyDisclosure),
                        redactionSummary: s.redactionSummary, meta: s.meta, revealed: .max)
     }
 
@@ -254,7 +258,7 @@ final class AIChatModel {
         let svc = service
         switch mode {
         case .ask:
-            let p = SecurityAssistant.prepare(question: q, history: hist, posture: posture, service: svc)
+            let p = SecurityAssistant.prepare(question: q, history: hist, posture: posture, actionContext: actionContext(posture), service: svc)
             run(userText: q, title: nil, prepared: p) { .reply($0) }
         case .scam:
             run(userText: q, title: "Scam check", prepared: ScamSecondOpinion.prepare(text: q, service: svc)) { .scam($0) }
@@ -271,6 +275,35 @@ final class AIChatModel {
 
     func planPosture(_ checks: [PostureCheck]) {
         run(userText: "Turn my Security Score into a plan", title: "Your security plan", prepared: ExplainPosture.prepare(checks, service: service)) { .plan($0) }
+    }
+
+    private func actionContext(_ posture: [PostureCheck]) -> AIActionValidator.Context {
+        let app = AppModel.shared
+        let failing = Set(posture.filter { $0.state == .fail && $0.fixable }.map(\.id)).intersection(AIAction.fixableCheckIDs)
+        return AIActionValidator.Context(settings: app.mode == .live ? app.settings : nil, fixableFailing: failing)
+    }
+
+    // MARK: Proposed actions (run only from the Apply button)
+
+    func dismissAction(_ id: UUID) { gate.dismiss(id); actionStates[id] = gate.state(id) }
+
+    func applyAction(_ p: AIProposedAction, confirmedLowering: Bool) {
+        guard actionStates[p.id] == .pending || { if case .failed = actionStates[p.id] { return true }; return false }() else { return }
+        actionStates[p.id] = .running
+        let gate = gate
+        let chatID = currentID
+        Task { [weak self] in
+            var line: String
+            do { line = try await gate.approve(p.id, confirmedLowering: confirmedLowering, executor: AppActionExecutor()) }
+            catch { line = "Couldn't apply “\(p.title)”: \(error)" }
+            guard let self else { return }
+            self.actionStates[p.id] = gate.state(p.id)
+            if let chatID, self.currentID == chatID {
+                let m = Message(isUser: false, payload: .text(line), revealed: .max)
+                self.messages.append(m)
+                self.record(m, in: chatID)
+            }
+        }
     }
 
     func cancel() { task?.cancel(); task = nil; isSending = false }
@@ -292,6 +325,10 @@ final class AIChatModel {
                 guard let self, !Task.isCancelled, self.currentID == chatID else { self?.isSending = false; return }
                 let meta = "\(out.model) · \(String(format: "%.1f", out.latency)) s · ~\(out.estimatedTokens) tokens estimated" + (out.usage?.totalTokenCount.map { ", \($0) used" } ?? "")
                 let m = Message(isUser: false, title: title, payload: wrap(out.output), sent: out.sentText, redactionSummary: out.redactionSummary, meta: meta, revealed: 0)
+                if case .reply(let r) = m.payload, let acts = r.actions {
+                    self.gate.register(acts)
+                    for a in acts { self.actionStates[a.id] = .pending }
+                }
                 self.record(m, in: chatID)
                 self.append(m)
             } catch {

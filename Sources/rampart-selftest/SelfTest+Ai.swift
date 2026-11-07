@@ -45,6 +45,8 @@ extension SelfTest {
         aiConsent()
         aiKeychain()
         aiChatStore()
+        aiDisclosure()
+        aiActions()
         aiLive()
     }
 
@@ -235,7 +237,8 @@ extension SelfTest {
         let an = PasteCommandAnalyzer(service: svc)
         let p = an.prepare(command: injected, decoded: ["echo hi"], sourceApp: "Safari")
         check(p.model == GeminiModel.fast.id && p.timeout == 4, "paste: fast model, 4 s budget")
-        check(p.disclosure.contains("<<<DATA command") && p.disclosure.contains("<<<DATA decoded_layer_1") && p.disclosure.contains("<<<DATA source_app"), "paste: data blocks")
+        let wire = p.request.contents.last?.parts.first?.text ?? ""
+        check(wire.contains("<<<DATA command") && wire.contains("<<<DATA decoded_layer_1") && wire.contains("<<<DATA source_app"), "paste: data blocks")
         let r = blockingAsync { await an.assess(command: injected, decoded: [], sourceApp: "Safari") }
         let v: PasteAIResult? = (try? r.get()) ?? nil
         check(v?.verdict == .malicious && (v?.confidence ?? 0) >= 85 && v?.injectionDetected == true, "paste: injection overrides benign verdict")
@@ -328,6 +331,119 @@ extension SelfTest {
         // Search.
         let rec = ChatRecord(title: "Firewall", messages: [StoredChatMessage(isUser: false, kind: .reply, text: "x", reply: reply)])
         check(rec.matches("firewall") && rec.matches("PRIVACY & security") && rec.matches("open system") && !rec.matches("bitcoin") && rec.matches(""), "search: titles and messages")
+    }
+
+    /// "What was sent" must never show the system prompt, markers, instruction line or schema.
+    static func aiDisclosure() {
+        let (svc, _) = testService(MockTransport([(200, "{}", [:])]))
+        let checks = [PostureCheck(id: "filevault", title: "FileVault", state: .fail, weight: 10, detail: "Off", fixable: false, fixHint: "")]
+        let det = Detection(path: "/Users/jdoe/Downloads/x.pkg", name: "Unsigned installer", category: .suspicious, severity: .medium, confidence: 60,
+                            evidence: [Evidence(source: .signing, title: "Unsigned", detail: "No signature", score: 40)])
+        let all: [(String, String, String?)] = [
+            ("chat", SecurityAssistant.prepare(question: "How do I turn on the firewall?", history: [ChatTurn(role: .user, text: "hi")], posture: checks,
+                                               actionContext: .init(), service: svc).disclosure, "How do I turn on the firewall?"),
+            ("explain", ExplainDetection.prepare(det, service: svc).disclosure, "Unsigned installer"),
+            ("scam", ScamSecondOpinion.prepare(text: "You won a prize", localSignals: ["prize words"], service: svc).disclosure, "You won a prize"),
+            ("link", URLReputationExplainer.prepare(url: "https://evil.test/a", localSignals: ["new domain"], service: svc).disclosure, "https://evil.test/a"),
+            ("posture", ExplainPosture.prepare(checks, service: svc).disclosure, nil),
+            ("paste", PasteCommandAnalyzer(service: svc).prepare(command: "ls -la", decoded: [], sourceApp: "Safari").disclosure, "ls -la"),
+        ]
+        for (name, d, content) in all {
+            let leaks = d.contains("<<<") || d.contains(">>>") || d.contains("DATA") || d.contains("You are the RamPart AI Assistant")
+                || d.contains("Rules you always follow") || d.contains("\"type\"") || d.contains("Answer the question") || d.contains("Explain this RamPart")
+                || d.contains("Assess whether") || d.contains("Build the prioritised") || d.contains("Classify the command") || d.contains("Explain why this link")
+            check(!leaks, "disclosure \(name): no prompt, markers or schema")
+            check(d.hasSuffix(".") && d.contains("Plus RamPart's instructions"), "disclosure \(name): plain summary")
+            if let content { check(d.contains(content) && d.count < 2000, "disclosure \(name): shows user content") }
+        }
+        check(all[0].1.contains("your 1 Security Score check results") && all[0].1.contains("last 1 message") && !all[0].1.contains("id=filevault"), "disclosure chat: context summarised")
+        check(all[2].1.contains("1 local warning sign") && !all[2].1.contains("prize words"), "disclosure scam: signals summarised")
+        let legacy = "Answer the question in the DATA block named question.\n\n<<<DATA security_score_checks AB12\n- id=x\nDATA>>> security_score_checks AB12\n\n<<<DATA question AB12\nIs my Mac safe?\nDATA>>> question AB12"
+        let cleaned = AIService.cleanLegacyDisclosure(legacy)
+        check(cleaned.hasPrefix("Is my Mac safe?") && !cleaned.contains("DATA") && !cleaned.contains("id=x"), "disclosure: legacy saved text cleaned")
+    }
+
+    fileprivate final class CountingExecutor: AIActionExecutor, @unchecked Sendable {
+        var runs: [AIAction] = []
+        func execute(_ a: AIAction) async throws -> String { runs.append(a); return "Done: \(a.title)" }
+    }
+
+    static func aiActions() {
+        var settings = RampartSettings(); settings.exclusions = ["~/Projects/build"]
+        let ctx = AIActionValidator.Context(settings: settings, fixableFailing: ["firewall", "remoteLogin"], lockdownOn: false)
+        let raw: [AIRawAction] = [
+            .init(action: "fixPosture", value: "firewall", reason: "Your firewall is off."),
+            .init(action: "rm -rf /", value: "x"),
+            .init(action: "fixPosture", value: "sip", reason: "Not allowed"),
+            .init(action: "fixPosture", value: "stealthMode", reason: "Not failing"),
+            .init(action: "realtimeOn", value: "on", reason: "Already on: no-op"),
+            .init(action: "scheduledScanHour", value: "30"),
+            .init(action: "addExclusion", value: "/"),
+            .init(action: "addExclusion", value: "~/Downloads/../.."),
+            .init(action: "remoteLockdown", value: "maybe"),
+        ]
+        let v = AIActionValidator.validate(raw, context: ctx)
+        check(v.map(\.action) == [.fixPosture("firewall")] && v.first?.title == "Turn the firewall on", "actions: unknown / out-of-range / no-op dropped")
+        let v2 = AIActionValidator.validate([.init(action: "quickScan"), .init(action: "quickScan"), .init(action: "realtimeOn", value: "off", reason: "r"),
+                                             .init(action: "addExclusion", value: "~/Projects/vm/"), .init(action: "updateDefinitions")], context: ctx)
+        check(v2.map(\.action) == [.quickScan, .setToggle(.realtimeOn, false), .addExclusion("~/Projects/vm")], "actions: dedupe, max 3, path normalised")
+        check(!v2[0].lowersProtection && v2[1].lowersProtection && v2[2].lowersProtection && v2[1].action.warning != nil, "actions: lowering flags")
+        check(AIAction.setToggle(.developerMode, true).lowersProtection && !AIAction.setToggle(.developerMode, false).lowersProtection
+              && AIAction.remoteLockdown(false).lowersProtection && !AIAction.remoteLockdown(true).lowersProtection
+              && AIAction.setToggle(.autoQuarantine, false).lowersProtection && !AIAction.fixPosture("firewall").lowersProtection, "actions: lowering table")
+        check(AIActionValidator.validate([.init(action: "removeExclusion", value: "~/Projects/build")], context: ctx).first?.action == .removeExclusion("~/Projects/build")
+              && AIActionValidator.validate([.init(action: "removeExclusion", value: "~/Nope")], context: ctx).isEmpty, "actions: remove only existing exclusion")
+        let applied = AIActionValidator.applying(.addExclusion("~/Projects/vm"), to: settings)
+        check(applied?.exclusions == ["~/Projects/build", "~/Projects/vm"] && applied?.realtimeOn == settings.realtimeOn
+              && AIActionValidator.applying(.quickScan, to: settings) == nil, "actions: read-modify-write settings")
+
+        // Chat parsing: proposals validated; ignored without an action context; never from scam tool (no field).
+        let body = #"{"answer":"Turn on the firewall.","steps":[],"relatedCheckIDs":[],"onTopic":true,"refused":false,"proposedActions":[{"action":"fixPosture","value":"firewall","reason":"It's off."},{"action":"deleteAllFiles","value":"","reason":"x"}]}"#
+        let tA = MockTransport([(200, envelope(body), [:])])
+        let (svcA, _) = testService(tA)
+        let oA = try? blockingAsync { try await svcA.run(SecurityAssistant.prepare(question: "Turn my firewall on", posture: [], actionContext: ctx, service: svcA)) }.get()
+        check(oA?.output.actions?.map(\.action) == [.fixPosture("firewall")], "actions: parsed from chat reply")
+        let sentSchema = tA.lastRequest?.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        check(sentSchema.contains("proposedActions") && sentSchema.contains("remoteLockdown"), "actions: schema sent with allow-list")
+        let tB = MockTransport([(200, envelope(body), [:])])
+        let (svcB, _) = testService(tB)
+        let oB = try? blockingAsync { try await svcB.run(SecurityAssistant.prepare(question: "q", posture: [], service: svcB)) }.get()
+        check(oB != nil && oB?.output.actions == nil, "actions: none without action context")
+        let refusedBody = body.replacingOccurrences(of: #""refused":false"#, with: #""refused":true"#)
+        let tC = MockTransport([(200, envelope(refusedBody), [:])])
+        let (svcC, _) = testService(tC)
+        let oC = try? blockingAsync { try await svcC.run(SecurityAssistant.prepare(question: "q", posture: [], actionContext: ctx, service: svcC)) }.get()
+        check(oC?.output.actions == nil, "actions: none when refused")
+        let scamSchema = ScamSecondOpinion.prepare(text: "x", service: svcA).request.generationConfig?.responseJsonSchema
+        check(scamSchema?["properties"]?["proposedActions"] == nil && URLReputationExplainer.prepare(url: "https://a.test", localSignals: [], service: svcA).request.generationConfig?.responseJsonSchema?["properties"]?["proposedActions"] == nil
+              && ExplainPosture.prepare([], service: svcA).request.generationConfig?.responseJsonSchema?["properties"]?["proposedActions"] == nil, "actions: only chat can propose")
+
+        // Gate: nothing runs without approve; lowering needs the second confirmation; single use.
+        let exec = CountingExecutor()
+        let results: [String] = (try? blockingAsync { () async throws -> [String] in
+            return try await Self.gateScenario(v2, exec)
+        }.get()) ?? []
+        check(results == ["pending-before", "needsConfirmation", "Done: Turn off real-time protection", "notPending", "dismissed-blocked", "unknown", "Done: Run a Quick Scan"], "gate: approval flow \(results)")
+        check(exec.runs == [.setToggle(.realtimeOn, false), .quickScan], "gate: executor only ran approved actions")
+    }
+
+    fileprivate static func gateScenario(_ props: [AIProposedAction], _ exec: CountingExecutor) async throws -> [String] {
+        var out: [String] = []
+        let gate = AIActionGate()
+        gate.register(props)
+        out.append(exec.runs.isEmpty && gate.state(props[1].id) == .pending ? "pending-before" : "ran-early")
+        do { try await gate.approve(props[1].id, confirmedLowering: false, executor: exec); out.append("ran-without-confirm") }
+        catch { out.append((error as? AIActionGate.ApproveError) == .needsConfirmation ? "needsConfirmation" : "\(error)") }
+        out.append(try await gate.approve(props[1].id, confirmedLowering: true, executor: exec))
+        do { try await gate.approve(props[1].id, confirmedLowering: true, executor: exec); out.append("ran-twice") }
+        catch { out.append((error as? AIActionGate.ApproveError) == .notPending ? "notPending" : "\(error)") }
+        gate.dismiss(props[2].id)
+        do { try await gate.approve(props[2].id, confirmedLowering: true, executor: exec); out.append("ran-dismissed") }
+        catch { out.append("dismissed-blocked") }
+        do { try await gate.approve(UUID(), confirmedLowering: true, executor: exec); out.append("ran-unknown") }
+        catch { out.append((error as? AIActionGate.ApproveError) == .unknown ? "unknown" : "\(error)") }
+        out.append(try await gate.approve(props[0].id, confirmedLowering: false, executor: exec))
+        return out
     }
 
     static func aiKeychain() {

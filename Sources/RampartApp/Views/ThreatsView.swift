@@ -7,7 +7,11 @@ struct ThreatsView: View {
     @Environment(AppModel.self) private var model
     @StateVar private var segment: Segment = .detections
     @StateVar private var selectedDetection: Detection.ID?
-    @StateVar private var selectedQuarantine: QuarantineRecord.ID?
+    @StateVar private var selectedQuarantine: Set<QuarantineRecord.ID> = []
+    @StateVar private var notesExpanded = false
+    @StateVar private var notesFilter = ""
+    /// Notes the user dismissed (per-viewer convenience; comma-separated UUIDs).
+    @AppStorage("threats.dismissedNotes") private var dismissedNotesRaw = ""
     @StateVar private var showInspector = true
     @StateVar private var sortOrder = [KeyPathComparator(\Detection.date, order: .reverse)]
     /// Records the user deleted but whose permanent delete hasn't run yet (undo window).
@@ -63,30 +67,38 @@ struct ThreatsView: View {
             Group {
                 if segment == .detections, let id = selectedDetection, let d = model.detections.first(where: { $0.id == id }) {
                     DetectionInspector(detection: d, record: record(for: d), onDelete: scheduleDelete, onRestored: offerReQuarantine)
-                } else if segment == .quarantine, let id = selectedQuarantine, let r = visibleQuarantine.first(where: { $0.id == id }) {
+                } else if segment == .quarantine, selectedQuarantine.count == 1, let id = selectedQuarantine.first,
+                          let r = visibleQuarantine.first(where: { $0.id == id }) {
                     DetectionInspector(detection: detection(for: r), record: r, onDelete: scheduleDelete, onRestored: offerReQuarantine)
                 } else {
-                    EmptyStateView(symbol: "info.circle", title: "Select an item", detail: "You'll see why \(Product.name) flagged it and what you can do.")
+                    EmptyStateView(symbol: "info.circle", title: segment == .quarantine && selectedQuarantine.count > 1 ? "\(selectedQuarantine.count) items selected" : "Select an item",
+                                   detail: segment == .quarantine && selectedQuarantine.count > 1
+                                       ? "Use Restore or Delete above to act on all of them."
+                                       : "You'll see why \(Product.name) flagged it and what you can do.")
                 }
             }
             .inspectorColumnWidth(min: 340, ideal: 400, max: 520)
         }
         .onAppear {
-            if selectedDetection == nil { selectedDetection = model.openDetections.first?.id ?? model.detections.first?.id }
-            if selectedQuarantine == nil { selectedQuarantine = model.quarantine.first?.id }
+            if selectedDetection == nil { selectedDetection = decisions.first(where: { !$0.resolved })?.id ?? decisions.first?.id }
+            if selectedQuarantine.isEmpty, let f = model.quarantine.first?.id { selectedQuarantine = [f] }
         }
     }
 
     // MARK: Undo
 
     /// Hides the record at once and deletes it for real only after a short grace period.
-    private func scheduleDelete(_ r: QuarantineRecord) {
+    private func scheduleDelete(_ r: QuarantineRecord) { scheduleDelete([r]) }
+
+    private func scheduleDelete(_ rs: [QuarantineRecord]) {
+        guard !rs.isEmpty else { return }
         finishUndo(commit: true)
-        pendingDeletes.insert(r.id)
-        if selectedQuarantine == r.id { selectedQuarantine = visibleQuarantine.first?.id }
-        let name = (r.originalPath as NSString).lastPathComponent
-        present(UndoNote(text: "Deleted \u{201C}\(name)\u{201D}", undo: { pendingDeletes.remove(r.id); selectedQuarantine = r.id },
-                         commit: { await model.delete(r); pendingDeletes.remove(r.id) }))
+        let ids = Set(rs.map(\.id))
+        pendingDeletes.formUnion(ids)
+        selectedQuarantine.subtract(ids)
+        let text = rs.count == 1 ? "Deleted \u{201C}\((rs[0].originalPath as NSString).lastPathComponent)\u{201D}" : "Deleted \(rs.count) items"
+        present(UndoNote(text: text, undo: { pendingDeletes.subtract(ids); selectedQuarantine = ids },
+                         commit: { for r in rs { await model.delete(r) }; pendingDeletes.subtract(ids) }))
     }
 
     /// After a restore, offers to put the file straight back in quarantine.
@@ -127,7 +139,58 @@ struct ThreatsView: View {
             ?? model.detections.first { $0.name == r.detectionName }
     }
 
-    private var sortedDetections: [Detection] { model.detections.sorted(using: sortOrder) }
+    // MARK: Decisions vs notes
+
+    /// Needs a decision (or already handled): alert level (>= 60) or quarantined. Everything else is a note.
+    private func isNote(_ d: Detection) -> Bool { d.confidence < 60 && record(for: d) == nil }
+    private var decisions: [Detection] { model.detections.filter { !isNote($0) }.sorted(using: sortOrder) }
+    private var dismissedNotes: Set<UUID> { Set(dismissedNotesRaw.split(separator: ",").compactMap { UUID(uuidString: String($0)) }) }
+    private var notes: [Detection] {
+        let gone = dismissedNotes
+        return model.detections.filter { isNote($0) && !gone.contains($0.id) }.sorted { $0.date > $1.date }
+    }
+    private var filteredNotes: [Detection] {
+        let q = notesFilter.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return notes }
+        return notes.filter { d in
+            [d.name, d.path ?? "", Self.tag(for: d, note: true)].contains { $0.lowercased().contains(q) }
+                || d.evidence.contains { $0.title.lowercased().contains(q) }
+        }
+    }
+
+    private func dismissAllNotes() {
+        var ids = dismissedNotes.union(notes.map(\.id))
+        let live = Set(model.detections.map(\.id))
+        ids = ids.intersection(live)            // forget ids that no longer exist
+        dismissedNotesRaw = ids.prefix(3000).map(\.uuidString).joined(separator: ",")
+        if let s = selectedDetection, ids.contains(s) { selectedDetection = decisions.first?.id }
+    }
+
+    /// Calm, accurate tag. Notes are "Note"; generic "suspicious" items name what was actually seen.
+    static func tag(for d: Detection, note: Bool) -> String {
+        if note { return "Note" }
+        guard d.category == .suspicious else { return d.category.label }
+        switch d.evidence.max(by: { $0.score < $1.score })?.source {
+        case .signing?: return "Code signing"
+        case .behaviour?: return "Unusual activity"
+        case .persistence?: return "Login item"
+        case .network?: return "Network activity"
+        case .heuristic?: return "Heuristic match"
+        case .hash?, .yara?, .xprotect?: return "Known signature"
+        default: return "Needs review"
+        }
+    }
+
+    private func itemCell(_ d: Detection) -> some View {
+        HStack(spacing: Spacing.s) {
+            FileIcon(path: d.path)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(d.path.map { ($0 as NSString).lastPathComponent } ?? d.name).lineLimit(1)
+                Text(d.path.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "—")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            }
+        }
+    }
 
     @ViewBuilder private var detectionsTable: some View {
         if model.detections.isEmpty {
@@ -136,86 +199,98 @@ struct ThreatsView: View {
                                ? "\(Product.name) checks new and changed files as they arrive. If it ever finds something, it will appear here with a plain explanation of why."
                                : "When \(Product.name) finds something, it will appear here with an explanation.", brand: true)
         } else {
-            Table(sortedDetections, selection: $selectedDetection, sortOrder: $sortOrder) {
-                TableColumn("Item", value: \.name) { d in
-                    HStack(spacing: Spacing.s) {
-                        FileIcon(path: d.path)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(d.path.map { ($0 as NSString).lastPathComponent } ?? d.name).lineLimit(1)
-                            Text(d.path.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "—")
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            VStack(spacing: 0) {
+                if decisions.isEmpty {
+                    HStack(spacing: Spacing.m) {
+                        Image(systemName: "checkmark.shield").font(.title2).foregroundStyle(Color.statusProtected).accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Nothing needs your attention").font(.headline)
+                            Text("\(Product.name) only logged a few notes for reference.").font(.callout).foregroundStyle(.secondary)
                         }
+                        Spacer()
                     }
-                }
-                .width(min: 220, ideal: 300)
-                TableColumn("Type") { d in Badge(text: d.category.label) }.width(min: 110, ideal: 150)
-                TableColumn("Severity", value: \.severity.rawValue) { d in
-                    Label { Text(d.severity.label) } icon: { Image(systemName: d.severity.symbol).foregroundStyle(d.severity.tint) }
-                }
-                .width(min: 80, ideal: 90)
-                TableColumn("Status") { d in DetectionStatus(detection: d, quarantined: record(for: d) != nil) }.width(min: 110, ideal: 130)
-                TableColumn("Detected", value: \.date) { d in Text(Fmt.ago(d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
-            }
-            .scrollContentBackground(.hidden)
-            .contextMenu(forSelectionType: Detection.ID.self) { ids in
-                if let id = ids.first, let d = model.detections.first(where: { $0.id == id }), let p = d.path {
-                    if FileManager.default.fileExists(atPath: p) {
-                        Button("Reveal in Finder") { NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "") }
-                        Divider()
+                    .padding(Spacing.l)
+                    if !notesExpanded { Spacer() }
+                } else {
+                    Table(decisions, selection: $selectedDetection, sortOrder: $sortOrder) {
+                        TableColumn("Item", value: \.name) { d in itemCell(d) }
+                            .width(min: 220, ideal: 300)
+                        TableColumn("Type") { d in Badge(text: Self.tag(for: d, note: false)) }.width(min: 110, ideal: 150)
+                        TableColumn("Severity", value: \.severity.rawValue) { d in
+                            Label { Text(d.severity.label) } icon: { Image(systemName: d.severity.symbol).foregroundStyle(d.severity.tint) }
+                        }
+                        .width(min: 80, ideal: 90)
+                        TableColumn("Status") { d in DetectionStatus(detection: d, quarantined: record(for: d) != nil) }.width(min: 110, ideal: 130)
+                        TableColumn("Detected", value: \.date) { d in Text(Fmt.ago(d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
                     }
-                    Button("Copy Path") { copy(p) }
-                    if let h = d.sha256 { Button("Copy SHA-256") { copy(h) } }
+                    .scrollContentBackground(.hidden)
+                    .contextMenu(forSelectionType: Detection.ID.self) { ids in detectionMenu(ids) }
                 }
+                if !notes.isEmpty { notesSection }
             }
         }
     }
 
-    @ViewBuilder private var quarantineTable: some View {
-        if visibleQuarantine.isEmpty {
-            EmptyStateView(symbol: "archivebox", title: "Quarantine is empty",
-                           detail: "Files \(Product.name) isolates will appear here. They can't run while they're here.")
-        } else {
-            VStack(spacing: 0) {
-                Table(visibleQuarantine, selection: $selectedQuarantine) {
-                    TableColumn("Item") { r in
-                        HStack(spacing: Spacing.s) {
-                            Image(systemName: "lock.square.stack").foregroundStyle(Color.statusQuarantined).font(.title3).frame(width: 24)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text((r.originalPath as NSString).lastPathComponent).lineLimit(1)
-                                Text(r.detectionName).font(.caption).foregroundStyle(.secondary)
-                            }
-                        }
+    @ViewBuilder private func detectionMenu(_ ids: Set<Detection.ID>) -> some View {
+        if let id = ids.first, let d = model.detections.first(where: { $0.id == id }), let p = d.path {
+            if FileManager.default.fileExists(atPath: p) {
+                Button("Reveal in Finder") { NSWorkspace.shared.selectFile(p, inFileViewerRootedAtPath: "") }
+                Divider()
+            }
+            Button("Copy Path") { copy(p) }
+            if let h = d.sha256 { Button("Copy SHA-256") { copy(h) } }
+        }
+    }
+
+    private var notesSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Divider()
+            HStack(spacing: Spacing.s) {
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { notesExpanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.right").rotationEffect(.degrees(notesExpanded ? 90 : 0)).font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text("Notes (\(notes.count))").font(.headline)
+                        Text("logged for reference, no action needed").font(.callout).foregroundStyle(.secondary)
                     }
-                    .width(min: 200, ideal: 240)
-                    TableColumn("Original location") { r in
-                        Text((r.originalPath as NSString).deletingLastPathComponent.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
-                            .font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Notes, \(notes.count), logged for reference, no action needed")
+                .accessibilityValue(notesExpanded ? "Expanded" : "Collapsed")
+                .help("Low-confidence observations, such as ad-hoc or unsigned code. Kept for reference; nothing was changed.")
+                Spacer()
+                if notesExpanded {
+                    TextField("Filter notes", text: $notesFilter).textFieldStyle(.roundedBorder).frame(maxWidth: 180).controlSize(.small)
+                }
+                Button("Dismiss All Notes") { dismissAllNotes() }.controlSize(.small)
+                    .help("Hide these notes. New notes will still appear.")
+            }
+            .padding(.horizontal, Spacing.m).padding(.vertical, Spacing.s)
+            if notesExpanded {
+                Table(filteredNotes, selection: $selectedDetection) {
+                    TableColumn("Item") { d in itemCell(d) }.width(min: 220, ideal: 300)
+                    TableColumn("Observation") { d in
+                        Text(d.evidence.max(by: { $0.score < $1.score })?.title ?? d.name).foregroundStyle(.secondary).lineLimit(1)
                     }
-                    TableColumn("Quarantined") { r in Text(Fmt.dayTime(r.date)).foregroundStyle(.secondary) }.width(min: 110, ideal: 130)
-                    TableColumn("Size") { r in Text(Fmt.bytes(r.size)).monospacedDigit().foregroundStyle(.secondary) }.width(min: 60, ideal: 70)
-                    TableColumn("Auto-delete") { r in
-                        Text(r.date.addingTimeInterval(30 * 86_400).formatted(date: .abbreviated, time: .omitted)).foregroundStyle(.secondary)
-                    }
-                    .width(min: 90, ideal: 100)
+                    .width(min: 140, ideal: 200)
+                    TableColumn("Type") { d in Badge(text: Self.tag(for: d, note: true)) }.width(min: 60, ideal: 70)
+                    TableColumn("Logged") { d in Text(Fmt.ago(d.date)).foregroundStyle(.secondary) }.width(min: 90, ideal: 110)
                 }
                 .scrollContentBackground(.hidden)
-                .contextMenu(forSelectionType: QuarantineRecord.ID.self) { ids in
-                    if let id = ids.first, let r = visibleQuarantine.first(where: { $0.id == id }) {
-                        Button("Copy Original Path") { copy(r.originalPath) }
-                        if !r.sha256.isEmpty { Button("Copy SHA-256") { copy(r.sha256) } }
-                        Divider()
-                        Button("Delete Permanently", role: .destructive) { scheduleDelete(r) }
-                    }
-                }
-                HStack {
-                    Image(systemName: "info.circle").foregroundStyle(.secondary)
-                    Text("Deleted automatically after 30 days.").foregroundStyle(.secondary)
-                    Button("Change in Settings") { model.selection = .settings }.buttonStyle(.link)
-                    Spacer()
-                }
-                .font(.callout).padding(Spacing.m)
+                .frame(minHeight: 160, idealHeight: decisions.isEmpty ? 400 : 220, maxHeight: decisions.isEmpty ? .infinity : 260)
+                .contextMenu(forSelectionType: Detection.ID.self) { ids in detectionMenu(ids) }
+                .transition(.opacity)
             }
         }
+        .background(Color.primary.opacity(0.02))
+    }
+
+    private var quarantineTable: some View {
+        QuarantineManagerView(records: visibleQuarantine, selection: $selectedQuarantine, showInspector: $showInspector,
+                              detection: { detection(for: $0) }, onDelete: { scheduleDelete($0) })
     }
 
     private func copy(_ s: String) {
@@ -310,7 +385,7 @@ struct DetectionInspector: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(displayName).font(.title3.weight(.semibold)).lineLimit(2)
                 HStack(spacing: 6) {
-                    if let d = detection { Badge(text: d.category.label) }
+                    if let d = detection { Badge(text: ThreatsView.tag(for: d, note: d.confidence < 60 && record == nil)) }
                     if record != nil { Badge(text: "Quarantined", tint: .gray) }
                 }
             }

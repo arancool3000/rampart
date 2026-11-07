@@ -53,7 +53,7 @@ public final class PasteCommandAnalyzer: @unchecked Sendable {
         blocks.append(("source_app", sourceApp ?? "unknown"))
         let localInjection = Self.localInjectionSignals([command] + decoded)
         return service.prepare(tool: "PasteCommandAnalyzer", model: GeminiModel.fast.id,
-                               system: Self.system, blocks: blocks,
+                               system: Self.system, blocks: blocks, context: ["source_app": "the app it was copied from"],
                                instruction: "Classify the command in the DATA blocks.", schema: Self.schema,
                                maxOutputTokens: 400, timeout: budget, raw: Raw.self) { Self.validate($0, localInjection: localInjection) }
     }

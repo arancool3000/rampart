@@ -1,9 +1,14 @@
 import Foundation
 import CryptoKit
 
-/// RFC 6238 time-based one-time passwords (RFC 4226 HOTP with a time counter).
+/// RFC 6238 time-based one-time passwords (RFC 4226 HOTP with a time counter). `kind == .hotp` makes it a
+/// counter-based RFC 4226 token instead.
 public struct TOTP: Codable, Hashable, Sendable {
     public enum Algorithm: String, Codable, Sendable, CaseIterable { case sha1 = "SHA1", sha256 = "SHA256", sha512 = "SHA512" }
+    public enum Kind: String, Codable, Sendable, CaseIterable { case totp, hotp }
+    public var kind: Kind = .totp
+    /// HOTP moving counter (ignored for TOTP).
+    public var counter: UInt64 = 0
 
     public var secret: Data
     public var digits: Int
@@ -21,18 +26,23 @@ public struct TOTP: Codable, Hashable, Sendable {
     public init?(string: String) {
         let s = string.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.lowercased().hasPrefix("otpauth://") {
-            guard let c = URLComponents(string: s), c.host?.lowercased() == "totp" else { return nil }
+            guard let c = URLComponents(string: s), let host = c.host?.lowercased(), let kind = Kind(rawValue: host) else { return nil }
             let q = Dictionary((c.queryItems ?? []).map { ($0.name.lowercased(), $0.value ?? "") }, uniquingKeysWith: { a, _ in a })
             guard let sec = q["secret"].flatMap(Base32.decode), !sec.isEmpty else { return nil }
             let label = c.path.hasPrefix("/") ? String(c.path.dropFirst()) : c.path
-            let parts = label.split(separator: ":", maxSplits: 1).map(String.init)
+            let parts = label.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            let qIssuer = q["issuer"].map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
+            let account = parts.last.flatMap { $0.isEmpty ? nil : $0 }
+            guard let alg = Algorithm(rawValue: (q["algorithm"] ?? "SHA1").uppercased()) else { return nil }
             self.init(secret: sec,
                       digits: Int(q["digits"] ?? "") ?? 6,
                       period: Int(q["period"] ?? "") ?? 30,
-                      algorithm: Algorithm(rawValue: (q["algorithm"] ?? "SHA1").uppercased()) ?? .sha1,
-                      issuer: q["issuer"] ?? (parts.count == 2 ? parts[0] : nil),
-                      account: parts.last)
-            guard (6...10).contains(digits), period > 0 else { return nil }
+                      algorithm: alg,
+                      issuer: qIssuer ?? (parts.count == 2 && !parts[0].isEmpty ? parts[0] : nil),
+                      account: account)
+            self.kind = kind
+            if kind == .hotp { guard let ctr = UInt64(q["counter"] ?? "0") else { return nil }; counter = ctr }
+            guard (6...10).contains(digits), (1...300).contains(period) else { return nil }
         } else {
             guard let sec = Base32.decode(s), sec.count >= 10 else { return nil }
             self.init(secret: sec)
@@ -41,17 +51,20 @@ public struct TOTP: Codable, Hashable, Sendable {
 
     public var uri: String {
         var c = URLComponents()
-        c.scheme = "otpauth"; c.host = "totp"
+        c.scheme = "otpauth"; c.host = kind.rawValue
         c.path = "/" + [issuer, account].compactMap { $0 }.joined(separator: ":")
         c.queryItems = [URLQueryItem(name: "secret", value: Base32.encode(secret)),
                         URLQueryItem(name: "algorithm", value: algorithm.rawValue),
                         URLQueryItem(name: "digits", value: String(digits)),
-                        URLQueryItem(name: "period", value: String(period))] + (issuer.map { [URLQueryItem(name: "issuer", value: $0)] } ?? [])
-        return c.string ?? ""
+                        kind == .hotp ? URLQueryItem(name: "counter", value: String(counter)) : URLQueryItem(name: "period", value: String(period))]
+            + (issuer.map { [URLQueryItem(name: "issuer", value: $0)] } ?? [])
+        // URLComponents leaves "+" and ":" in queries; encode "+" so issuers like "A+B" survive.
+        return (c.string ?? "").replacingOccurrences(of: "+", with: "%2B")
     }
 
     public func code(at date: Date = Date()) -> String {
-        Self.hotp(secret: secret, counter: UInt64(max(0, date.timeIntervalSince1970) / Double(period)), digits: digits, algorithm: algorithm)
+        if kind == .hotp { return Self.hotp(secret: secret, counter: counter, digits: digits, algorithm: algorithm) }
+        return Self.hotp(secret: secret, counter: UInt64(max(0, date.timeIntervalSince1970) / Double(period)), digits: digits, algorithm: algorithm)
     }
 
     public func secondsRemaining(at date: Date = Date()) -> Int {

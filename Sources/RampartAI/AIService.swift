@@ -7,7 +7,8 @@ public struct AIPrepared<Output: Sendable>: @unchecked Sendable {
     public var tool: String
     public var model: String
     public var request: GeminiRequest
-    /// Exactly the user-turn text that goes to Google (system prompt excluded; it's fixed and public in source).
+    /// What the user sees under "What was sent": their own content (redacted, without any markers or
+    /// instructions) plus a plain summary of the context RamPart added. Never the system prompt or schema.
     public var disclosure: String
     public var redaction: Redactor.Result
     public var estimatedTokens: Int
@@ -59,28 +60,51 @@ public final class AIService: @unchecked Sendable {
 
     // MARK: Builder shared by tools
 
+    /// `blocks`: (label, content). Labels in `context` are summarised in the disclosure instead of shown.
     func prepare<Raw: Decodable, Output>(tool: String, model: String? = nil, system: String, history: [GeminiContent] = [],
-                                         blocks: [(String, String)], instruction: String, schema: JSONValue,
+                                         blocks: [(String, String)], context: [String: String] = [:], instruction: String, schema: JSONValue,
                                          maxOutputTokens: Int = 1200, timeout: TimeInterval = 0,
                                          raw: Raw.Type, validate: @escaping (Raw) throws -> Output) -> AIPrepared<Output> {
         let nonce = PromptKit.nonce()
         var counts: [Redactor.Kind: Int] = [:]
         var parts: [String] = []
+        var visible: [String] = []
+        var summaries: [String] = []
         for (label, content) in blocks {
             let r = redactor.redact(content)
             r.counts.forEach { counts[$0.key, default: 0] += $0.value }
             parts.append(PromptKit.block(label, r.text, nonce: nonce))
+            if let summary = context[label] { summaries.append(summary) } else { visible.append(PromptKit.neutralize(r.text)) }
         }
         let userText = instruction + "\n\n" + parts.joined(separator: "\n\n")
         let req = GeminiClient.buildRequest(system: PromptKit.baseRules + "\n\n" + system,
                                             turns: history + [GeminiContent(role: "user", text: userText)],
                                             schema: schema, maxOutputTokens: maxOutputTokens)
-        let historyText = history.map { ($0.role ?? "") + ": " + $0.parts.compactMap(\.text).joined() }.joined(separator: "\n")
-        return AIPrepared(tool: tool, model: model ?? settings.modelID, request: req,
-                          disclosure: (historyText.isEmpty ? "" : "Earlier conversation:\n" + historyText + "\n\n") + userText,
+        if !history.isEmpty { summaries.insert("the last \(history.count) message\(history.count == 1 ? "" : "s") of this conversation", at: 0) }
+        let tail = "Plus RamPart's instructions" + (summaries.isEmpty ? "" : " and " + Self.list(summaries)) + "."
+        let disclosure = (visible.isEmpty ? "" : visible.joined(separator: "\n\n") + "\n\n") + tail
+        return AIPrepared(tool: tool, model: model ?? settings.modelID, request: req, disclosure: disclosure,
                           redaction: Redactor.Result(text: userText, counts: counts),
                           estimatedTokens: GeminiClient.estimateTokens(req), timeout: timeout,
                           decode: { text in try validate(try GeminiClient.decodeJSON(Raw.self, from: text)) })
+    }
+
+    static func list(_ a: [String]) -> String {
+        a.count <= 1 ? (a.first ?? "") : a.dropLast().joined(separator: ", ") + " and " + a.last!
+    }
+
+    /// Cleans "What was sent" text saved by older builds (which included markers and the instruction line).
+    public static func cleanLegacyDisclosure(_ s: String) -> String {
+        guard s.contains("<<<DATA") || s.contains("DATA>>>") else { return s }
+        var keep: [String] = []
+        var inside = false, label = ""
+        for line in s.components(separatedBy: "\n") {
+            if line.hasPrefix("<<<DATA ") { inside = true; label = line.split(separator: " ").dropFirst().first.map(String.init) ?? ""; continue }
+            if line.hasPrefix("DATA>>>") { inside = false; continue }
+            if inside && !["security_score_checks", "local_signals", "source_app"].contains(label) { keep.append(line) }
+        }
+        let body = keep.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (body.isEmpty ? "" : body + "\n\n") + "Plus RamPart's instructions and context."
     }
 }
 

@@ -9,8 +9,7 @@ struct PasswordsView: View {
     var body: some View {
         Group {
             switch model.phase {
-            case .noVault: VaultLockScreen(creating: true)
-            case .locked: VaultLockScreen(creating: false)
+            case .noVault, .locked: lockedTabs
             case .unlocked: unlocked
             }
         }
@@ -27,6 +26,24 @@ struct PasswordsView: View {
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.85), value: model.toast)
         .onAppear { model.refreshPhase() }
+    }
+
+    @StateVar private var lockedTab = 0
+
+    /// While locked: the lock screen, plus the password checker that works without unlocking.
+    private var lockedTabs: some View {
+        VStack(spacing: 0) {
+            if lockedTab == 0 { VaultLockScreen(creating: model.phase == .noVault) } else { PasswordCheckerView() }
+        }
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("Section", selection: $lockedTab) {
+                    Label(model.phase == .noVault ? "Create Vault" : "Unlock", systemImage: "lock.fill").tag(0)
+                    Label("Password Checker", systemImage: "checkmark.shield").tag(1)
+                }
+                .pickerStyle(.segmented).labelsHidden()
+            }
+        }
     }
 
     private var unlocked: some View {

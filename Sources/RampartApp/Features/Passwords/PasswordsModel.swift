@@ -3,6 +3,7 @@ import AppKit
 import Observation
 import UniformTypeIdentifiers
 import RampartVault
+import LocalAuthentication
 
 /// State for the Passwords screen. One shared instance so the lock state survives sidebar navigation.
 /// Never logs secrets; decrypted items live only while unlocked and are dropped on lock.
@@ -49,6 +50,11 @@ final class PasswordsModel {
     var generatorHistory = GeneratorHistory()
     /// When the copied secret will be cleared from the clipboard (drives the countdown).
     var clipboardDeadline: Date?
+    /// The one locked item currently revealed (re-locks on navigation, hide, minimise or 60 s idle).
+    var revealedItem: UUID?
+    var itemUnlockError: String?
+    @ObservationIgnored private var revealTimer: Timer?
+    @ObservationIgnored private var revealObservers: [NSObjectProtocol] = []
     var lastBreachSweep: Date?
     @ObservationIgnored let breachChecker = BreachChecker()
     @ObservationIgnored private var sweepTask: Task<Void, Never>?
@@ -110,6 +116,7 @@ final class PasswordsModel {
     func lock() {
         autoLock?.stop(); autoLock = nil
         sweepTask?.cancel(); sweepTask = nil; breachSweepRunning = false
+        relockItem()
         breachChecker.clearCache()
         generatorHistory.clear(); clipboardDeadline = nil
         ClipboardGuard.shared.clearIfOurs()
@@ -309,6 +316,114 @@ final class PasswordsModel {
     func runAudit(checkBreaches: Bool) async {
         reload()
         if checkBreaches { startBreachSweep(force: true) }
+    }
+
+    // MARK: Per-item lock (secure notes and "Require Touch ID to view")
+
+    func isItemHidden(_ item: VaultItem) -> Bool { meta.requiresItemUnlock(item) && revealedItem != item.id }
+
+    func setItemLock(_ id: UUID, _ on: Bool) {
+        perform { try self.store.updateMeta { m in m.lockedItems.removeAll { $0 == id }; if on { m.lockedItems.append(id) } } }
+    }
+
+    /// Touch ID (falling back to the Mac's login password). Never called during development or headless.
+    func unlockItem(_ item: VaultItem) async {
+        guard !Headless.active else { return }
+        itemUnlockError = nil
+        let ctx = LAContext()
+        ctx.localizedFallbackTitle = "Use Password"
+        var err: NSError?
+        guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) else {
+            itemUnlockError = "Touch ID isn't available. Enter your master password instead."; return
+        }
+        do {
+            let ok = try await ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "show “\(item.title)”")
+            if ok { reveal(item.id) }
+        } catch let e as LAError where e.code == .userCancel || e.code == .appCancel || e.code == .systemCancel {
+        } catch { itemUnlockError = error.localizedDescription }
+    }
+
+    func unlockItem(_ item: VaultItem, master: String) async {
+        if await verifyMaster(master) { reveal(item.id) } else { itemUnlockError = "That master password is not correct." }
+    }
+
+    private func reveal(_ id: UUID) {
+        relockItem()
+        revealedItem = id
+        let nc = NotificationCenter.default
+        for name in [NSApplication.didHideNotification, NSApplication.didResignActiveNotification, NSWindow.didMiniaturizeNotification] {
+            revealObservers.append(nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.relockItem() }
+            })
+        }
+        revealTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { if AutoLock.systemIdleSeconds >= 60 { self?.relockItem() } }
+        }
+    }
+
+    /// Hides the revealed item again and stops watching. Views never keep their own copy of the content.
+    func relockItem() {
+        revealTimer?.invalidate(); revealTimer = nil
+        for o in revealObservers { NotificationCenter.default.removeObserver(o) }
+        revealObservers = []
+        if revealedItem != nil { revealedItem = nil }
+    }
+
+    // MARK: Authenticator (accounts are .totp vault items; secrets stay inside the encrypted vault)
+
+    var authenticatorItems: [VaultItem] {
+        let auth = items.filter { $0.kind == .totp && $0.totp != nil }
+        let order = Dictionary(meta.authenticatorOrder.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+        return auth.sorted { a, b in
+            if a.favourite != b.favourite { return a.favourite }
+            let oa = order[a.id] ?? Int.max, ob = order[b.id] ?? Int.max
+            return oa != ob ? oa < ob : a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+        }
+    }
+
+    /// Adds accounts, skipping duplicates. Returns (added, duplicates).
+    @discardableResult
+    func addAuthenticatorAccounts(_ accounts: [TOTP]) -> (Int, Int) {
+        let existing = items.compactMap(\.totp)
+        let (kept, dup) = Authenticator.dedupe(accounts, against: existing)
+        if !kept.isEmpty { perform { try self.store.insert(kept.map(Authenticator.makeItem)) } }
+        flash("Added \(kept.count) account\(kept.count == 1 ? "" : "s")\(dup > 0 ? ", skipped \(dup) duplicate\(dup == 1 ? "" : "s")" : "").")
+        return (kept.count, dup)
+    }
+
+    func moveAuthenticator(from: IndexSet, to: Int) {
+        var ids = authenticatorItems.map(\.id)
+        ids.move(fromOffsets: from, toOffset: to)
+        perform { try self.store.updateMeta { $0.authenticatorOrder = ids } }
+    }
+
+    /// HOTP: advance the counter (shows the next code) and save.
+    func advanceHOTP(_ item: VaultItem) {
+        guard var t = item.totp, t.kind == .hotp else { return }
+        t.counter += 1
+        var i = item; i.totpSecret = t.uri
+        perform { try self.store.upsert(i) }
+    }
+
+    func verifyMaster(_ pw: String) async -> Bool {
+        let store = store
+        return await Task.detached { store.verifyMasterPassword(pw) }.value
+    }
+
+    func exportAuthenticator(password: String) async {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "RamPart Authenticator.rpexport"
+        panel.message = "The export is encrypted with the password you chose (AES-256-GCM, PBKDF2)."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        busy = true
+        let auth = authenticatorItems
+        let result: Result<Data, Error> = await Task.detached { Result { try EncryptedExport.export(items: auth, folders: [], password: password) } }.value
+        busy = false
+        switch result {
+        case .success(let d):
+            do { try d.write(to: url, options: .atomic); flash("Exported \(auth.count) accounts, encrypted.") } catch { self.error = error.localizedDescription }
+        case .failure(let e): error = e.localizedDescription
+        }
     }
 
     // MARK: Import / export

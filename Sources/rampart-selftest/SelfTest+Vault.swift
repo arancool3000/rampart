@@ -21,6 +21,7 @@ extension SelfTest {
         vaultCSV(dir)
         vaultAudit()
         vaultBreachMonitor()
+        vaultAuthenticator()
         vaultKeychain()
         vaultTouchID(env)
     }
@@ -283,6 +284,78 @@ extension SelfTest {
         var g = VaultItem(kind: .login, title: "GitHub"); g.urls = ["https://github.com"]; g.password = strong; g.totpSecret = "JBSWY3DPEHPK3PXP"
         let pa = VaultAudit.run(items: [g])
         check(pa.items(.passkey) == [g.id] && pa.problemItemCount == 0 && pa.score == 100, "audit: passkey is an opportunity, not a problem")
+    }
+
+    /// Authenticator: otpauth parsing, Keyring paste, Google migration protobuf, HOTP vectors, dedupe.
+    static func vaultAuthenticator() {
+        let s1 = Data("12345678901234567890".utf8), b32 = Base32.encode(s1)
+        // RFC 4226 Appendix D HOTP vectors.
+        let hotp = ["755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"]
+        for (c, want) in hotp.enumerated() {
+            check(TOTP.hotp(secret: s1, counter: UInt64(c), digits: 6, algorithm: .sha1) == want, "hotp vector \(c)")
+        }
+        let h = TOTP(string: "otpauth://hotp/Corp:bob?secret=\(b32)&counter=7")
+        check(h?.kind == .hotp && h?.counter == 7 && h?.code() == "162583", "authenticator: hotp uri + counter")
+        check(h.flatMap { TOTP(string: $0.uri) } == h, "authenticator: hotp uri round trip")
+        // Labels, URL-encoding, issuer param precedence, params.
+        let enc = TOTP(string: "otpauth://totp/ACME%20Co:jane%40example.com?secret=\(b32.lowercased())&algorithm=sha256&digits=8&period=60")
+        check(enc?.issuer == "ACME Co" && enc?.account == "jane@example.com" && enc?.algorithm == .sha256 && enc?.digits == 8 && enc?.period == 60, "authenticator: encoded label + params")
+        let pref = TOTP(string: "otpauth://totp/Old:alice?secret=\(b32)&issuer=New%20Name")
+        check(pref?.issuer == "New Name" && pref?.account == "alice", "authenticator: issuer param wins")
+        check(TOTP(string: "otpauth://totp/alice?secret=\(b32)")?.issuer == nil, "authenticator: account-only label")
+        check(TOTP(string: "otpauth://totp/x?secret=NOT*BASE32") == nil, "authenticator: bad base32 rejected")
+        check(TOTP(string: "otpauth://totp/x?secret=\(b32)&algorithm=MD5") == nil, "authenticator: unknown algorithm rejected")
+        check(TOTP(string: "otpauth://totp/x?secret=\(b32)&digits=4") == nil, "authenticator: 4 digits rejected")
+        check(TOTP(string: "otpauth://steam/x?secret=\(b32)") == nil, "authenticator: unknown type rejected")
+        let plus = TOTP(secret: s1, issuer: "A+B", account: "me")
+        check(TOTP(string: plus.uri)?.issuer == "A+B", "authenticator: '+' survives round trip")
+        // Keyring-style "Copy all": one link per line, blank lines and junk reported.
+        let paste = """
+        otpauth://totp/GitHub:octo?secret=\(b32)&issuer=GitHub
+
+        otpauth://totp/Google:me%40gmail.com?secret=JBSWY3DPEHPK3PXP&issuer=Google&period=30&digits=6&algorithm=SHA1
+          otpauth://totp/Discord:me?secret=GEZDGNBVGY3TQOJQ
+        hello
+        """
+        let pr = Authenticator.parse(paste)
+        check(pr.accounts.map { $0.issuer ?? "" } == ["GitHub", "Google", "Discord"] && pr.errors.count == 1, "authenticator: keyring multi-line paste")
+        // Dedupe by issuer + account + secret (case-insensitive names).
+        var dupe = pr.accounts[0]; dupe.issuer = "github"; dupe.account = "OCTO"
+        let d = Authenticator.dedupe([dupe, pr.accounts[1], pr.accounts[1]], against: [pr.accounts[0]])
+        check(d.kept.count == 1 && d.duplicates == 2, "authenticator: dedupe")
+        var other = pr.accounts[0]; other.secret = Data(repeating: 9, count: 20)
+        check(Authenticator.dedupe([other], against: [pr.accounts[0]]).kept.count == 1, "authenticator: same name, different secret kept")
+        check(!Authenticator.warnings(TOTP(secret: Data(count: 5))).isEmpty && Authenticator.warnings(TOTP(secret: s1)).isEmpty, "authenticator: weak params warned")
+        // Google Authenticator migration fixture built by hand (protobuf).
+        func varint(_ v: UInt64) -> [UInt8] { var v = v, o: [UInt8] = []; repeat { var b = UInt8(v & 0x7f); v >>= 7; if v > 0 { b |= 0x80 }; o.append(b) } while v > 0; return o }
+        func field(_ n: Int, _ bytes: [UInt8]) -> [UInt8] { varint(UInt64(n << 3 | 2)) + varint(UInt64(bytes.count)) + bytes }
+        func vfield(_ n: Int, _ v: UInt64) -> [UInt8] { varint(UInt64(n << 3)) + varint(v) }
+        let otp1 = field(1, Array(s1)) + field(2, Array("Example:alice@example.com".utf8)) + field(3, Array("Example".utf8)) + vfield(4, 1) + vfield(5, 1) + vfield(6, 2)
+        let otp2 = field(1, Array(s1)) + field(2, Array("bob".utf8)) + vfield(4, 2) + vfield(5, 2) + vfield(6, 1) + vfield(7, 3)
+        let payload = field(1, otp1) + field(1, otp2) + vfield(2, 1) + vfield(3, 1) + vfield(4, 0) + vfield(5, 12345)
+        let b64 = Data(payload).base64EncodedString().addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+        let mig = Authenticator.parse("otpauth-migration://offline?data=\(b64)").accounts
+        check(mig.count == 2 && mig[0].issuer == "Example" && mig[0].account == "alice@example.com" && mig[0].secret == s1 && mig[0].kind == .totp && mig[0].digits == 6,
+              "authenticator: google migration totp")
+        check(mig.count == 2 && mig[1].kind == .hotp && mig[1].counter == 3 && mig[1].algorithm == .sha256 && mig[1].digits == 8 && mig[1].account == "bob",
+              "authenticator: google migration hotp")
+        check(GoogleMigration.decodePayload(Data([0x0a, 0xff])) == nil, "authenticator: truncated protobuf rejected")
+        // JSON exports.
+        let aegis = #"{"version":1,"db":{"version":2,"entries":[{"type":"totp","name":"me","issuer":"Aegis Site","info":{"secret":"\#(b32)","algo":"SHA1","digits":6,"period":30}}]}}"#
+        check(Authenticator.parse(aegis).accounts.first?.issuer == "Aegis Site", "authenticator: aegis json")
+        let twofas = #"{"services":[{"name":"2FAS Site","secret":"\#(b32)","otp":{"account":"me","digits":6,"period":30,"algorithm":"SHA1","tokenType":"TOTP"}}]}"#
+        check(Authenticator.parse(twofas).accounts.first?.account == "me", "authenticator: 2fas json")
+        let bw = #"{"items":[{"name":"BW","login":{"username":"u","totp":"\#(b32)"}}]}"#
+        check(Authenticator.parse(bw).accounts.first?.issuer == "BW", "authenticator: bitwarden json")
+        // Stored as an encrypted vault item.
+        let item = Authenticator.makeItem(pr.accounts[0])
+        check(item.kind == .totp && item.totp?.secret == s1 && item.title == "GitHub", "authenticator: vault item")
+        // Per-item lock: secure notes always, others when marked.
+        var lm = VaultMeta(); let note = VaultItem(kind: .secureNote, title: "n"); let login = VaultItem(kind: .login, title: "l")
+        check(lm.requiresItemUnlock(note) && !lm.requiresItemUnlock(login), "item lock: notes locked by default")
+        lm.lockedItems = [login.id]
+        let lmRT = (try? JSONEncoder().encode(lm)).flatMap { try? JSONDecoder().decode(VaultMeta.self, from: $0) }
+        check(lmRT?.requiresItemUnlock(login) == true, "item lock: marked item persists")
     }
 
     static func vaultKeychain() {

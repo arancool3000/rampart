@@ -10,6 +10,8 @@ enum FeatureRouter {
         case .aiAssistant: AIAssistantView()
         case .remoteAccess: RemoteAccessView()
         case .passwords: PasswordsView()
+        case .authenticator: AuthenticatorView()
+        case .passwordChecker: PasswordCheckerView()
         case .networkScan: NetworkScanView()
         // Not built yet: replace the placeholder with the owner's view when it lands.
         case .scamCheck: ScamCheckView()
