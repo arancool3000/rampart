@@ -102,6 +102,7 @@ struct RampartApp: App {
     private var mainWindow: some Scene {
         Window(Product.name, id: "main") {
             RootView()
+                .disclosureGroupStyle(FullRowDisclosureStyle())
                 .background(HeadlessWindowHider())
                 .environment(model)
                 .tint(.rampartTeal)
@@ -114,6 +115,7 @@ struct RampartApp: App {
     @SceneBuilder private var settingsAndMenuBar: some Scene {
         Settings {
             SettingsView(standalone: true)
+                .disclosureGroupStyle(FullRowDisclosureStyle())
                 .environment(model)
                 .tint(.rampartTeal)
                 .frame(width: 680, height: 560)
@@ -121,6 +123,7 @@ struct RampartApp: App {
 
         MenuBarExtra(isInserted: chrome.menuBarBinding) {
             MenuBarView()
+                .disclosureGroupStyle(FullRowDisclosureStyle())
                 .environment(model)
                 .tint(.rampartTeal)
         } label: {
