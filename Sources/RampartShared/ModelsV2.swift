@@ -117,6 +117,8 @@ public enum ActivityEvent: String, Codable, Sendable, CaseIterable {
     case vaultEvent, authenticatorEvent
     // maintenance
     case refreshCleanup, refreshUndo, networkScan
+    // Cat & Mouse deception messages (decoys touched, tarpit visits)
+    case deceptionEvent
     // service
     case serviceStarted, serviceStopped, uninstall
     /// Older free-text entries that match no known decision.

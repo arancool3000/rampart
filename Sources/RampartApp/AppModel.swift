@@ -188,6 +188,7 @@ enum ScanPhase: Equatable {
     case finished(ScanRecord, [Detection])
 }
 
+/// One Protection Activity row: the stored entry plus its plain-English presentation (computed once).
 struct ActivityItem: Identifiable, Hashable {
     enum Kind: String, CaseIterable, Identifiable {
         case threat, network, scan, update, settings, protection
@@ -204,19 +205,45 @@ struct ActivityItem: Identifiable, Hashable {
             case .update: return "arrow.triangle.2.circlepath"; case .settings: return "gearshape"; case .protection: return "shield.lefthalf.filled"
             }
         }
+        var entryKind: ActivityEntry.Kind {
+            switch self {
+            case .threat: return .detection; case .network: return .webBlock; case .scan: return .scan
+            case .update: return .update; case .settings: return .settings; case .protection: return .system
+            }
+        }
     }
-    let id = UUID()
-    var date: Date
-    var kind: Kind
-    var title: String
-    var outcome: String
-
+    let entry: ActivityEntry
+    let presentation: ActivityPresentation
+    /// Lowercased title, subtitle, explanation and facts (search).
+    let searchText: String
+    var id: UUID { entry.id }
+    var date: Date { entry.date }
+    var kind: Kind {
+        switch presentation.category {
+        case .threats: return .threat; case .web, .network: return .network; case .scans: return .scan
+        case .updates: return .update; case .settings: return .settings; case .protection, .privacy, .maintenance: return .protection
+        }
+    }
     /// hx8: titles and outcomes carry file names, process names and daemon text. Shown as one plain line.
-    init(date: Date, kind: Kind, title: String, outcome: String) {
-        self.date = date; self.kind = kind
-        self.title = SafeText.line(title, max: 160)
-        self.outcome = SafeText.line(outcome, max: 80)
+    let title: String
+    let outcome: String
+
+    init(entry: ActivityEntry) {
+        self.entry = entry
+        let p = ActivityPresenter.present(entry)
+        presentation = p
+        self.title = SafeText.line(p.title, max: 160)
+        self.outcome = SafeText.line(p.status, max: 80)
+        searchText = ActivityPresenter.searchText(p, entry).lowercased()
     }
+
+    /// Free-text item (demo data and older call sites).
+    init(date: Date, kind: Kind, title: String, outcome: String) {
+        self.init(entry: ActivityEntry(date: date, kind: kind.entryKind, title: title, outcome: outcome))
+    }
+
+    static func == (a: ActivityItem, b: ActivityItem) -> Bool { a.entry == b.entry }
+    func hash(into h: inout Hasher) { h.combine(entry.id) }
 }
 
 // SafeText lives in RampartShared/SafeText.swift (hx8: shared with the CLI, the browser and rampart-selftest).
@@ -354,7 +381,16 @@ final class AppModel {
     @ObservationIgnored private var pauseTimer: Timer?
     @ObservationIgnored private var lastHeavyRefresh = Date.distantPast
     @ObservationIgnored private var lastNetworkStats: NetworkStats?
-    @ObservationIgnored private var lastActivity: [ActivityEntry] = []
+    @ObservationIgnored private var lastActivitySignature = ""
+    /// Daemon entries by id (merged across light and full fetches), newest kept for 90 days.
+    @ObservationIgnored private var daemonActivity: [UUID: ActivityEntry] = [:]
+    @ObservationIgnored private var lastFullActivityFetch = Date.distantPast
+    @ObservationIgnored private var activityFetchScheduled = false
+    @ObservationIgnored private var activityItemCache: [UUID: ActivityItem] = [:]
+    /// App-process events (PasteGuard, Wi-Fi, vault, Refresh, network scan...) and who-did-it notes.
+    @ObservationIgnored let localActivity = AppActivityLog()
+    /// Set while an approved AI action runs, so its changes are attributed to the AI assistant.
+    @ObservationIgnored var activityActorOverride: ActivityActor?
     @ObservationIgnored private var lastConnections: [ConnectionInfo] = []
 
     var isDemo: Bool { mode == .demo }
@@ -381,17 +417,12 @@ final class AppModel {
 
     /// Derives per-day stats from the activity log (live mode).
     func rebuildDaily() {
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        daily = (0..<14).reversed().map { back in
-            let day = cal.date(byAdding: .day, value: -back, to: today)!
-            let items = activity.filter { cal.isDate($0.date, inSameDayAs: day) }
-            let files = scanHistory.filter { cal.isDate($0.date, inSameDayAs: day) }.reduce(0) { $0 + $1.scanned }
-            let idx = 13 - back
-            let blocked = liveBlockedByDay.count == 14 ? liveBlockedByDay[idx] : items.filter { $0.kind == .network }.count
-            let scanFiles = files > 0 ? files : 0
-            return DayStat(day: day, filesChecked: scanFiles, sitesBlocked: blocked,
-                           threats: items.filter { $0.kind == .threat && ($0.outcome.contains("uarantin") || $0.title.lowercased().contains("detect")) }.count)
+        let tallies = ActivityStats.daily(activity.map(\.entry), days: 14)
+        daily = tallies.enumerated().map { idx, t in
+            // DNS blocks: the DNS filter's own per-day counter also sees blocks it doesn't log (one entry per domain
+            // per few minutes), so the larger of the two is used. Scam-link and page blocks come from the log.
+            let dns = liveBlockedByDay.count == 14 ? max(liveBlockedByDay[idx], t.dnsBlocks) : t.dnsBlocks
+            return DayStat(day: t.day, filesChecked: t.filesChecked, sitesBlocked: dns + t.webBlocks, threats: t.threatsStopped)
         }
     }
 
@@ -507,9 +538,7 @@ final class AppModel {
             set(\.wifi, w.connected ? WiFiInfo(ssid: w.ssid, security: w.security ?? "Unknown security", encrypted: !w.weakSecurity,
                                                gatewayChanged: w.gatewayMACChanged, note: w.note) : nil)
         }
-        if case .activity(let a)? = try? await client.request(.activity(limit: 300)) {
-            if a != lastActivity { lastActivity = a; apply(a) }
-        } else { rebuildLiveActivity() }
+        await fetchActivity(full: heavy || Date().timeIntervalSince(lastFullActivityFetch) > 600)
         if heavy {
             lastHeavyRefresh = Date()
             if case .connections(let c)? = try? await client.request(.connections) { apply(c) }
@@ -559,24 +588,74 @@ final class AppModel {
         return p
     }
 
-    private func apply(_ entries: [ActivityEntry]) {
-        activity = entries.map { e in
-            let kind: ActivityItem.Kind
-            switch e.kind {
-            case .scan: kind = .scan
-            case .detection, .quarantine, .restore: kind = .threat
-            case .webBlock: kind = .network
-            case .update: kind = .update
-            case .posture, .settings: kind = .settings
-            case .persistence, .system: kind = .protection
-            case .pasteGuard: kind = .threat
-            case .wifi, .networkScan: kind = .network
-            default: kind = .protection
+    /// Fetches the daemon's activity: everything kept (full) or the newest 300 (light), merged by id.
+    func fetchActivity(full: Bool) async {
+        guard mode == .live else { return }
+        let limit = full ? 0 : 300
+        if case .activity(let a)? = try? await client.request(.activity(limit: limit), timeout: full ? 30 : 10) {
+            if full { lastFullActivityFetch = Date() }
+            let sig = "\(a.count)|\(a.first?.id.uuidString ?? "")|\(full)"
+            if sig == lastActivitySignature && !full { return }
+            lastActivitySignature = sig
+            if full {
+                // A full list is authoritative (the daemon prunes after 90 days).
+                daemonActivity = Dictionary(a.map { ($0.id, $0) }, uniquingKeysWith: { x, _ in x })
+            } else {
+                for e in a { daemonActivity[e.id] = e }
             }
-            return ActivityItem(date: e.date, kind: kind, title: e.title, outcome: e.outcome.isEmpty ? e.detail : e.outcome)
+            rebuildActivity()
+        } else if daemonActivity.isEmpty {
+            rebuildLiveActivity()
         }
-        .sorted { $0.date > $1.date }
+    }
+
+    /// Debounced light fetch so a new detection or block shows up within a second or two.
+    func scheduleActivityFetch() {
+        guard mode == .live, !activityFetchScheduled else { return }
+        activityFetchScheduled = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            self.activityFetchScheduled = false
+            await self.fetchActivity(full: false)
+        }
+    }
+
+    /// Daemon entries (annotated with who did it) + the app's own entries, newest first.
+    func rebuildActivity() {
+        let cutoff = Date().addingTimeInterval(-AppActivityLog.retention)
+        var all: [ActivityEntry] = []
+        all.reserveCapacity(daemonActivity.count + localActivity.entries.count)
+        for e in daemonActivity.values where e.date >= cutoff { all.append(localActivity.annotate(e)) }
+        let ids = Set(all.map(\.id))
+        all += localActivity.entries.filter { $0.date >= cutoff && !ids.contains($0.id) }
+        all.sort { $0.date > $1.date }
+        // Presentation is computed once per entry and reused while the entry is unchanged.
+        var cache: [UUID: ActivityItem] = [:]
+        cache.reserveCapacity(all.count)
+        activity = all.map { e in
+            let item = activityItemCache[e.id].flatMap { $0.entry == e ? $0 : nil } ?? ActivityItem(entry: e)
+            cache[e.id] = item
+            return item
+        }
+        activityItemCache = cache
         rebuildDaily()
+    }
+
+    /// Records an app-side event. `daemonRecordsWhenLive`: the service logs this itself when connected, so the
+    /// app only records it in offline/demo mode (no duplicates).
+    func recordActivity(_ e: ActivityEntry, daemonRecordsWhenLive: Bool = false) {
+        if daemonRecordsWhenLive && mode == .live { scheduleActivityFetch(); return }
+        var e = e
+        if e.actor == nil { e.actor = activityActorOverride }
+        else if e.actor == .user, let o = activityActorOverride { e.actor = o }
+        if mode == .demo { activity.insert(ActivityItem(entry: e), at: 0); rebuildDaily(); return }
+        localActivity.add(e)
+        rebuildActivity()
+    }
+
+    /// The app is about to ask the service for a change: attribute the resulting daemon entries.
+    func noteActivityActor(place: String? = nil, events: Set<ActivityEvent> = ActivityEvent.attributable) {
+        localActivity.note(activityActorOverride ?? .user, place: activityActorOverride == .ai ? "AI assistant" : place, events: events)
     }
 
     private func subscribe() {
@@ -591,23 +670,64 @@ final class AppModel {
 
     func receive(detection d: Detection) {
         if let i = detections.firstIndex(where: { $0.id == d.id }) { detections[i] = d } else { detections.insert(d, at: 0) }
-        activity.insert(ActivityItem(date: d.date, kind: .threat, title: "\(d.name) detected\(d.path.map { " in \(($0 as NSString).lastPathComponent)" } ?? "")",
-                                     outcome: d.resolved ? "Quarantined" : "Needs decision"), at: 0)
+        if mode == .live { scheduleActivityFetch() }   // the service logged it; show it within a second or two
+        else { recordActivity(Self.activityEntry(for: d)) }
         if d.confidence >= 60 { Notifier.shared.threat(d) }
     }
 
+    /// PasteGuard runs in the app: its decisions are recorded here (reasons only, never the command text).
+    func receivePasteGuard(_ d: Detection) {
+        if let i = detections.firstIndex(where: { $0.id == d.id }) { detections[i] = d } else { detections.insert(d, at: 0) }
+        let blocked = d.name.lowercased().contains("blocked")
+        let reasons = d.evidence.first?.detail ?? ""
+        let decision = d.evidence.first { $0.title.hasPrefix("Decision ") }
+        var source: String?
+        if let det = decision?.detail, det.hasPrefix("Copied from "), let dot = det.range(of: ". ") {
+            source = String(det[det.index(det.startIndex, offsetBy: "Copied from ".count)..<dot.lowerBound])
+            if source == "an unknown app" { source = nil }
+        }
+        let ai = d.evidence.first { $0.title.hasPrefix("AI check:") }?.title
+        recordActivity(ActivityEntry(date: d.date, kind: .pasteGuard, title: d.name, outcome: blocked ? "blocked" : "warned",
+                                     severity: d.severity, detectionID: d.id, event: blocked ? .pasteGuardBlocked : .pasteGuardWarned,
+                                     actor: .system, rule: decision.map { String($0.title.dropFirst("Decision ".count)) },
+                                     reason: reasons.isEmpty ? nil : reasons, score: d.confidence,
+                                     action: blocked ? "Replaced the command on the clipboard with a harmless note, so pasting it does nothing." : "Warned you before it could be pasted.",
+                                     facts: ["sourceApp": source ?? "", "AI opinion": ai.map { String($0.dropFirst("AI check: ".count)) } ?? ""]))
+        if d.confidence >= 60 { Notifier.shared.threat(d) }
+    }
+
+    /// Entry for a detection seen while the service isn't connected (offline/demo).
+    static func activityEntry(for d: Detection) -> ActivityEntry {
+        let top = d.evidence.filter { $0.score > 0 }.max { $0.score < $1.score }
+        return ActivityEntry(date: d.date, kind: .detection, title: d.name, detail: d.path ?? "", outcome: d.resolved ? "contained" : (d.confidence >= 60 ? "needs review" : "logged"),
+                             severity: d.severity, detectionID: d.id, event: d.name.hasPrefix("Tampering with ") ? .tamper : .detection,
+                             process: d.pid.map { ActivityProcess(pid: $0) }, target: d.path, rule: top?.title,
+                             reason: top.map { $0.detail.isEmpty ? $0.title : $0.detail }, score: d.confidence, sha256: d.sha256,
+                             facts: ["threat": d.name])
+    }
+
     private func rebuildLiveActivity() {
-        var items: [ActivityItem] = detections.map {
-            ActivityItem(date: $0.date, kind: .threat, title: "\($0.name) detected", outcome: $0.resolved ? "Resolved" : "Needs decision")
+        var entries: [ActivityEntry] = detections.map {
+            ActivityEntry(id: $0.id, date: $0.date, kind: .detection, title: $0.name, detail: $0.path ?? "", outcome: $0.resolved ? "contained" : "needs review",
+                          severity: $0.severity, detectionID: $0.id, event: .detection, target: $0.path, score: $0.confidence, sha256: $0.sha256)
         }
-        items += quarantine.map { ActivityItem(date: $0.date, kind: .threat, title: "Moved \(($0.originalPath as NSString).lastPathComponent) to quarantine", outcome: "Contained") }
-        items += scanHistory.map { ActivityItem(date: $0.date, kind: .scan, title: "\($0.kind.title) checked \(Fmt.count($0.scanned)) files", outcome: $0.found == 0 ? "No threats" : "\($0.found) found") }
+        entries += quarantine.map {
+            ActivityEntry(id: $0.id, date: $0.date, kind: .quarantine, title: "Quarantined \($0.detectionName)", detail: $0.originalPath, outcome: "quarantined",
+                          event: .quarantined, target: $0.originalPath, sha256: $0.sha256, refID: $0.id.uuidString, facts: ["threat": $0.detectionName])
+        }
+        entries += scanHistory.map {
+            ActivityEntry(date: $0.date, kind: .scan, title: "\($0.kind.title) finished", outcome: $0.found == 0 ? "no threats" : "\($0.found) found",
+                          event: .scanFinished, count: $0.scanned, found: $0.found, facts: ["scanType": $0.kind.title, "seconds": String(format: "%.1f", $0.seconds)])
+        }
         if let ls = status.lastScan, scanHistory.isEmpty {
-            items.append(ActivityItem(date: ls, kind: .scan, title: "Scheduled scan finished", outcome: "Completed"))
+            entries.append(ActivityEntry(date: ls, kind: .scan, title: "Scheduled scan finished", outcome: "completed", event: .scanFinished, actor: .schedule))
         }
-        activity = items.sorted { $0.date > $1.date }
+        let ids = Set(entries.map(\.id))
+        entries += localActivity.entries.filter { !ids.contains($0.id) }
+        activity = entries.sorted { $0.date > $1.date }.map(ActivityItem.init(entry:))
         rebuildDaily()
     }
+
 
     func enterDemo() {
         mode = .demo
@@ -668,6 +788,7 @@ final class AppModel {
 
     func startScan(_ kind: ScanKind, paths: [String] = []) {
         guard !isScanning else { return }
+        noteActivityActor(events: [.scanStarted, .scanFinished, .scanCancelled])
         let home = NSHomeDirectory()
         let targets: [String]
         switch kind {
@@ -707,7 +828,15 @@ final class AppModel {
             }, onEnd: { err in
                 let m = AppModel.shared
                 if Headless.active { HeadlessRunner.log("headless-check: scan stream ended \(err.map { "with error: \($0.localizedDescription)" } ?? "cleanly")") }
-                if let err, m.isScanning { m.lastError = AppModel.userFacing(err); m.scanPhase = .idle }
+                if let err, m.isScanning {
+                    m.lastError = AppModel.userFacing(err)
+                    if case .running(let p) = m.scanPhase {
+                        m.recordActivity(ActivityEntry(kind: .scan, title: "\(p.kind.title) couldn't finish", outcome: "failed", severity: .low,
+                                                       event: .scanFailed, actor: .user, reason: m.lastError, count: p.scanned, found: p.found,
+                                                       facts: ["scanType": p.kind.title]))
+                    }
+                    m.scanPhase = .idle
+                }
             })
         } else {
             DemoData.runScan(self, kind: kind, paths: paths)
@@ -721,8 +850,9 @@ final class AppModel {
         for d in found where !detections.contains(where: { $0.id == d.id }) { detections.insert(d, at: 0) }
         scanPhase = .finished(rec, found)
         status.lastScan = Date()
-        activity.insert(ActivityItem(date: Date(), kind: .scan, title: "\(kind.title) checked \(Fmt.count(scanned)) files",
-                                     outcome: found.isEmpty ? "No threats" : "\(found.count) found"), at: 0)
+        recordActivity(ActivityEntry(kind: .scan, title: "\(kind.title) finished", outcome: found.isEmpty ? "no threats" : "\(found.count) found",
+                                     severity: found.isEmpty ? .info : .medium, event: .scanFinished, actor: .user, count: scanned, found: found.count,
+                                     facts: ["scanType": kind.title, "seconds": String(format: "%.1f", seconds)]), daemonRecordsWhenLive: true)
         Notifier.shared.scanFinished(rec)
         if mode == .live { Task { await refresh() } }
     }
@@ -742,7 +872,9 @@ final class AppModel {
         scanHandle?.cancel(); scanHandle = nil
         demoTimer?.invalidate()
         if case .running(let p) = scanPhase {
-            activity.insert(ActivityItem(date: Date(), kind: .scan, title: "\(p.kind.title) stopped after \(Fmt.count(p.scanned)) files", outcome: "Stopped"), at: 0)
+            noteActivityActor(events: [.scanCancelled])
+            recordActivity(ActivityEntry(kind: .scan, title: "\(p.kind.title) cancelled", outcome: "stopped", event: .scanCancelled, actor: .user,
+                                         count: p.scanned, found: p.found, facts: ["scanType": p.kind.title]), daemonRecordsWhenLive: true)
         }
         scanPhase = .idle
     }
@@ -750,6 +882,7 @@ final class AppModel {
     func setDemoTimer(_ t: Timer?) { demoTimer?.invalidate(); demoTimer = t }
 
     func quarantine(_ d: Detection) async {
+        noteActivityActor()
         if mode == .live {
             do { _ = try await client.request(.quarantine(detectionID: d.id)); await refresh() } catch { lastError = AppModel.userFacing(error) }
         } else {
@@ -758,10 +891,13 @@ final class AppModel {
                 quarantine.insert(QuarantineRecord(originalPath: p, sha256: d.sha256 ?? "", size: 184_320, detectionName: d.name, ownerUID: 501, mode: 0o755), at: 0)
             }
         }
-        activity.insert(ActivityItem(date: Date(), kind: .threat, title: "Moved \(d.name) to quarantine", outcome: "Contained"), at: 0)
+        recordActivity(ActivityEntry(kind: .quarantine, title: "Quarantined \(d.name)", detail: d.path ?? "", outcome: "quarantined", severity: d.severity,
+                                     detectionID: d.id, event: .quarantined, actor: .user, target: d.path, score: d.confidence, sha256: d.sha256,
+                                     facts: ["threat": d.name]), daemonRecordsWhenLive: true)
     }
 
     func restore(_ r: QuarantineRecord, allow: Bool) async {
+        noteActivityActor()
         if mode == .live {
             do { _ = try await client.request(.restore(id: r.id, allow: allow)); await refresh() } catch { lastError = AppModel.userFacing(error); return }
         } else {
@@ -770,16 +906,20 @@ final class AppModel {
         if allow && mode != .live {
             allowRules.insert(AllowRuleSpec(scope: .fileHash, value: r.sha256, name: (r.originalPath as NSString).lastPathComponent), at: 0)
         }
-        activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Restored \((r.originalPath as NSString).lastPathComponent)\(allow ? " and allowed it" : " once")", outcome: "Restored"), at: 0)
+        recordActivity(ActivityEntry(kind: .restore, title: "Restored \(r.detectionName)", detail: r.originalPath, outcome: allow ? "restored and trusted" : "restored",
+                                     event: .restored, actor: .user, target: r.originalPath, sha256: r.sha256, refID: r.id.uuidString,
+                                     facts: ["threat": r.detectionName]), daemonRecordsWhenLive: true)
     }
 
     func delete(_ r: QuarantineRecord) async {
+        noteActivityActor()
         if mode == .live {
             do { _ = try await client.request(.deleteQuarantined(id: r.id)); await refresh() } catch { lastError = AppModel.userFacing(error); return }
         } else {
             quarantine.removeAll { $0.id == r.id }
         }
-        activity.insert(ActivityItem(date: Date(), kind: .threat, title: "Deleted \((r.originalPath as NSString).lastPathComponent) permanently", outcome: "Deleted"), at: 0)
+        recordActivity(ActivityEntry(kind: .quarantine, title: "Deleted \((r.originalPath as NSString).lastPathComponent)", detail: r.originalPath, outcome: "deleted",
+                                     event: .deleted, actor: .user, target: r.originalPath, sha256: r.sha256, facts: ["threat": r.detectionName]), daemonRecordsWhenLive: true)
     }
 
     func allow(_ d: Detection, scope: AllowRuleSpec.Scope) async {
@@ -798,24 +938,28 @@ final class AppModel {
 
     @discardableResult
     func addAllowRule(_ rule: AllowRuleSpec) async -> Bool {
+        noteActivityActor()
         if mode == .live {
             do { _ = try await client.request(.addAllowRule(rule)) } catch { lastError = AppModel.userFacing(error); return false }
             if case .allowRules(let r)? = try? await client.request(.listAllowRules) { allowRules = r.sorted { $0.created > $1.created } }
         } else {
             allowRules.insert(rule, at: 0)
         }
-        activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Allowed \(rule.name) (\(rule.scope.label.lowercased()))", outcome: "Rule added"), at: 0)
+        recordActivity(ActivityEntry(kind: .settings, title: "Allowed \(rule.name)", outcome: "allow rule added", event: .allowRuleAdded, actor: .user,
+                                     refID: rule.id.uuidString, facts: ["name": rule.name, "scope": rule.scope.rawValue]), daemonRecordsWhenLive: true)
         return true
     }
 
     func removeAllowRule(_ rule: AllowRuleSpec) async {
+        noteActivityActor()
         if mode == .live {
             do { _ = try await client.request(.removeAllowRule(id: rule.id)) } catch { lastError = AppModel.userFacing(error); return }
             if case .allowRules(let r)? = try? await client.request(.listAllowRules) { allowRules = r.sorted { $0.created > $1.created } }
         } else {
             allowRules.removeAll { $0.id == rule.id }
         }
-        activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Removed rule for \(rule.name)", outcome: "Rule removed"), at: 0)
+        recordActivity(ActivityEntry(kind: .settings, title: "Removed rule for \(rule.name)", outcome: "allow rule removed", event: .allowRuleRemoved, actor: .user,
+                                     refID: rule.id.uuidString, facts: ["name": rule.name, "scope": rule.scope.rawValue]), daemonRecordsWhenLive: true)
     }
 
     // MARK: Settings (owned by the daemon in live mode)
@@ -824,6 +968,7 @@ final class AppModel {
         var next = settings
         change(&next)
         guard next != settings else { return }
+        noteActivityActor()
         let previous = settings
         settings = next
         if next.realtimeOn != previous.realtimeOn { status.realtimeOn = next.realtimeOn }
@@ -856,13 +1001,15 @@ final class AppModel {
     }
 
     func remediate(_ item: PersistenceItem) async -> String? {
+        noteActivityActor()
         if mode == .live {
             do { _ = try await client.request(.remediate(persistenceID: item.id), timeout: 60) } catch { return error.localizedDescription }
             await refresh()
         } else {
             persistence.removeAll { $0.id == item.id }
         }
-        activity.insert(ActivityItem(date: Date(), kind: .protection, title: "Turned off startup item \(item.label)", outcome: "Removed"), at: 0)
+        recordActivity(ActivityEntry(kind: .persistence, title: "Turned off startup item \(item.label)", outcome: "removed", event: .startupItemRemoved, actor: .user,
+                                     target: item.location, facts: ["label": item.label]), daemonRecordsWhenLive: true)
         return nil
     }
 
@@ -881,6 +1028,7 @@ final class AppModel {
     }
 
     func fix(_ c: PostureCheck) async {
+        noteActivityActor()
         fixingChecks.insert(c.id)
         defer { fixingChecks.remove(c.id) }
         if mode == .live {
@@ -889,18 +1037,22 @@ final class AppModel {
             try? await Task.sleep(nanoseconds: 700_000_000)
             if let i = posture.firstIndex(where: { $0.id == c.id }) { posture[i].state = .pass; posture[i].detail = "Turned on by \(Product.name) just now." }
         }
-        activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Fixed: \(c.title)", outcome: "Done"), at: 0)
+        recordActivity(ActivityEntry(kind: .posture, title: "Fixed: \(c.title)", outcome: "fixed", event: .postureFixed, actor: .user,
+                                     facts: ["check": c.title]), daemonRecordsWhenLive: true)
     }
 
     func setWebProtection(_ on: Bool) async {
+        noteActivityActor()
         if mode == .live {
             guard webProtectionAvailable else { lastError = "Web protection needs the full system service."; return }
             do { _ = try await client.request(.setWebProtection(on: on)); await refresh() } catch { lastError = AppModel.userFacing(error); return }
         } else { status.webProtectionOn = on }
-        activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Web protection turned \(on ? "on" : "off")", outcome: "Changed"), at: 0)
+        recordActivity(ActivityEntry(kind: .settings, title: "Web protection \(on ? "on" : "off")", outcome: on ? "on" : "off", event: .protectionToggled, actor: .user,
+                                     facts: ["setting": "Web protection", "value": on ? "on" : "off"]), daemonRecordsWhenLive: true)
     }
 
     func setRealtime(_ on: Bool, pauseFor minutes: Int? = nil) {
+        noteActivityActor()
         if let minutes { pausedUntil = Date().addingTimeInterval(Double(minutes) * 60) } else { pausedUntil = nil }
         let effectiveOn = on && minutes == nil
         status.realtimeOn = effectiveOn || minutes != nil
@@ -918,12 +1070,19 @@ final class AppModel {
         } else {
             status.realtimeOn = on || minutes != nil
         }
-        activity.insert(ActivityItem(date: Date(), kind: .protection,
-                                     title: minutes.map { "Real-time protection paused for \($0 >= 60 ? "\($0 / 60) hour" : "\($0) minutes")" } ?? "Real-time protection turned \(on ? "on" : "off")",
-                                     outcome: "Changed"), at: 0)
+        if let minutes {
+            // The service only sees "off": the pause and its length are known to the app.
+            recordActivity(ActivityEntry(kind: .settings, title: "Protection paused for \(minutes) min", outcome: "paused", severity: .medium,
+                                         event: .protectionPaused, actor: .user, count: minutes))
+        } else {
+            recordActivity(ActivityEntry(kind: .settings, title: "Real-time protection \(on ? "on" : "off")", outcome: on ? "on" : "off",
+                                         severity: on ? .info : .medium, event: .protectionToggled, actor: .user,
+                                         facts: ["setting": "Real-time protection", "value": on ? "on" : "off"]), daemonRecordsWhenLive: true)
+        }
     }
 
     func updateDefinitions() async {
+        noteActivityActor()
         isUpdatingDefinitions = true
         defer { isUpdatingDefinitions = false }
         if mode == .live {
@@ -932,7 +1091,7 @@ final class AppModel {
             try? await Task.sleep(nanoseconds: 1_200_000_000)
         }
         definitionsUpdated = Date()
-        activity.insert(ActivityItem(date: Date(), kind: .update, title: "Definitions updated", outcome: "Up to date"), at: 0)
+        recordActivity(ActivityEntry(kind: .update, title: "Protection updated", outcome: "ok", event: .definitionsUpdated, actor: .user), daemonRecordsWhenLive: true)
     }
 }
 

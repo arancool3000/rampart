@@ -33,7 +33,7 @@ extension SelfTest {
             print("SKIP daemon: live daemon checks (rampartd unavailable)")
             return
         }
-        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("rampart-selftest-\(getpid())")
+        let tmp = URL(fileURLWithPath: SelfTest.fixtureTempDir).appendingPathComponent("rampart-selftest-\(getpid())")
         let root = tmp.appendingPathComponent("state"), files = tmp.appendingPathComponent("files")
         try? FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

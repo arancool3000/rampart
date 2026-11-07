@@ -8,7 +8,7 @@ import RampartRemediation
 extension SelfTest {
     static func remediation() {
         let scratchBase = ProcessInfo.processInfo.environment["RAMPART_SCRATCH"]
-            ?? "/private/tmp/claude-501/-Users-arankeyhan/ab330a0d-96bf-4eec-a6ed-51d815d3bfd2/scratchpad"
+            ?? SelfTest.fixtureTempDir
         let base = URL(fileURLWithPath: scratchBase).appendingPathComponent("remediation-selftest-\(UUID().uuidString.prefix(8))")
         let fm = FileManager.default
         try? fm.createDirectory(at: base, withIntermediateDirectories: true)

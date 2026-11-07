@@ -47,6 +47,10 @@ final class NetworkScanModel {
                 let r = try await scanner.scan { p in Task { @MainActor in self.progress = p } }
                 self.report = r
                 self.state = .done
+                AppModel.shared.recordActivity(ActivityEntry(kind: .networkScan, title: "Network scan finished", outcome: r.findings.isEmpty ? "no problems" : "\(r.findings.count) to review",
+                    severity: r.findings.isEmpty ? .info : .low, event: .networkScan, actor: .user, target: "\(r.subnet.network)/\(r.subnet.prefix)",
+                    count: r.devices.count, found: r.findings.count,
+                    facts: ["new devices": r.newDevices.isEmpty ? "" : String(r.newDevices.count)]))
                 if self.selectedDevice == nil { self.selectedDeviceID = r.newDevices.first?.id ?? r.gateway?.id }
             } catch {
                 self.state = .failed((error as? NetScopeError)?.description ?? error.localizedDescription)

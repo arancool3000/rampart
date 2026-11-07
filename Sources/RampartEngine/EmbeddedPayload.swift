@@ -47,8 +47,8 @@ public enum EmbeddedPayload {
 
     // MARK: patterns
 
-    private static func rx(_ s: String) -> NSRegularExpression {
-        try! NSRegularExpression(pattern: s, options: [.caseInsensitive, .anchorsMatchLines])
+    private static func rx(_ s: String, caseSensitive: Bool = false) -> NSRegularExpression {
+        try! NSRegularExpression(pattern: s, options: caseSensitive ? [.anchorsMatchLines] : [.caseInsensitive, .anchorsMatchLines])
     }
     /// Shell decoders / decompressors.
     static let shellDecoder = #"(base64\s+(-[a-z]*d\b|-D\b|--decode)|\bb64decode\b|\bgunzip\b|\bgzip\s+-[a-z]*d|\bzcat\b|\bgzcat\b|\bbunzip2\b|\bbzip2\s+-[a-z]*d|\bbzcat\b|\bxz\s+-[a-z]*d|\bunxz\b|\bxzcat\b|\blzma\s+-[a-z]*d|\bzstd\s+-[a-z]*d|\bunzstd\b|\buudecode\b|\bopenssl\s+(enc\s+)?[^|;]*-d\b|\bopenssl\s+base64\s+-d|\bxxd\s+-r|\bcompression_tool\s+-decode|\baa\s+extract|\bperl\s+-[a-z]*e\s*.{0,40}unpack)"#
@@ -70,11 +70,12 @@ public enum EmbeddedPayload {
     /// In-language decode/decompress + exec (Python, JS, Ruby, Perl, PHP, AppleScript).
     static let langDecoder = #"((zlib|gzip|bz2|lzma)\.(decompress|open)|zlib\.decompressobj|base64\.(b64|b32|b16|a85|b85|urlsafe_b64)decode|\bb64decode|\bdecodebytes|marshal\.loads|codecs\.decode|bytes\.fromhex|unhexlify|\binflate\w*|\bgunzip\w*|\bunzipSync|brotliDecompress\w*|pako\.\w+|LZString\.\w+|\batob\s*\(|Buffer\.from\s*\([^)]{0,200}(base64|hex)|Zlib::(Inflate|GzipReader)|Base64\.(strict_|urlsafe_)?decode64|unpack1?\s*\(\s*['"][mu]|\.unpack\(['"]m|\buncompress\s*\(|Compress::Zlib|IO::Uncompress|MIME::Base64|decode_base64|gzinflate|gzuncompress|gzdecode|str_rot13|base64_decode)"#
     static let compressionWords = #"(zlib|gzip|bz2|lzma|decompress|inflate|gunzip|unzip|brotli|pako|LZString|Zlib::|uncompress|Compress::|IO::Uncompress|gzinflate|gzuncompress|gzdecode|marshal)"#
-    static let langSink = #"(\bexec|\beval|\bcompile|\bFunction|new\s+Function|\bvm\.run\w*|runInThisContext|runInNewContext|\binstance_eval|\bclass_eval|\bmodule_eval|\bsystem|\brun\s+script|\bdo\s+shell\s+script|\bcreate_function|\bpreg_replace)"#
+    /// Code-running calls. Case-sensitive and the call parenthesis is required ("function inflate(" is not a sink).
+    static let langSink = #"(?<![\w$])(exec|eval|compile|Function|new\s+Function|vm\.run\w*|runInThisContext|runInNewContext|instance_eval|class_eval|module_eval|system|create_function)\s*\("#
     /// Sink call whose argument (no quotes / statement end in between) contains a decoder.
-    static let langInline = rx(langSink + #"\s*\(?\s*[^;"'\n`]{0,160}?"# + langDecoder)
+    static let langInline = rx(langSink + #"\s*[^;"'\n`]{0,160}?"# + langDecoder, caseSensitive: true)
     /// `x = decode(...)` then, within 6 lines, `exec(x)`.
-    static let langTwoStep = rx(#"^[ \t]*\$?([A-Za-z_][A-Za-z0-9_]{0,40})\s*=\s*[^\n]{0,400}"# + langDecoder + #"[^\n]*\n(?:[^\n]*\n){0,6}?[^\n]*"# + langSink + #"\s*\(?\s*\$?\1\b"#)
+    static let langTwoStep = rx(#"^[ \t]*\$?([A-Za-z_][A-Za-z0-9_]{0,40})\s*=\s*[^\n]{0,400}"# + langDecoder + #"[^\n]*\n(?:[^\n]*\n){0,6}?[^\n]*"# + langSink + #"\s*\$?\1\b"#, caseSensitive: true)
     static let compressionRx = rx(compressionWords)
 
     /// Base64 runs worth decoding (inside quotes, heredocs or assignments).
@@ -212,18 +213,24 @@ public enum EmbeddedPayload {
         return one.count > 120 ? String(one.prefix(117)) + "…" : one
     }
 
-    /// Length of the leading text part (stops at the first 512-byte window that is mostly binary).
+    /// Length of the leading text part: stops at the first line that contains NUL or is mostly control bytes
+    /// (a script with an appended binary payload).
     static func textPrefixLength(_ d: Data) -> Int {
-        var i = 0
+        var lineStart = 0, bad = 0, i = 0
         let n = d.count
         while i < n {
-            let end = min(n, i + 512)
-            var bad = 0
-            for j in i..<end { let b = d[d.startIndex + j]; if b == 0 || (b < 9) || (b > 13 && b < 32 && b != 27) { bad += 1 } }
-            if bad * 10 > (end - i) { return i }
-            i = end
+            let b = d[d.startIndex + i]
+            if b == 0 { return lineStart }
+            if b < 9 || (b > 13 && b < 32 && b != 27) { bad += 1 }
+            if b == 10 || i - lineStart >= 4096 {
+                let len = i - lineStart + 1
+                if bad * 10 > len { return lineStart }
+                lineStart = i + 1; bad = 0
+            }
+            i += 1
         }
-        return n
+        let len = n - lineStart
+        return len > 0 && bad * 10 > len ? lineStart : n
     }
 
     static func isBinary(_ d: Data, from off: Int) -> Bool {
@@ -280,6 +287,9 @@ public enum EmbeddedPayload {
         guard allowed, let s = String(data: d, encoding: .ascii) else { return nil }
         return Data(base64Encoded: s, options: .ignoreUnknownCharacters)
     }
+
+    /// Test hook for the uudecoder.
+    public static func uudecodeForTest(_ s: String) -> Data? { uudecode(s, cap: 1 << 20) }
 
     /// Minimal uudecode (traditional "begin 644 name" … "end"); `begin-base64` blocks use base64.
     static func uudecode(_ text: String, cap: UInt64) -> Data? {

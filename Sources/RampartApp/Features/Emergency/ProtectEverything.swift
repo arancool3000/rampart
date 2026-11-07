@@ -79,7 +79,10 @@ final class ProtectEverythingModel {
             if s.status == .willTurnOn, plan.first(where: { $0.id == s.id })?.status == .willTurnOn { s.status = .failed }
             return s
         }
-        app.activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Protect Everything turned on", outcome: "\(steps.filter { $0.status == .turnedOn }.count) turned on"), at: 0)
+        let turned = steps.filter { $0.status == .turnedOn }.map(\.title), failed = steps.filter { $0.status == .failed }.map(\.title)
+        app.recordActivity(ActivityEntry(kind: .settings, title: "Protect Everything turned on", detail: "\(turned.count) protection\(turned.count == 1 ? "" : "s") turned on",
+                                         outcome: "on", event: .protectEverything, actor: .user,
+                                         facts: ["value": "on", "turned on": turned.joined(separator: ", "), "couldn't turn on": failed.joined(separator: ", ")]))
     }
 
     /// Back to the state saved when the switch went on. macOS firewall fixes stay (turn them off in System Settings).
@@ -93,7 +96,8 @@ final class ProtectEverythingModel {
         if prev.pasteGuard == "stopped" { PasteGuardHost.shared.stop() }
         Self.savePrevious(nil)
         await refresh()
-        app.activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Protect Everything turned off", outcome: "Previous settings restored"), at: 0)
+        app.recordActivity(ActivityEntry(kind: .settings, title: "Protect Everything turned off", detail: "Previous settings restored", outcome: "off",
+                                         event: .protectEverything, actor: .user, facts: ["value": "off"]))
     }
 
     private func request(_ r: IPCRequest, timeout: TimeInterval = 10) async {

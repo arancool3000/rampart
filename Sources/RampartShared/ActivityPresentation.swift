@@ -71,6 +71,7 @@ public enum ActivityPresenter {
             if t.contains("started") { return .scanStarted }
             return .scanFinished
         case .detection:
+            if o == "decoy" { return .deceptionEvent }
             if isTamperName(e.title) { return .tamper }
             if isRemoteName(e.title) { return .remoteAccessAttempt }
             if t.hasPrefix("pasteguard") || t.contains("pasted command") || t.contains("clipboard") { return .pasteGuardWarned }
@@ -152,6 +153,7 @@ public enum ActivityPresenter {
         case .definitionsUpdated, .definitionsFailed: return .updates
         case .vaultEvent, .authenticatorEvent: return .privacy
         case .refreshCleanup, .refreshUndo: return .maintenance
+        case .deceptionEvent: return .threats
         case .other: return .protection
         }
     }
@@ -260,7 +262,7 @@ public enum ActivityPresenter {
         case .sandboxRun:
             p.tone = .info; p.symbol = "shippingbox"
             p.title = (e.outcome.lowercased() == "started" ? "Started a sandboxed test run of " : "Sandboxed test run of ") + threatName(e)
-            p.subtitle = humanOutcome(e.outcome) + (fileName.map { " · \($0)" } ?? "")
+            p.subtitle = [humanOutcome(e.outcome), fileName ?? ""].filter { !$0.isEmpty }.joined(separator: " · ")
             p.whatHappened = "A quarantined item was run inside a locked-down sandbox to see what it does."
             p.whatWeDid = "The sandbox has no network, no access to your files and is stopped after a short time."
             p.why = reason
@@ -517,7 +519,7 @@ public enum ActivityPresenter {
         case .definitionsFailed:
             p.tone = .attention; p.symbol = "exclamationmark.arrow.triangle.2.circlepath"
             p.title = "Couldn't update all protection definitions"
-            p.subtitle = (e.detail.isEmpty ? "" : shortList(e.detail) + " · ") + "will retry"; p.status = "Will retry"
+            p.subtitle = (e.detail.isEmpty ? "Will retry" : shortList(e.detail) + " · will retry"); p.status = "Will retry"
             p.whatHappened = "Some definitions couldn't be downloaded\(e.detail.isEmpty ? "" : ": \(e.detail)")."
             p.why = reason ?? "Usually the Mac was offline or a download server didn't answer."
             p.whatWeDid = "\(Product.name) kept using the definitions it already has and will try again automatically."
@@ -568,6 +570,15 @@ public enum ActivityPresenter {
             p.subtitle = "Approved with an administrator password"; p.status = "Uninstalling"
             p.whatHappened = "Someone asked to remove \(Product.name)."; p.whatWeDid = "Protection is being removed."
             p.whatYouCanDo = "If this wasn't you, reinstall \(Product.name) and change your Mac password."
+        case .deceptionEvent:
+            p.tone = e.severity >= .high ? .danger : .attention; p.symbol = "theatermasks"
+            p.title = cleanTitle(e.title); p.subtitle = SafeText.line(e.detail, max: 200)
+            p.status = e.outcome.lowercased() == "decoy" ? "Decoy touched" : humanOutcome(e.outcome)
+            p.whatHappened = e.detail.isEmpty ? cleanTitle(e.title) + "." : e.detail
+            p.why = reason ?? "Decoy files and services are never used by you or your apps, so touching one is a strong sign of an intruder or malware."
+            p.whatWeDid = e.action ?? "\(Product.name) recorded it and kept the intruder busy with harmless decoys."
+            p.whatYouCanDo = "Run a full scan. If it keeps happening, turn on Emergency Lockdown."
+            p.burstNoun = "decoy events"
         case .other:
             p.title = cleanTitle(e.title); p.subtitle = e.detail
             p.whatHappened = cleanTitle(e.title) + "."; p.whatWeDid = outcomeSentence(e.outcome, default: "Recorded.")
@@ -616,6 +627,13 @@ public enum ActivityPresenter {
         case "freed": return "Space freed"; case "subnet": return "Network"; case "list": return "Blocklist"; case "verdict": return "Verdict"
         default: return splitCamel(k).prefix(1).uppercased() + splitCamel(k).dropFirst()
         }
+    }
+
+    /// Text searched by the Activity screen: everything shown in the row and the detail panel, plus raw fields.
+    public static func searchText(_ p: ActivityPresentation, _ e: ActivityEntry) -> String {
+        var parts = [p.title, p.subtitle, p.status, p.whatHappened, p.why ?? "", p.whatWeDid, p.category.title, e.title, e.detail]
+        for f in p.facts where f.label != "When" { parts.append(f.value) }
+        return parts.joined(separator: "\n")
     }
 
     /// Everything about the entry as plain text (search, Copy details, export). No secrets are ever stored.
@@ -852,9 +870,11 @@ public enum ActivityPresenter {
         return Int(src[r].replacingOccurrences(of: " files", with: "").replacingOccurrences(of: ",", with: ""))
     }
 
+    private static let numberFormatter: NumberFormatter = { let f = NumberFormatter(); f.numberStyle = .decimal; return f }()
+    private static let fmtLock = NSLock()
     static func fmt(_ n: Int) -> String {
-        let f = NumberFormatter(); f.numberStyle = .decimal
-        return f.string(from: NSNumber(value: n)) ?? String(n)
+        fmtLock.lock(); defer { fmtLock.unlock() }
+        return numberFormatter.string(from: NSNumber(value: n)) ?? String(n)
     }
 }
 

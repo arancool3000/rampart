@@ -63,7 +63,7 @@ final class Router {
         case .deceptionStatus: return "deceptionStatus"; case .deceptionSetDecoys: return "deceptionSetDecoys"
         case .deceptionSetMaze: return "deceptionSetMaze"; case .deceptionRemoveAll: return "deceptionRemoveAll"
         case .deceptionSetTarpit: return "deceptionSetTarpit"; case .deceptionSetTone: return "deceptionSetTone"
-        case .deceptionEvidence: return "deceptionEvidence"
+        case .deceptionEvidence: return "deceptionEvidence"; case .deceptionSetDecoysVisible: return "deceptionSetDecoysVisible"
         }
     }
 
@@ -137,6 +137,7 @@ final class Router {
                 guard let path = d.path else { throw ServiceError.failed("detection has no file path") }
                 let qrec = try p.services.quarantine.quarantine(path: path, detection: d)
                 _ = p.store.update(id) { $0.resolved = true }
+                p.markDecoyCatchContained(d, quarantineID: qrec.id)
                 p.activity.add(.quarantine, "Quarantined \(d.name)", detail: path, outcome: "quarantined", severity: d.severity, detectionID: d.id,
                                event: .quarantined, actor: .user, target: path, score: d.confidence,
                                action: "Moved the file to quarantine because you asked.", sha256: d.sha256, refID: qrec.id.uuidString,
@@ -258,11 +259,11 @@ final class Router {
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("remote-access lockdown") }
                 try g.allow(id, minutes: minutes, pinCurrentSigners: true)
                 p.activity.add(.settings, "Allowed remote tool \(id)", detail: minutes.map { "for \($0) min" } ?? "until revoked", outcome: "allowed",
-                               event: .remoteAccessAllowed, actor: .user, facts: ["tool": RemoteToolCatalogue.tool(id)?.name ?? id, "for": minutes.map { "\($0) minutes" } ?? "until you remove it"])
+                               event: .remoteAccessAllowed, actor: .user, refID: id, facts: ["tool": RemoteToolCatalogue.tool(id)?.name ?? id, "for": minutes.map { "\($0) minutes" } ?? "until you remove it"])
                 _ = send(.ok)
             case .revokeRemoteTool(let id):
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("remote-access lockdown") }
-                g.revoke(id); p.activity.add(.settings, "Revoked remote tool \(id)", outcome: "revoked", event: .remoteAccessRevoked, actor: .user,
+                g.revoke(id); p.activity.add(.settings, "Revoked remote tool \(id)", outcome: "revoked", event: .remoteAccessRevoked, actor: .user, refID: id,
                                              facts: ["tool": RemoteToolCatalogue.tool(id)?.name ?? id]); _ = send(.ok)
             case .setRemoteLockdown(let on):
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("remote-access lockdown") }
@@ -366,21 +367,25 @@ final class Router {
                 _ = send(.deception(try JSONEncoder.rampart.encode(try deception().status())))
             case .deceptionSetDecoys(let on):
                 let d = try deception(); _ = d.setDecoys(on)
-                p.activity.add(.settings, "Cat & Mouse decoys \(on ? "on" : "off")", outcome: on ? "on" : "off")
+                p.activity.add(.settings, "Cat & Mouse decoys \(on ? "on" : "off")", outcome: on ? "on" : "off", event: .protectionToggled, actor: .user, facts: ["setting": "Cat & Mouse decoys", "value": on ? "on" : "off"])
                 _ = send(.deception(try JSONEncoder.rampart.encode(d.status())))
             case .deceptionSetMaze(let on):
                 let d = try deception(); try d.setMaze(on)
-                p.activity.add(.settings, "Cat & Mouse maze \(on ? "on" : "off")", outcome: on ? "on" : "off")
+                p.activity.add(.settings, "Cat & Mouse maze \(on ? "on" : "off")", outcome: on ? "on" : "off", event: .protectionToggled, actor: .user, facts: ["setting": "Cat & Mouse maze", "value": on ? "on" : "off"])
                 _ = send(.deception(try JSONEncoder.rampart.encode(d.status())))
             case .deceptionRemoveAll:
                 let d = try deception(); _ = d.removeAll()
-                p.activity.add(.settings, "Cat & Mouse decoys removed", outcome: "removed")
+                p.activity.add(.settings, "Cat & Mouse decoys removed", outcome: "removed", event: .settingsChanged, actor: .user, facts: ["changes": "Cat & Mouse decoys removed"])
                 _ = send(.deception(try JSONEncoder.rampart.encode(d.status())))
             case .deceptionSetTarpit(let on, let port, let scopeRaw):
                 guard let scope = LureScope(rawValue: scopeRaw) else { throw ServiceError.failed("unknown scope") }
                 if scope != .loopback && !(peer.isAdmin || peer.uid == 0) { throw ServiceError.denied("a lure reachable from other devices needs an administrator") }
                 guard port >= 1024 else { throw ServiceError.failed("the lure port must be 1024 or higher") }
                 let d = try deception(); try d.setTarpit(on, port: port, scope: scope)
+                _ = send(.deception(try JSONEncoder.rampart.encode(d.status())))
+            case .deceptionSetDecoysVisible(let visible):
+                let d = try deception(); d.setDecoysVisible(visible)
+                p.activity.add(.settings, "Cat & Mouse decoys \(visible ? "shown" : "hidden") in Finder", outcome: visible ? "visible" : "hidden", event: .settingsChanged, actor: .user, facts: ["changes": "Cat & Mouse decoys \(visible ? "shown" : "hidden") in Finder"])
                 _ = send(.deception(try JSONEncoder.rampart.encode(d.status())))
             case .deceptionSetTone(let serious):
                 let d = try deception(); d.setTone(serious ? .serious : .playful)

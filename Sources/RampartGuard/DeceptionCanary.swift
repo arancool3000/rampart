@@ -72,6 +72,14 @@ public final class RansomCanaryRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var marks: [String: String] = [:]
 
+    /// Registry + per-install name seed straight from a deception state folder (same `decoy.key` / `canaries.json`
+    /// that `DeceptionService` uses). For daemons that plant canaries without running the Cat & Mouse service
+    /// (the root daemon): the key lives in that daemon's own state folder, 0600, owned by it.
+    public static func load(directory: URL) throws -> (registry: RansomCanaryRegistry, seed: UInt64) {
+        let t = try DecoyTagger.loadOrCreateKey(at: directory.appendingPathComponent("decoy.key"))
+        return (RansomCanaryRegistry(tagger: t, url: directory.appendingPathComponent("canaries.json")), t.installSeed())
+    }
+
     public init(tagger: DecoyTagger, url: URL) {
         key = tagger.key; self.url = url
         if let d = try? Data(contentsOf: url), let m = try? JSONDecoder().decode([String: String].self, from: d) { marks = m }

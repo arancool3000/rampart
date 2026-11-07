@@ -167,12 +167,15 @@ enum Emergency {
                 guard enforce else { c.updateAction(a.kind, state: .dryRun, result: "would SIGSTOP \(a.pids)"); continue }
                 var stopped: [Int32] = []
                 for pid in a.pids where !ProcessKiller.isPlatformBinary(pid) && Darwin.kill(pid, SIGSTOP) == 0 { stopped.append(pid) }
+                for pid in stopped { p.services.deception?.markContained(pid: pid, quarantineID: nil) }
                 c.updateAction(a.kind, state: stopped.isEmpty ? .failed : .done, result: "suspended \(stopped)") { $0.pids = stopped }
             case .quarantineFiles:
                 var done: [String] = [], hashes: [String] = []
                 for path in a.paths {
                     let d = detection ?? Detection(path: path, name: "Emergency lockdown", category: .suspicious, severity: .critical, confidence: 100, evidence: [])
-                    if let rec = try? p.services.quarantine.quarantine(path: path, detection: d) { done.append(path); hashes.append(rec.sha256) }
+                    if let rec = try? p.services.quarantine.quarantine(path: path, detection: d) {
+                        done.append(path); hashes.append(rec.sha256); p.markDecoyCatchContained(d, quarantineID: rec.id)
+                    }
                 }
                 if let id = detection?.id, !done.isEmpty { _ = p.store.update(id) { $0.resolved = true } }
                 c.update { $0.quarantinedHashes += hashes; if !done.isEmpty, $0.reason?.path.map(done.contains) == true { $0.triggerResolved = true } }

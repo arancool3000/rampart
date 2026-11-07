@@ -129,7 +129,7 @@ DaemonWiring.hub?.onDetection = { protection.handle($0) }
 Emergency.start(protection)
 // Cat & Mouse: messages to Activity, lure detections to the store, emergencies to the lockdown trigger.
 if let dec = DaemonWiring.deception {
-    dec.notify = { m in protection.activity.add(.detection, m.title, detail: m.body, outcome: "decoy", severity: m.severity) }
+    dec.notify = { m in protection.activity.add(.detection, m.title, detail: m.body, outcome: "decoy", severity: m.severity, event: .deceptionEvent, actor: .system) }
     dec.onLureDetection = { d in protection.handle(d) }
     dec.onEmergency = { why in _ = try? Emergency.manual(protection, peer: .local, reason: "Cat & Mouse: " + why) }
 }

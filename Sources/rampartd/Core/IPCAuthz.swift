@@ -199,7 +199,7 @@ enum IPCAuthz {
             return on ? .adminClient : .adminClientWeakening
         case .deceptionRemoveAll:
             return .adminClientWeakening
-        case .deceptionSetTarpit, .deceptionSetTone:
+        case .deceptionSetTarpit, .deceptionSetTone, .deceptionSetDecoysVisible:
             return .adminClient
         case .emergencyStatus, .emergencyRescan, .emergencyAck:
             return .sessionUser

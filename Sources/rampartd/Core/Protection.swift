@@ -80,7 +80,9 @@ final class Protection {
         if remediate && d.confidence >= 90 && !d.resolved {
             var actions: [String] = []
             if cfg.killMaliciousProcesses, let pid = d.pid, pid > 1, let killer = services.processes {
-                actions.append(killer.terminate(pid: pid, expectedPath: d.path))
+                let r = killer.terminate(pid: pid, expectedPath: d.path)
+                actions.append(r)
+                if r.hasPrefix("killed ") && !r.hasPrefix("killed 0 ") { markDecoyCatchContained(d, quarantineID: nil) }
             }
             // Files are quarantined only on file-engine evidence. Behaviour/persistence findings point at
             // plists, scripts or apps that need a reviewed, journaled remediation instead.
@@ -90,6 +92,7 @@ final class Protection {
                     let rec = try services.quarantine.quarantine(path: path, detection: d)
                     actions.append("quarantined as \(rec.id.uuidString)")
                     d = store.update(d.id) { $0.resolved = true } ?? d
+                    markDecoyCatchContained(d, quarantineID: rec.id)
                 } catch { actions.append("quarantine failed: \(error.localizedDescription)") }
             }
             if !actions.isEmpty {

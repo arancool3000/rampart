@@ -43,6 +43,8 @@ extension SelfTest {
             ("integration", SelfTest.integrationChecks),
             ("deception", SelfTest.deceptionChecks),
             ("b5x", SelfTest.b5xChecks),
+            ("activity", SelfTest.activityChecks),
+            ("compress", SelfTest.compressChecks),
         ]
     }
 }

@@ -128,6 +128,9 @@ public struct ContainerUnreadable: Error, CustomStringConvertible, Sendable {
     /// Member names we could still list (e.g. an encrypted zip's central directory). Capped.
     public var memberNames: [String] = []
     public var description: String { "\(format.displayName) \(reason.rawValue): \(detail)" }
+    public init(reason: Reason, format: ArchiveFormat, detail: String, memberNames: [String] = []) {
+        self.reason = reason; self.format = format; self.detail = detail; self.memberNames = memberNames
+    }
 }
 
 /// Expands archives, compressed streams, DMGs and flat PKGs into a private temp directory using only
@@ -139,8 +142,24 @@ public struct ArchiveUnpacker: Sendable {
     public var tempRoot: String
 
     public init(limits: ArchiveLimits = ArchiveLimits(),
-                tempRoot: String = NSTemporaryDirectory() + "rampart-unpack") {
+                tempRoot: String = ArchiveUnpacker.defaultTempRoot) {
         self.limits = limits; self.tempRoot = tempRoot
+    }
+
+    /// Per-user Darwin temp dir (`/private/var/folders/…/T/`, from confstr, ignoring `$TMPDIR`) + "rampart-unpack".
+    /// Unpacked members never land in watched or shared folders such as /private/tmp, so real-time protection
+    /// (which skips /private/var/folders) doesn't re-detect what a scan is in the middle of checking.
+    public static var defaultTempRoot: String { darwinUserTempDir + "rampart-unpack" }
+
+    public static var darwinUserTempDir: String {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let n = confstr(_CS_DARWIN_USER_TEMP_DIR, &buf, buf.count)
+        if n > 0 && n <= buf.count {
+            let s = String(cString: buf)
+            if s.hasPrefix("/") { return s.hasSuffix("/") ? s : s + "/" }
+        }
+        let t = NSTemporaryDirectory()
+        return t.hasSuffix("/") ? t : t + "/"
     }
 
     /// File kinds this unpacker can expand.
@@ -172,7 +191,12 @@ public struct ArchiveUnpacker: Sendable {
         let out = (dir as NSString).appendingPathComponent("x")
         do {
             let c: UnpackedContainer
+            // A compressed tar (.tar.gz, .tbz, .txz, .tar.Z): bsdtar reads it in one step (one nesting level, not two).
+            let compressedTar = [ArchiveFormat.gzip, .bzip2, .xz, .compressZ, .lzma].contains(format) && (try? tarListing(path))?.isTar == true
             switch format {
+            case _ where compressedTar:
+                try bsdtarExtract(path, format: format, size: size, to: out)
+                c = UnpackedContainer(root: out, tempDir: dir, mountPoint: nil)
             case .zip:
                 try unzip(path, size: size, to: out)
                 c = UnpackedContainer(root: out, tempDir: dir, mountPoint: nil)
@@ -293,12 +317,22 @@ public struct ArchiveUnpacker: Sendable {
 
     // MARK: bsdtar (tar, 7z, rar, cpio, xar)
 
-    private func bsdtarExtract(_ path: String, format: ArchiveFormat, size: UInt64, to out: String) throws {
-        // List first (bounded output) so bombs and member counts are refused before anything is written.
+    struct TarListing { var result: BoundedProcess.Result; var parsed: (files: Int, bytes: UInt64, names: [String])
+        /// bsdtar recognised an archive (not just a compressed blob of something else).
+        var isTar: Bool { (result.status == 0 && parsed.files > 0) || result.truncated } }
+
+    /// `tar -tv` with bounded output (bsdtar auto-detects compression and format).
+    func tarListing(_ path: String) throws -> TarListing {
         let maxListing = min(64 << 20, max(1 << 20, limits.maxFiles * 400))
         let list = try BoundedProcess.run("/usr/bin/tar", ["-t", "-v", "--passphrase", Self.noPassphrase, "-f", path],
                                           maxStdout: maxListing, timeout: limits.timeout)
-        let parsed = Self.parseTarListing(String(decoding: list.stdout, as: UTF8.self))
+        return TarListing(result: list, parsed: Self.parseTarListing(String(decoding: list.stdout, as: UTF8.self)))
+    }
+
+    private func bsdtarExtract(_ path: String, format: ArchiveFormat, size: UInt64, to out: String) throws {
+        // List first (bounded output) so bombs and member counts are refused before anything is written.
+        let l = try tarListing(path)
+        let list = l.result, parsed = l.parsed
         let err = String(decoding: list.stderr.prefix(400), as: UTF8.self)
         if list.truncated || parsed.files > limits.maxFiles {
             throw ContainerUnreadable(reason: .tooManyFiles, format: format, detail: "more than \(limits.maxFiles) members", memberNames: parsed.names)

@@ -11,7 +11,7 @@ final class PermissionGuidePanel {
     private var panel: NSPanel?
     private let state = GuideState()
 
-    @MainActor @Observable final class GuideState { var done = false }
+    @MainActor @Observable final class GuideState { var done = false; var pointRight = false }
 
     var isShowing: Bool { panel != nil }
 
@@ -65,7 +65,9 @@ final class PermissionGuidePanel {
            let x = b["X"], let y = b["Y"], let width = b["Width"], let h = b["Height"] {
             let flippedY = primaryHeight - y - h       // CG is top-left origin; AppKit is bottom-left
             var px = x + width + 12
-            if let vf = screen?.visibleFrame, px + size.width > vf.maxX { px = x - size.width - 12 }
+            var right = false
+            if let vf = screen?.visibleFrame, px + size.width > vf.maxX { px = x - size.width - 12; right = true }
+            state.pointRight = right
             origin = NSPoint(x: px, y: flippedY + h - size.height - 60)
         }
         if origin == nil, let vf = screen?.visibleFrame {
@@ -82,6 +84,12 @@ private struct PermissionGuideView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateVar private var nudge = false
     @StateVar private var toggleOn = false
+
+    private var guideArrow: some View {
+        Image(systemName: state.pointRight ? "arrow.right" : "arrow.left").font(.title2.weight(.bold)).foregroundStyle(Color.rampartTeal)
+            .offset(x: nudge ? (state.pointRight ? 6 : -6) : 0)
+            .accessibilityHidden(true)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -100,11 +108,10 @@ private struct PermissionGuideView: View {
                 .transition(.opacity)
             } else {
                 HStack(spacing: 6) {
-                    Image(systemName: "arrow.left").font(.title2.weight(.bold)).foregroundStyle(Color.rampartTeal)
-                        .offset(x: nudge ? -6 : 0)
-                        .accessibilityHidden(true)
-                    Text("Find \(Product.name) in the list (it's in alphabetical order, under R) and turn on its switch.")
+                    if !state.pointRight { guideArrow }
+                    Text("Find \(Product.name) and app.rampart.daemon in the list (alphabetical order) and turn on both switches.")
                         .font(.callout).fixedSize(horizontal: false, vertical: true)
+                    if state.pointRight { guideArrow }
                 }
                 row
                 Divider()

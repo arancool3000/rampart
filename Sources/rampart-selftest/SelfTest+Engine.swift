@@ -7,7 +7,7 @@ import RampartEngine
 extension SelfTest {
     static func engine() {
         let fm = FileManager.default
-        let work = fm.temporaryDirectory.appendingPathComponent("com.rampart.test.engine-\(UUID().uuidString)")
+        let work = URL(fileURLWithPath: SelfTest.fixtureTempDir).appendingPathComponent("com.rampart.test.engine-\(UUID().uuidString)")
         try? fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
 

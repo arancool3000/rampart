@@ -72,7 +72,7 @@ extension SelfTest {
     }
 
     static func yaraXProtectAndEICAR() {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("com.rampart.test.yara.\(getpid())")
+        let tmp = URL(fileURLWithPath: SelfTest.fixtureTempDir).appendingPathComponent("com.rampart.test.yara.\(getpid())")
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 

@@ -32,6 +32,7 @@ fi
 echo "==> swift build ($CONFIG, scratch $SCRATCH) v$VERSION ($BUILD)"
 PRODUCTS="rampartd rampart RampartApp"
 grep -q '"rampart-nmh"' Package.swift && PRODUCTS="$PRODUCTS rampart-nmh"
+grep -q '"rampart-lure"' Package.swift && PRODUCTS="$PRODUCTS rampart-lure"
 if [ -n "${QUICK:-}" ]; then
   # One incremental debug build of everything (seconds instead of minutes); release builds stay per-product below.
   LOGF="$(mktemp -t rampart-build)"
@@ -56,6 +57,7 @@ cp "$BIN/RampartApp" "$APP/Contents/MacOS/$APP_NAME"
 cp "$BIN/rampartd"   "$APP/Contents/MacOS/rampartd"      # root LaunchDaemon source (copied to PrivilegedHelperTools)
 cp "$BIN/rampartd"   "$APP/Contents/Helpers/rampartd"    # --user LaunchAgent (app.rampart.userdaemon)
 [ -x "$BIN/rampart-nmh" ] && cp "$BIN/rampart-nmh" "$APP/Contents/Helpers/rampart-nmh"
+[ -x "$BIN/rampart-lure" ] && cp "$BIN/rampart-lure" "$APP/Contents/Helpers/rampart-lure"   # Cat & Mouse lure (root daemon installs it)
 cp "$BIN/rampart"    "$APP/Contents/Helpers/rampart"
 sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" -e "s/__DISPLAY_NAME__/$DISPLAY_NAME/g" Packaging/Info.plist > "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
@@ -94,6 +96,7 @@ codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --identifier a
 codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --identifier app.rampart.daemon "$APP/Contents/Helpers/rampartd"
 codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --identifier app.rampart.cli    "$APP/Contents/Helpers/rampart"
 [ -x "$APP/Contents/Helpers/rampart-nmh" ] && codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --identifier app.rampart.nmh "$APP/Contents/Helpers/rampart-nmh"
+[ -x "$APP/Contents/Helpers/rampart-lure" ] && codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --identifier app.rampart.lure "$APP/Contents/Helpers/rampart-lure"
 codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --entitlements Packaging/Rampart.entitlements "$APP"
 codesign --verify --strict --verbose=1 "$APP"
 "$APP/Contents/MacOS/rampartd" --version

@@ -53,6 +53,16 @@ public enum ContainerRisk {
 
     static func ext(_ name: String) -> String { ScanTriage.pathExtension(name) }
 
+    /// "x.ipa.part00", "x.zip.001", "x.z01", "x.7z.002", "x.part1.rar": one piece of a split archive.
+    public static func isSplitPart(_ name: String) -> Bool {
+        let e = ext(name)
+        if e.hasPrefix("part") && e.dropFirst(4).allSatisfy(\.isNumber) && e.count > 4 { return true }
+        if e.count >= 3 && e.allSatisfy(\.isNumber) { return true }
+        if e.count == 3 && e.hasPrefix("z") && e.dropFirst().allSatisfy(\.isNumber) { return true }
+        if e.count == 3 && e.hasPrefix("r") && e.dropFirst().allSatisfy(\.isNumber) { return true }
+        return name.lowercased().range(of: #"\.part\d+\.rar$"#, options: .regularExpression) != nil
+    }
+
     /// Member names that would run code (".app/" bundles count once), most telling first. Capped at 5.
     public static func riskyMembers(_ names: [String]) -> [String] {
         var out: [String] = []
@@ -148,6 +158,10 @@ public enum ContainerRisk {
         }
         let quiet = isQuietLocation(outerPath(displayPath)) && !origin.isRisky
         if why.isEmpty && (quiet || (e.reason == .tooDeep && benignNestingExtensions.contains(ext(name)))) { return nil }
+        // zstd / lz4 have no decompressor on a stock Mac (a victim can't open them either) and are common inside app
+        // documents (Blender .blend); split-archive parts are "truncated" by design. Quiet unless something is risky.
+        if why.isEmpty && e.reason == .unsupported && (e.format == .zstd || e.format == .lz4) { return nil }
+        if why.isEmpty && e.reason == .corrupt && isSplitPart(name) { return nil }
         score = min(score, maxScore)
 
         let what: String

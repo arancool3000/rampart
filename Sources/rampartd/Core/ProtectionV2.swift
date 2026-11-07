@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import RampartShared
 import RampartEngine
+import RampartGuard
 
 /// Pause/cancel for running scans. Pausing blocks scan workers at the next file (see `ScanGate`).
 final class ScanControl {
@@ -199,28 +200,42 @@ extension Protection {
         }
         let on = runtime.config.ransomwareCanaries
         let existing = state.value.canaries ?? []
+        guard on || !existing.isEmpty else { return }
+        guard let (reg, seed) = canaryRegistry() else { logWarn("ransomware canaries: no canary key available; nothing changed"); return }
         if on {
             guard let b = services.behaviour else { return }
             let dirs = Util.homeDirectories().flatMap { h in ["Documents", "Desktop", "Pictures"].map { h + "/" + $0 } }
                 .filter { FileManager.default.fileExists(atPath: $0) }
-            // Plants missing ones and (re)registers existing ones so they're watched after a restart.
-            let planted = b.plantCanaries(in: dirs)
-            state.update { $0.canaries = Array(Set(existing + planted)).sorted() }
+            // Keyed per-install canaries. Plants missing ones, keeps ours, and replaces legacy fixed-sentence canaries
+            // (old paths that are no longer active are dropped from the watch list).
+            let planted = reg.plant(in: dirs, seed: seed)
+            let stale = existing.filter { !planted.contains($0) }
+            b.ransomware.removeCanaries(stale)
+            _ = reg.remove(stale)   // only files byte-for-byte ours or holding the legacy sentence
+            for p in planted { b.ransomware.registerCanary(p) }
+            state.update { $0.canaries = planted.sorted() }
             logInfo("ransomware canaries active: \(planted.count) file(s)")
-        } else if !existing.isEmpty {
-            let removed = services.behaviour?.removeCanaries(existing) ?? Self.removeCanaryFiles(existing)
+        } else {
+            services.behaviour?.ransomware.removeCanaries(existing)
+            let removed = reg.remove(existing)
             state.update { $0.canaries = nil }
             logInfo("removed \(removed.count) ransomware canary file(s)")
         }
     }
 
-    /// Fallback removal without the behaviour engine: only registry paths still holding the RamPart decoy body.
-    static func removeCanaryFiles(_ paths: [String]) -> [String] {
-        paths.filter { p in
-            guard let d = FileManager.default.contents(atPath: p), String(decoding: d, as: UTF8.self).contains("Rampart ransomware protection file")
-            else { return false }
-            return (try? FileManager.default.removeItem(atPath: p)) != nil
-        }
+    /// Cat & Mouse: after remediation killed or quarantined the process behind a detection, mark its decoy catches
+    /// contained (the user sees "caught and contained", with the quarantine item for "study it in the sandbox").
+    func markDecoyCatchContained(_ d: Detection, quarantineID: UUID?) {
+        guard let pid = d.pid, pid > 1, let dec = services.deception else { return }
+        dec.markContained(pid: pid, quarantineID: quarantineID)
+    }
+
+    /// Cat & Mouse's registry in the user daemon; elsewhere (root daemon, where that service doesn't run) a registry
+    /// keyed from this daemon's own deception state folder. Same files either way, so one daemon never sees two keys.
+    func canaryRegistry() -> (RansomCanaryRegistry, UInt64)? {
+        if let d = services.deception { return (d.ransomCanaries(), d.installSeed) }
+        guard let o = try? RansomCanaryRegistry.load(directory: runtime.root.appendingPathComponent("deception")) else { return nil }
+        return (o.registry, o.seed)
     }
 
     // MARK: real-time

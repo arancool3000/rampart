@@ -1,6 +1,7 @@
 import Foundation
 import RampartShared
 import RampartBehaviour
+import RampartGuard
 
 // False-positive regression checks (launch items seen on a real Mac, canary atomic saves).
 extension SelfTest {
@@ -75,7 +76,8 @@ extension SelfTest {
         let docs = root + "/Documents"
         try? fm.createDirectory(atPath: docs, withIntermediateDirectories: true)
         let rw = RansomwareDetector(config: RansomwareConfig(protectedRoots: [docs]))
-        let planted = rw.plantCanaries(in: [docs])
+        let canaryState = root + "/canary-state"
+        let planted = plantTestCanaries(rw, in: [docs], state: canaryState)
         check(planted.count == 2, "fp1: canaries planted only when asked")
         let canary = planted[0]
         let tmp = docs + "/.sb-1a2b3c4d-XyZ123"
@@ -91,9 +93,19 @@ extension SelfTest {
         let bin = ProcessInfoLite(pid: 4343, ppid: 1, path: root + "/rampart.test.locker", uid: 501)
         let hits = rw.observe(SecurityEvent(kind: .fileWrite, process: bin, path: canary, source: "eslogger"), actorKey: "p:2")
         check(hits.contains { $0.ruleID == "R01" }, "fp1: non-atomic canary modification still detected")
-        let removed = rw.removeCanaries(planted)
-        check(removed.count == 1 && fm.fileExists(atPath: canary), "fp1: removeCanaries deletes only files still holding RamPart's decoy body")
+        let reg = (try? RansomCanaryRegistry.load(directory: URL(fileURLWithPath: canaryState)))?.registry
+        rw.removeCanaries(planted)
+        check(rw.canaryPaths.isEmpty && planted.allSatisfy { fm.fileExists(atPath: $0) }, "fp1: detector removeCanaries only unregisters (files untouched)")
+        let removed = reg?.remove(planted) ?? []
+        check(removed.count == 1 && fm.fileExists(atPath: canary), "fp1: canary removal deletes only files still exactly as RamPart planted them")
         let other = docs + "/notes.rtf"; write(other, "user file")
-        check(rw.removeCanaries([other]).isEmpty && fm.fileExists(atPath: other), "fp1: removeCanaries never deletes non-canary files")
+        check((reg?.remove([other]) ?? ["x"]).isEmpty && fm.fileExists(atPath: other), "fp1: canary removal never deletes non-canary files")
+        // Legacy migration never touches a user file that merely shares a legacy name.
+        let udir = root + "/LegacyDocs"; try? fm.createDirectory(atPath: udir, withIntermediateDirectories: true)
+        write(udir + "/zzz Archive Notes.rtf", "my own archive notes")
+        write(udir + "/000 Budget Notes.rtf", "{\\rtf1\\ansi Rampart ransomware protection file. Please do not edit, move or delete it; Rampart watches it to spot ransomware early.\\par}" + String(repeating: " ", count: 2048))
+        let migrated = reg?.plant(in: [udir], seed: (try? RansomCanaryRegistry.load(directory: URL(fileURLWithPath: canaryState)))?.seed ?? 0) ?? []
+        check(String(decoding: fm.contents(atPath: udir + "/zzz Archive Notes.rtf") ?? Data(), as: UTF8.self) == "my own archive notes", "fp1: legacy migration leaves a same-named user file alone")
+        check(!migrated.isEmpty && !(fm.contents(atPath: udir + "/000 Budget Notes.rtf").map(RansomwareDetector.isLegacyCanary) ?? false), "fp1: legacy canary replaced")
     }
 }

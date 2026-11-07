@@ -42,7 +42,7 @@ final class PasteGuardHost {
             Task { @MainActor in PasteGuardHost.shared.enqueue(ev) }
         }
         g.onDetection = { d in
-            Task { @MainActor in AppModel.shared.receive(detection: d) }
+            Task { @MainActor in AppModel.shared.receivePasteGuard(d) }
         }
         guardian = g
         g.start()

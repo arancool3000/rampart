@@ -42,7 +42,12 @@ final class RefreshModel {
     var forceQuitCandidate: SpeedMonitor.AppUsage?
 
     @ObservationIgnored private var scanner: RefreshScanner?
-    let cleaner = RefreshCleaner()
+    /// Cat & Mouse decoys and the maze are on the safety policy's skip list, so Refresh never "cleans them up".
+    /// Falls back to every decoy path in the last status when the helper predates `exclusions`.
+    var cleaner: RefreshCleaner {
+        let st = CatAndMouseModel.shared.status
+        return RefreshCleaner(policy: RefreshSafetyPolicy(decoyPaths: st?.exclusions ?? st?.decoys.map(\.path) ?? []))
+    }
 
     // MARK: Derived
 
@@ -108,13 +113,13 @@ final class RefreshModel {
 
     func preparePreview() {
         let items = selectedItems
-        let c = cleaner
-        Task.detached(priority: .userInitiated) {
-            let p = c.preview(items)
-            await MainActor.run {
-                RefreshModel.shared.previewRefused = p.refused
-                RefreshModel.shared.showPreview = true
-            }
+        Task {
+            // Fresh decoy list first (the user may never have opened Cat & Mouse this session).
+            await CatAndMouseModel.shared.refresh()
+            let c = cleaner
+            let p = await Task.detached(priority: .userInitiated) { c.preview(items) }.value
+            RefreshModel.shared.previewRefused = p.refused
+            RefreshModel.shared.showPreview = true
         }
     }
 
@@ -129,6 +134,12 @@ final class RefreshModel {
                 let m = RefreshModel.shared
                 m.lastOutcome = out
                 m.lastUndo = out.trashed
+                let freed = ByteCountFormatter.string(fromByteCount: Int64(out.freedBytes), countStyle: .file)
+                AppModel.shared.recordActivity(ActivityEntry(kind: .refresh, title: "Cleaned up \(freed)", outcome: "cleaned", event: .refreshCleanup, actor: .user,
+                    action: RefreshModel.dryRun ? "Practice run: nothing was moved." : "Moved the items to the Bin so this can be undone.",
+                    count: out.trashed.count, found: out.failed.count,
+                    facts: ["freed": freed, "skipped for safety": out.refused.isEmpty ? "" : String(out.refused.count),
+                            "couldn't be removed": out.failed.isEmpty ? "" : String(out.failed.count)]))
                 let gone = Set(out.trashed.map(\.original))
                 for i in m.results.indices { m.results[i].items.removeAll { gone.contains($0.path) } }
                 m.volume = DiskSizer.volume()
@@ -146,6 +157,8 @@ final class RefreshModel {
                 let m = RefreshModel.shared
                 m.undoMessage = r.skipped.isEmpty ? "Put back \(r.restored.count) item\(r.restored.count == 1 ? "" : "s")."
                     : "Put back \(r.restored.count); \(r.skipped.count) couldn't be restored (already moved or replaced)."
+                AppModel.shared.recordActivity(ActivityEntry(kind: .refresh, title: "Undid the last clean-up", outcome: "undone", event: .refreshUndo, actor: .user,
+                    count: r.restored.count, facts: ["couldn't be restored": r.skipped.isEmpty ? "" : String(r.skipped.count)]))
                 m.lastUndo = []
                 m.results = []
                 m.phase = .idle
@@ -161,6 +174,9 @@ final class RefreshModel {
             _ = try? c.emptyTrash(confirmed: true, dryRun: RefreshModel.dryRun)
             await MainActor.run {
                 let m = RefreshModel.shared
+                let freed = ByteCountFormatter.string(fromByteCount: Int64(m.trashBytes), countStyle: .file)
+                AppModel.shared.recordActivity(ActivityEntry(kind: .refresh, title: "Emptied the Bin", outcome: "cleaned", event: .refreshCleanup, actor: .user,
+                    action: "Deleted the Bin's contents permanently.", facts: ["freed": freed]))
                 m.trashBytes = 0
                 m.results.removeAll { $0.category == .trash }
                 m.volume = DiskSizer.volume()

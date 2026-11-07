@@ -17,6 +17,10 @@ struct AppActionExecutor: AIActionExecutor {
         let model = AppModel.shared
         let offline = Failure(description: "RamPart's protection service isn't connected, so this can't be changed right now.")
         model.lastError = nil
+        // Protection Activity: whatever this changes is shown as "by the AI assistant, approved by you".
+        model.activityActorOverride = .ai
+        defer { model.activityActorOverride = nil }
+        model.noteActivityActor()
         switch action {
         case .setToggle(.realtimeOn, let on):
             guard model.mode == .live else { throw offline }
@@ -44,6 +48,7 @@ struct AppActionExecutor: AIActionExecutor {
             model.startScan(.quick)
         case .remoteLockdown(let on):
             guard model.mode == .live else { throw offline }
+            model.noteActivityActor(events: [.remoteLockdownChanged])
             if case .error(let e) = try await model.client.request(.setRemoteLockdown(on: on), timeout: 30) { throw Failure(description: e) }
         case .updateDefinitions:
             await model.updateDefinitions()

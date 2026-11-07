@@ -81,11 +81,8 @@ final class BehaviourControlAdapter: BehaviourControl {
         }
         engine.config.allowlist = BehaviourConfig.defaultAllowlist + entries
     }
-    func plantCanaries(in dirs: [String]) -> [String] {
-        // Canary documents are covered by R01 (with atomic-save handling); they are not credential honeytokens.
-        engine.ransomware.plantCanaries(in: dirs)
-    }
-    func removeCanaries(_ paths: [String]) -> [String] { engine.ransomware.removeCanaries(paths) }
+    // Canary documents are covered by R01 (with atomic-save handling); they are not credential honeytokens.
+    var ransomware: RansomwareDetector { engine.ransomware }
 }
 
 /// RampartBehaviour.PersistenceScanner + snapshot differ + BehaviourEngine.evaluatePersistence.

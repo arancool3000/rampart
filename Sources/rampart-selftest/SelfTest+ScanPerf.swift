@@ -21,7 +21,7 @@ private final class ProbeDetector: FileDetector, @unchecked Sendable {
 extension SelfTest {
     static func scanPerfChecks() {
         let fm = FileManager.default
-        let work = NSTemporaryDirectory() + "com.rampart.test.scanperf-\(getpid())"
+        let work = SelfTest.fixtureTempDir + "com.rampart.test.scanperf-\(getpid())"
         try? fm.removeItem(atPath: work)
         defer { try? fm.removeItem(atPath: work) }
         let nm = work + "/proj/node_modules/com.rampart.test.pkg"

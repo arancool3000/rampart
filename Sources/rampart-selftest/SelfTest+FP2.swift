@@ -145,7 +145,7 @@ extension SelfTest {
         // The engine refuses to scan an EICAR file inside an own-data folder, whoever asks, and still finds it elsewhere.
         let fm = FileManager.default
         // A home-shaped folder in temp (never the real vault): <tmp>/home/Library/Application Support/Rampart/Quarantine.
-        let base = NSTemporaryDirectory() + "rampart.test.owndata-\(getpid())"
+        let base = SelfTest.fixtureTempDir + "rampart.test.owndata-\(getpid())"
         let own = base + "/home/Library/Application Support/Rampart/Quarantine"
         let other = base + "/elsewhere"
         defer { try? fm.removeItem(atPath: base) }

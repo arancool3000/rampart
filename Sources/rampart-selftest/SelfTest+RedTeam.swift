@@ -119,8 +119,9 @@ extension SelfTest {
         redTeamGuardUpdateChecks()   // pure, no daemon
         guard let bin = siblingProduct("rampartd", envOverride: "RAMPART_DAEMON") else { print("SKIP redteam: rampartd unavailable"); return }
         let fm = FileManager.default
-        let base = URL(fileURLWithPath: ProcessInfo.processInfo.environment["RAMPART_REDTEAM_DIR"] ?? (NSTemporaryDirectory() + "rt-\(getpid())"))
+        let base = URL(fileURLWithPath: ProcessInfo.processInfo.environment["RAMPART_REDTEAM_DIR"] ?? (SelfTest.fixtureTempDir + "rt-\(getpid())"))
         try? fm.removeItem(at: base)
+        defer { if ProcessInfo.processInfo.environment["RAMPART_REDTEAM_KEEP"] != "1" { try? fm.removeItem(at: base) } }
         let root = base.appendingPathComponent("state"), files = base.appendingPathComponent("files")
         for d in [root, files] { try? fm.createDirectory(at: d, withIntermediateDirectories: true) }
         try? Data(#"{"realtime":false,"scheduledQuickScanHours":0,"autoQuarantine":true,"scanArchives":true}"#.utf8).write(to: root.appendingPathComponent("config.json"))

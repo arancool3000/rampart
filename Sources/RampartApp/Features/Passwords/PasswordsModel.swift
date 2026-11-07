@@ -101,6 +101,7 @@ final class PasswordsModel {
         }.value
         busy = false
         if let result { error = result.localizedDescription; return }
+        vaultActivity("Password vault created")
         didUnlock()
     }
 
@@ -113,11 +114,19 @@ final class PasswordsModel {
         }.value
         busy = false
         if let result {
-            if case VaultError.rolledBack = result { rollbackPending = true }
+            if case VaultError.rolledBack = result {
+                rollbackPending = true
+                vaultActivity("Vault file was replaced with an older copy", severity: .high,
+                              detail: "The vault on disk is older than the last one you used. It wasn't opened automatically.")
+            } else {
+                vaultActivity("Vault unlock failed", severity: .medium, detail: "Wrong main password or unreadable vault.")
+            }
             error = result.localizedDescription; return
         }
+        if accept { vaultActivity("Older vault copy accepted", severity: .medium, detail: "You chose to open the older copy.") }
         rollbackPending = false; acceptRollback = false
         unlockedWithMaster = true
+        vaultActivity("Vault unlocked with the main password")
         didUnlock()
         repairTouchIDIfNeeded()
     }
@@ -159,6 +168,7 @@ final class PasswordsModel {
         error = nil
         do {
             try await touchID.unlock(); unlockedWithMaster = false
+            vaultActivity("Vault unlocked with Touch ID")
             UserDefaults.standard.removeObject(forKey: Self.touchIDRepairKey)
             didUnlock()
         }
@@ -374,9 +384,11 @@ final class PasswordsModel {
             do {
                 let mode = try touchID.enable()
                 flash(mode == .secureEnclave ? "Touch ID is on, protected by your Mac's security chip." : "Touch ID is on (compatibility mode).")
+                vaultActivity("Touch ID unlock turned on", detail: mode == .secureEnclave ? "Protected by the Mac's security chip." : "Compatibility mode.")
             } catch { self.error = error.localizedDescription }
         } else {
             touchID.disable()
+            vaultActivity("Touch ID unlock turned off")
         }
         refreshPhase()
     }
@@ -491,7 +503,10 @@ final class PasswordsModel {
         busy = false
         switch result {
         case .success(let d):
-            do { try Self.writePrivate(d, to: url); flash("Exported \(auth.count) accounts, encrypted.") } catch { self.error = error.localizedDescription }
+            do {
+                try Self.writePrivate(d, to: url); flash("Exported \(auth.count) accounts, encrypted.")
+                vaultActivity("Authenticator accounts exported", event: .authenticatorEvent, detail: "\(auth.count) accounts, encrypted with the password you chose.", target: url.path)
+            } catch { self.error = error.localizedDescription }
         case .failure(let e): error = e.localizedDescription
         }
     }
@@ -515,6 +530,7 @@ final class PasswordsModel {
             try self.store.insert(items)
         }
         flash("Imported \(items.count) item\(items.count == 1 ? "" : "s") from \(result.source.rawValue)\(result.skipped > 0 ? " (\(result.skipped) empty rows skipped)" : "").")
+        if error == nil { vaultActivity("Passwords imported from a CSV file", detail: "\(items.count) items. Delete the CSV: it holds passwords in plain text.", target: url.path) }
         if error == nil {
             toast = (toast ?? "") + " Delete the CSV file now: it holds your passwords in plain text."
         }
@@ -531,7 +547,10 @@ final class PasswordsModel {
         busy = false
         switch result {
         case .success(let d):
-            do { try Self.writePrivate(d, to: url); flash("Exported \(items.count) items, encrypted.") } catch { self.error = error.localizedDescription }
+            do {
+                try Self.writePrivate(d, to: url); flash("Exported \(items.count) items, encrypted.")
+                vaultActivity("Vault exported", detail: "\(items.count) items, encrypted with the password you chose.", target: url.path)
+            } catch { self.error = error.localizedDescription }
         case .failure(let e): error = e.localizedDescription
         }
     }
@@ -554,8 +573,15 @@ final class PasswordsModel {
                 try self.store.insert(r.items)
             }
             flash("Imported \(r.items.count) items.")
+            vaultActivity("Vault items imported", detail: "\(r.items.count) items from an encrypted export.", target: url.path)
         case .failure(let e): error = e.localizedDescription
         }
+    }
+
+    /// Protection Activity: vault and authenticator security events. Titles, counts and file locations only:
+    /// never passwords, item names, codes or vault contents.
+    private func vaultActivity(_ title: String, event: ActivityEvent = .vaultEvent, severity: Severity = .info, detail: String = "", target: String? = nil) {
+        AppModel.shared.recordActivity(ActivityEntry(kind: .vault, title: title, detail: detail, severity: severity, event: event, actor: severity >= .medium ? nil : .user, target: target))
     }
 
     /// Writes a file only the user can read (0600), atomically. Used for exports and saved attachments.

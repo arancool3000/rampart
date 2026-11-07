@@ -1,6 +1,7 @@
 import Foundation
 import RampartShared
 import RampartBehaviour
+import RampartGuard
 import AppKit
 
 // Owned by the behaviour build agent. Add checks with check(cond, "name").
@@ -183,7 +184,7 @@ extension SelfTest {
             try? fm.createDirectory(atPath: docs + "/a", withIntermediateDirectories: true)
             try? fm.createDirectory(atPath: docs + "/b", withIntermediateDirectories: true)
             let rw = RansomwareDetector(config: RansomwareConfig(protectedRoots: [docs]))
-            let canaries = rw.plantCanaries(in: [docs])
+            let canaries = plantTestCanaries(rw, in: [docs], state: scratch + "/canary-state")
             check(canaries.count == 2, "two canaries planted")
             let sim = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning, ransomware: rw))
             let zsh = sim.terminalSession()
@@ -212,7 +213,7 @@ extension SelfTest {
             check(sim.detections.contains { $0.category == .ransomware && $0.severity == .critical }, "ransomware critical")
             // Canary touched without content change is not a hit
             let rw2 = RansomwareDetector(config: RansomwareConfig(protectedRoots: [docs]))
-            let c2 = rw2.plantCanaries(in: [docs + "/b"])
+            let c2 = plantTestCanaries(rw2, in: [docs + "/b"], state: scratch + "/canary-state")
             check(rw2.observe(SecurityEvent(kind: .fileClose, path: c2[0], detail: ["modified": "0"], source: "t"), actorKey: "x").isEmpty,
                   "unchanged canary read is not a hit")
         }
@@ -874,4 +875,13 @@ extension SelfTest {
         // The user's general pasteboard was never touched by these tests.
         check(board.pasteboard.name != .general, "tests used a private pasteboard")
     }
+}
+
+/// Plants keyed canaries the way rampartd does (RampartGuard registry, then registered with the detector).
+@discardableResult
+func plantTestCanaries(_ rw: RansomwareDetector, in dirs: [String], state: String) -> [String] {
+    guard let o = try? RansomCanaryRegistry.load(directory: URL(fileURLWithPath: state)) else { return [] }
+    let planted = o.registry.plant(in: dirs, seed: o.seed)
+    for p in planted { rw.registerCanary(p) }
+    return planted
 }

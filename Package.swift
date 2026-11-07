@@ -10,6 +10,7 @@ let package = Package(
         .executable(name: "rampart", targets: ["rampart"]),
         .executable(name: "RampartApp", targets: ["RampartApp"]),
         .executable(name: "rampart-nmh", targets: ["rampart-nmh"]),
+        .executable(name: "rampart-lure", targets: ["rampart-lure"]),
         .executable(name: "RampartBrowser", targets: ["RampartBrowser"]),
     ],
     targets: [
@@ -29,6 +30,8 @@ let package = Package(
         .target(name: "RampartAI", dependencies: ["RampartShared"]),
         .target(name: "RampartRefresh", dependencies: ["RampartShared"]),
         .executableTarget(name: "rampart-nmh", dependencies: ["RampartShared", "RampartWeb"]),
+        // Cat & Mouse network lure: the tiny sandboxed helper the root daemon starts via launchd (LureContainment).
+        .executableTarget(name: "rampart-lure", dependencies: ["RampartGuard"]),
         .executableTarget(name: "RampartBrowser", dependencies: ["RampartShared", "RampartWeb"],
                           exclude: ["README.md"],
                           linkerSettings: [.linkedFramework("WebKit")]),

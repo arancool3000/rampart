@@ -41,6 +41,15 @@ enum CatAndMouseBridge {
         if case .deception(let d)? = try? await client.request(.deceptionSetTarpit(on: on, port: port, scope: scope.rawValue)) { return decode(d) }
         return .unsupported
     }
+    /// Version-tolerant: a helper built before this request existed can't decode it and answers with an error (or
+    /// drops the connection). That is reported as a plain message, not as "Cat & Mouse unsupported".
+    static func setDecoysVisible(client: DaemonClient, visible: Bool) async -> Outcome {
+        switch try? await client.request(.deceptionSetDecoysVisible(visible: visible)) {
+        case .deception(let d)?: return decode(d)
+        case .error(let e)?: return .error("Couldn't change decoy visibility: \(e)")
+        default: return .error("This RamPart helper is too old to change decoy visibility. Update RamPart and try again.")
+        }
+    }
     static func setTone(client: DaemonClient, serious: Bool) async -> Outcome {
         if case .deception(let d)? = try? await client.request(.deceptionSetTone(serious: serious)) { return decode(d) }
         return .unsupported
@@ -88,9 +97,10 @@ final class CatAndMouseModel {
     func removeAll() async { busy = true; apply(await CatAndMouseBridge.removeAll(client: client)); busy = false }
     func setTarpit(_ on: Bool, scope: LureScope? = nil) async {
         busy = true
-        apply(await CatAndMouseBridge.setTarpit(client: client, on: on, port: status?.config.tarpitPort ?? 2222, scope: scope ?? status?.config.lureScope ?? .loopback))
+        apply(await CatAndMouseBridge.setTarpit(client: client, on: on, port: status?.config.tarpitPort ?? 2222, scope: scope ?? .loopback))   // other scopes: coming soon (root daemon)
         busy = false
     }
+    func setDecoysVisible(_ v: Bool) async { busy = true; apply(await CatAndMouseBridge.setDecoysVisible(client: client, visible: v)); busy = false }
     func setTone(_ t: DeceptionTone) async {
         UserDefaults.standard.set(t == .serious, forKey: "catMouse.serious")
         apply(await CatAndMouseBridge.setTone(client: client, serious: t == .serious))

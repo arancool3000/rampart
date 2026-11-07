@@ -79,11 +79,13 @@ struct CatAndMouseView: View {
                 }
             }
             if cfg.tarpitEnabled {
-                Picker("Who can reach it", selection: Binding(get: { cfg.lureScope == .anywhere ? .localSubnet : cfg.lureScope },
-                                                              set: { sc in Task { await model.setTarpit(true, scope: sc) } })) {
-                    Text("This Mac only").tag(LureScope.loopback)
-                    Text("My local network").tag(LureScope.localSubnet)
-                }.pickerStyle(.segmented).frame(maxWidth: 360)
+                // Reaching the lure from other devices needs the boxed-in helper (rampart-lure), its packet-filter
+                // anchor and launchd job, which only the RamPart system service may install. That isn't wired up yet,
+                // so only "This Mac" is offered and the network option says so honestly.
+                Label("Reachable from this Mac only.", systemImage: "laptopcomputer")
+                    .font(.callout)
+                Text("Coming soon: letting other devices on your local network reach the lure. It needs the RamPart system service to set up its packet filter and sandboxed helper.")
+                    .font(.caption).foregroundStyle(.secondary)
                 DisclosureGroup("The 10 containment layers") {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(LureContainment.layers) { l in
@@ -92,8 +94,13 @@ struct CatAndMouseView: View {
                     }.padding(.top, 4)
                 }.font(.callout)
             }
-            Text(cfg.decoysVisible ? "Decoys are visible in Finder." : "Decoys are hidden in Finder so you don't open them by accident. If you do, RamPart just tells you it's bait.")
-                .font(.caption).foregroundStyle(.secondary)
+            Toggle(isOn: Binding(get: { cfg.decoysVisible }, set: { v in Task { await model.setDecoysVisible(v) } })) {
+                VStack(alignment: .leading) {
+                    Text("Show decoys in Finder")
+                    Text(cfg.decoysVisible ? "Decoys are visible in Finder." : "Decoys are hidden in Finder so you don't open them by accident. If you do, RamPart just tells you it's bait.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }.disabled(!cfg.decoysEnabled)
             Picker("Tone", selection: Binding(get: { model.tone }, set: { t in Task { await model.setTone(t) } })) {
                 Text("Playful").tag(DeceptionTone.playful)
                 Text("Serious").tag(DeceptionTone.serious)

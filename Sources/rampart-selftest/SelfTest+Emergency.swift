@@ -6,7 +6,7 @@ import RampartGuard
 // no command runs (the planner only produces GuardCommand values).
 extension SelfTest {
     static func emergencyChecks() {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("com.rampart.test.emergency-\(UUID().uuidString)")
+        let tmp = URL(fileURLWithPath: SelfTest.fixtureTempDir).appendingPathComponent("com.rampart.test.emergency-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tmp) }
 

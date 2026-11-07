@@ -10,6 +10,8 @@ public struct DeceptionStatus: Codable, Hashable, Sendable {
     public var tarpitListening: Bool
     public var readDetectionAvailable: Bool   // false without eslogger (FSEvents cannot see reads)
     public var notes: [String]
+    /// Paths RamPart's own walkers and cleaners must skip (decoys + maze roots). Optional: older helpers omit it.
+    public var exclusions: [String]? = nil
 }
 
 /// The daemon-side orchestrator. Wiring (see report): feed every SecurityEvent to `handle`, route returned
@@ -59,7 +61,8 @@ public final class DeceptionService: @unchecked Sendable {
         if !readDetectionAvailable { notes.append("Read detection needs Full Disk Access for the RamPart helper (eslogger). Without it only copies, renames and deletes are seen.") }
         return DeceptionStatus(config: config, decoys: registry.all, catches: Array(catches.suffix(200)),
                                tarpitAttempts: tarpit?.recorded ?? [], tarpitListening: tarpit != nil,
-                               readDetectionAvailable: readDetectionAvailable, notes: notes)
+                               readDetectionAvailable: readDetectionAvailable, notes: notes,
+                               exclusions: DeceptionExclusions.paths(registry: registry))
     }
 
     // MARK: Settings
@@ -93,6 +96,23 @@ public final class DeceptionService: @unchecked Sendable {
         let o = planter.removeAll()
         lock.lock(); config.decoysEnabled = false; config.mazeEnabled = false; lock.unlock(); save()
         return DeceptionChangeReport(removed: o.removed, kept: o.keptBecauseChanged)
+    }
+
+    /// Shows or hides the decoys in Finder (UF_HIDDEN). Applies to decoys already planted, but only to files that
+    /// still verify as ours (registry tag + unchanged content); anything else is left exactly as it is.
+    /// Returns how many files were changed.
+    @discardableResult
+    public func setDecoysVisible(_ visible: Bool) -> Int {
+        lock.lock(); config.decoysVisible = visible; lock.unlock()
+        var changed = 0
+        for r in registry.all where r.kind != .mazeDir && r.kind != .mazeLink && tagger.verify(r) {
+            var st = stat()
+            guard lstat(r.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size < 1 << 20,
+                  let d = DecoyPlanter.readNoFollow(r.path), deceptionSHA256(d) == r.contentSHA256 else { continue }
+            let flags = visible ? st.st_flags & ~UInt32(UF_HIDDEN) : st.st_flags | UInt32(UF_HIDDEN)
+            if flags != st.st_flags, lchflags(r.path, flags) == 0 { changed += 1 }
+        }
+        save(); return changed
     }
 
     public func setTone(_ t: DeceptionTone) { lock.lock(); config.tone = t; lock.unlock(); save() }

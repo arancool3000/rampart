@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import RampartShared
 import RampartGuard
+import RampartRefresh
 
 // Cat & Mouse (deception) tests. Everything happens in a scratch "home" under the temp dir; never a real folder.
 extension SelfTest {
@@ -208,6 +209,24 @@ extension SelfTest {
         let removed = creg.remove()
         check(removed.count == expected && FileManager.default.fileExists(atPath: cdir + "/zzz Archive Notes.rtf"), "deception.canary.removeOnlyOurs")
 
+        // Show / hide decoys in Finder: only verified, unchanged decoys get their flag changed.
+        func hidden(_ p: String) -> Bool { var st = stat(); return lstat(p, &st) == 0 && (st.st_flags & UInt32(UF_HIDDEN)) != 0 }
+        _ = svc.setDecoysVisible(true)
+        check(svc.status().config.decoysVisible && !hidden(seed), "deception.visible.shown")
+        check(svc.setDecoysVisible(false) >= 1 && hidden(seed) && !svc.status().config.decoysVisible, "deception.visible.hidden")
+        check(!hidden(userFile), "deception.visible.userFileUntouched")
+
+        // Refresh never cleans decoys or the maze (the policy gets DeceptionService.exclusions).
+        let ex = svc.status().exclusions ?? []
+        check(ex.contains(seed) && ex == svc.exclusions, "deception.status.exclusions")
+        let rpol = RefreshSafetyPolicy(home: home, decoyPaths: svc.exclusions)
+        check(rpol.pathRefusal(seed) == .rampartDecoy, "deception.refresh.decoyRefused")
+        check(rpol.pathRefusal((seed as NSString).deletingLastPathComponent + "/rampart-test-sibling.txt") == nil, "deception.refresh.siblingAllowed")
+        if let m = svc.registry.mazeRoots.first {
+            check(rpol.pathRefusal(m + "/deep/file.txt") == .rampartDecoy, "deception.refresh.mazeRefused")
+        }
+        check(rpol.pathRefusal(home + "/Library/Caches/com.example/cache.db") == nil, "deception.refresh.realCacheAllowed")
+
         // Maze walk: walker opens many maze folders.
         let walker = ProcessInfoLite(pid: 5151, ppid: 1, path: "/Users/Shared/walker", uid: 501)
         let mazeDirs = svc.registry.all.filter { $0.kind == .mazeDir }.map(\.path)
@@ -295,6 +314,18 @@ extension SelfTest {
         } else { check(false, "deception.containment.plan") }
         check((try? LureContainment.plan(port: 5000, scope: .loopback, localSubnets: [], helperPath: "/x\") (allow default)")) == nil, "deception.containment.sbplInjection")
         check(LureContainment.pfAnchor(port: 2222, scope: .loopback, localSubnets: []).contains("block in quick on ! lo0"), "deception.containment.pfLoopback")
+        // rampart-lure command line (what launchd passes): round-trips, refuses accidental runs and unconfirmed internet exposure.
+        let la = LureHelperArgs(port: 5000, scope: .localSubnet, localSubnets: ["192.168.1.0/24"])
+        check((try? LureHelperArgs.parse(la.arguments)) == la, "deception.lureArgs.roundTrip")
+        check((try? LureHelperArgs.parse(["--port", "5000"])) == nil, "deception.lureArgs.needsLureFlag")
+        check((try? LureHelperArgs.parse(["--lure", "--port", "22"])) == nil, "deception.lureArgs.highPortOnly")
+        check((try? LureHelperArgs.parse(["--lure", "--port", "5000", "--scope", "anywhere"])) == nil, "deception.lureArgs.anywhereNeedsConfirm")
+        check((try? LureHelperArgs.parse(["--lure", "--port", "5000", "--subnet", "1.2.3.4/33"])) == nil, "deception.lureArgs.badSubnet")
+        if let lp = try? LureContainment.plan(port: 5000, scope: .localSubnet, localSubnets: ["192.168.1.0/24"]),
+           let pl = (try? PropertyListSerialization.propertyList(from: lp.launchdPlist, format: nil)) as? [String: Any],
+           let argv = pl["ProgramArguments"] as? [String] {
+            check(argv.contains("--subnet") && argv.contains("192.168.1.0/24") && (try? LureHelperArgs.parse(Array(argv.dropFirst(4)))) != nil, "deception.lureArgs.plistParses")
+        } else { check(false, "deception.lureArgs.plist") }
 
         if let tp = try? TarpitServer(port: 0, proto: .ssh, lineDelay: 0) {
             do {

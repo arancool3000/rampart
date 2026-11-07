@@ -306,6 +306,8 @@ public enum IPCRequest: Codable, Sendable {
     case deceptionSetTarpit(on: Bool, port: UInt16, scope: String)
     case deceptionSetTone(serious: Bool)
     case deceptionEvidence(catchID: UUID)            // -> .deceptionEvidence(Data)
+    // v7 (added later in v7; an older v7 daemon answers "unknown request", which the app treats as unsupported)
+    case deceptionSetDecoysVisible(visible: Bool)    // -> .deception(Data)
 }
 
 public enum IPCResponse: Codable, Sendable {

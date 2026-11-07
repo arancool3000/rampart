@@ -5,6 +5,7 @@ import Darwin
 public enum RefreshRefusal: String, Sendable, Equatable {
     case systemPath, appBundleInternals, keychain, rampartData, rootless, iCloud
     case openByProcess, outsideHome, protectedUserFolder, missing, symlink, homeItself
+    case rampartDecoy
 
     public var explanation: String {
         switch self {
@@ -20,6 +21,7 @@ public enum RefreshRefusal: String, Sendable, Equatable {
         case .missing: return "No longer exists."
         case .symlink: return "A link that points somewhere else; the link target is never followed."
         case .homeItself: return "Your home folder."
+        case .rampartDecoy: return "A RamPart Cat & Mouse decoy (or a folder holding one). Turn decoys off in Cat & Mouse to remove them."
         }
     }
 }
@@ -31,9 +33,13 @@ public struct RefreshSafetyPolicy: Sendable {
     public var extraAllowedRoots: [String]
     /// Paths of files currently open by any process we can see. nil = query libproc at check time.
     public var openFilesOverride: Set<String>?
+    /// Cat & Mouse decoys and maze roots (DeceptionService.exclusions): never cleaned, nor any folder holding one.
+    public var decoyPaths: [String]
 
-    public init(home: String = NSHomeDirectory(), extraAllowedRoots: [String] = [], openFilesOverride: Set<String>? = nil) {
+    public init(home: String = NSHomeDirectory(), extraAllowedRoots: [String] = [], openFilesOverride: Set<String>? = nil,
+                decoyPaths: [String] = []) {
         self.home = RefreshSafetyPolicy.normalize(home)
+        self.decoyPaths = decoyPaths.filter { !$0.isEmpty }.map { RefreshSafetyPolicy.normalize($0) }
         self.extraAllowedRoots = extraAllowedRoots.map { RefreshSafetyPolicy.normalize($0) }
         self.openFilesOverride = openFilesOverride
     }
@@ -57,6 +63,7 @@ public struct RefreshSafetyPolicy: Sendable {
                               "/Library/Preferences/app.rampart", "/Library/Logs/Rampart", "/Library/Containers/app.rampart",
                               "/Library/Caches/com.rampart", "/Library/Preferences/com.rampart"]
         if rampartMarkers.contains(where: { p.contains($0) }) { return .rampartData }
+        if decoyPaths.contains(where: { $0 == p || p.hasPrefix($0 + "/") || $0.hasPrefix(p + "/") }) { return .rampartDecoy }
         if p == home { return .homeItself }
         let roots = [home] + extraAllowedRoots
         guard let root = roots.first(where: { p.hasPrefix($0 + "/") }) else {

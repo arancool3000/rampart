@@ -1,6 +1,7 @@
 import Foundation
 import RampartShared
 import RampartGuard
+import RampartBehaviour
 
 // The plug-in layer. Each protocol is implemented either by a module adapter (Integrations.swift)
 // or by a built-in fallback (Builtin.swift) so the daemon always runs.
@@ -68,10 +69,8 @@ protocol PersistenceRemediationService: AnyObject {
 protocol BehaviourControl: AnyObject {
     func apply(learningMode: Bool, developerMode: Bool)
     func setAllowRules(_ rules: [AllowRuleSpec])
-    /// Plants canary files in `dirs`; returns the paths planted.
-    func plantCanaries(in dirs: [String]) -> [String]
-    /// Removes RamPart-created canaries (registry paths only); returns the paths removed.
-    func removeCanaries(_ paths: [String]) -> [String]
+    /// The ransomware detector (canary paths are planted by RampartGuard.RansomCanaryRegistry, then registered here).
+    var ransomware: RansomwareDetector { get }
 }
 
 protocol PersistenceService: AnyObject {

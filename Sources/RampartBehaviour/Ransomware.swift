@@ -49,28 +49,13 @@ public final class RansomwareDetector: @unchecked Sendable {
 
     // MARK: canaries
 
-    static let canaryNames = ["000 Budget Notes.rtf", "zzz Archive Notes.rtf"]
-    static let canaryBody = #"{\rtf1\ansi Rampart ransomware protection file. Please do not edit, move or delete it; Rampart watches it to spot ransomware early.\par}"#
+    // Canary files are planted by RampartGuard.RansomCanaryRegistry (keyed, per-install names and bodies);
+    // this detector only watches the paths it is given.
 
-    /// Writes decoy documents (hidden from Finder via UF_HIDDEN) that sort first and last, and registers them.
-    @discardableResult
-    public func plantCanaries(in dirs: [String]) -> [String] {
-        var planted: [String] = []
-        for d in dirs {
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: d, isDirectory: &isDir), isDir.boolValue else { continue }
-            for n in Self.canaryNames {
-                let p = (d as NSString).appendingPathComponent(n)
-                let body = Data((Self.canaryBody + String(repeating: " ", count: 2048)).utf8)
-                if !FileManager.default.fileExists(atPath: p) {
-                    guard FileManager.default.createFile(atPath: p, contents: body) else { continue }
-                    _ = chflags(p, UInt32(UF_HIDDEN))
-                }
-                registerCanary(p)
-                planted.append(p)
-            }
-        }
-        return planted
+    /// Legacy recogniser: the fixed sentence older builds wrote into every canary. Used only to migrate them.
+    public static let legacyCanaryMarker = "Rampart ransomware protection file"
+    public static func isLegacyCanary(_ d: Data) -> Bool {
+        String(decoding: d.prefix(4096), as: UTF8.self).contains(legacyCanaryMarker)
     }
 
     /// Registers an existing file as a canary (its current content is the reference).
@@ -89,18 +74,9 @@ public final class RansomwareDetector: @unchecked Sendable {
             || b.hasSuffix("~") || p.contains("/NSIRD_")
     }
 
-    /// Removes canary files RamPart created (only the registered paths given, and only if they still hold
-    /// RamPart's decoy body). Returns the paths removed.
-    @discardableResult
-    public func removeCanaries(_ paths: [String]) -> [String] {
-        var removed: [String] = []
-        for p in paths where Self.canaryNames.contains(PathUtil.basename(p)) {
-            guard let d = FileManager.default.contents(atPath: p), let s = String(data: d, encoding: .utf8),
-                  s.contains("Rampart ransomware protection file") else { continue }
-            if (try? FileManager.default.removeItem(atPath: p)) != nil { removed.append(p) }
-        }
+    /// Stops watching these canary paths. Never touches the files (RampartGuard.RansomCanaryRegistry removes them).
+    public func removeCanaries(_ paths: [String]) {
         lock.lock(); for p in paths { canaries[PathUtil.canonical(p)] = nil }; lock.unlock()
-        return removed
     }
 
     public func observe(_ e: SecurityEvent, actorKey: String, trustedGUIActor: Bool = false) -> [RansomHit] {
