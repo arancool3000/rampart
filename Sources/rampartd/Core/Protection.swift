@@ -49,6 +49,10 @@ final class Protection {
         let id = UUID(); subLock.lock(); subscribers[id] = send; subLock.unlock(); return id
     }
     func unsubscribe(_ id: UUID) { subLock.lock(); subscribers[id] = nil; subLock.unlock() }
+    /// Pushes a lockdown status to every subscribed app at once (it posts the user notification).
+    func broadcastEmergency(_ d: Data) { broadcast(.emergency(d)) }
+    var subscriberCount: Int { subLock.lock(); defer { subLock.unlock() }; return subscribers.count }
+
     private func broadcast(_ r: IPCResponse) {
         subLock.lock(); let subs = subscribers; subLock.unlock()
         for (id, send) in subs where !send(r) { unsubscribe(id) }
@@ -191,6 +195,7 @@ final class Protection {
                                 openDetections: store.openCount)
         status.definitionsUpdated = st.lastUpdate
         status.ipcVersion = IPC.version
+        status.healthNotes = DaemonHooks.healthNotes?()
         return status
     }
 

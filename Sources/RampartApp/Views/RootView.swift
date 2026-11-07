@@ -50,6 +50,8 @@ struct RootView: View {
                 if model.isOffline { OfflineBanner() }
                 else if model.mode == .live && (model.daemonOutdated || model.lastError == DaemonClient.outdatedMessage) { OutdatedDaemonBanner() }
                 else if let err = model.lastError, model.mode == .live { ErrorBanner(message: err) }
+                // One deduplicated health note (e.g. eslogger not permitted): a status note, never a threat.
+                if model.mode == .live, let n = model.status.healthNotes?.first { HealthNoteBanner(note: n) }
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
                 detail
@@ -466,5 +468,26 @@ struct FeaturePlaceholderView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle(item.title)
+    }
+}
+
+
+/// "Real-time monitoring needs Full Disk Access: Fix". Health problems are status notes, not detections.
+struct HealthNoteBanner: View {
+    let note: HealthNote
+    var body: some View {
+        HStack(spacing: Spacing.s) {
+            Image(systemName: "stethoscope").foregroundStyle(Color.statusAttention)
+            Text(note.message).font(.callout.weight(.semibold))
+            Text(note.count > 1 ? "(\(note.count) times)" : "").font(.caption).foregroundStyle(.secondary)
+                .help(note.detail)
+            Spacer()
+            if note.fix == .fullDiskAccess {
+                Button("Fix") { FullDiskAccessRequest.start() }.controlSize(.small)
+                    .help("Opens System Settings › Privacy & Security › Full Disk Access")
+            }
+        }
+        .bannerChrome()
+        .accessibilityElement(children: .combine)
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import CoreWLAN
 import Security
+import LocalAuthentication
 import RampartShared
 import RampartGuard
 
@@ -48,6 +49,24 @@ enum EmergencyBridge {
     static func ack(client: DaemonClient, ids: [String]) async -> Outcome { await call(client) { .emergencyAck(actionIDs: ids) } }
     static func lift(client: DaemonClient, token: String, force: Bool) async -> Outcome {
         await call(client) { .liftEmergencyLockdown(token: token, force: force) }
+    }
+
+    static func keepBlocking(client: DaemonClient) async -> Outcome { await call(client) { .emergencyNetwork(keep: true, token: nil) } }
+    static func restoreNetwork(client: DaemonClient, token: String) async -> Outcome {
+        await call(client) { .emergencyNetwork(keep: false, token: token) }
+    }
+
+    /// Super Kill Switch path A: the daemon, with a 3 s ceiling (a hung service must not hold the user offline).
+    static func killSwitch(client: DaemonClient, token: String) async -> Result<KillSwitch.Report, Failure> {
+        do {
+            switch try await client.request(.killSwitch(token: token), timeout: 3) {
+            case .killSwitch(let d):
+                guard let r = try? JSONDecoder.rampart.decode(KillSwitch.Report.self, from: d) else { return .failure(Failure(message: "unreadable reply")) }
+                return .success(r)
+            case .error(let e): return .failure(Failure(message: e))
+            default: return .failure(Failure(message: "The service is too old for the kill switch."))
+            }
+        } catch { return .failure(Failure(message: error.localizedDescription)) }
     }
 
     /// Step 1 of the existing admin token flow. Asks without a password first (user mode accepts that); only if
@@ -109,11 +128,8 @@ enum EmergencyAppActions {
         guard st.state.active, sessionActionsAllowed else { return [] }
         var done: [String] = []
         let pending = Set(st.state.actions.filter { $0.runner == .app && !st.state.appActionsDone.contains($0.id) }.map(\.kind))
-        if pending.contains(.alert) {
-            Notifier.shared.post(.threat, title: "Emergency lockdown is on",
-                                 body: st.state.reason?.summary ?? "\(Product.name) has isolated this Mac.", critical: true)
-            done.append(EmergencyAction.Kind.alert.rawValue)
-        }
+        // The notification itself is posted by EmergencyModel.apply for every transition (EmergencyNotice).
+        if pending.contains(.alert) { done.append(EmergencyAction.Kind.alert.rawValue) }
         if pending.contains(.lockVault) { PasswordsModel.shared.lock(); done.append(EmergencyAction.Kind.lockVault.rawValue) }
         if pending.contains(.clearClipboard) { NSPasteboard.general.clearContents(); done.append(EmergencyAction.Kind.clearClipboard.rawValue) }
         return done
@@ -129,5 +145,62 @@ enum EmergencyAppActions {
     static func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
+
+/// Super Kill Switch user-presence gate: Touch ID, or the Mac's password when Touch ID isn't available.
+/// Runs only from a button click (never at launch, never headless, never with RAMPART_NO_PRIVILEGED_TOOLS).
+@MainActor
+enum KillSwitchAuth {
+    static func confirm() async -> Bool {
+        guard EmergencyAppActions.sessionActionsAllowed else { return false }
+        let ctx = LAContext()
+        var e: NSError?
+        let policy: LAPolicy = ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &e)
+            ? .deviceOwnerAuthenticationWithBiometrics : .deviceOwnerAuthentication
+        ctx.localizedFallbackTitle = "Use Password"
+        do { return try await ctx.evaluatePolicy(policy, localizedReason: "turn off everything \(Product.name) is doing to your network") }
+        catch {
+            if policy == .deviceOwnerAuthenticationWithBiometrics, (error as? LAError)?.code == .userFallback {
+                return (try? await LAContext().evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "turn off everything \(Product.name) is doing to your network")) ?? false
+            }
+            return false
+        }
+    }
+}
+
+/// Super Kill Switch path B: when the service doesn't answer within 3 s (hung, dead, crash-looping, mismatched), run
+/// the bundled, signed killswitch.sh from inside this verified app bundle through the macOS administrator prompt
+/// (which offers Touch ID). The ONE documented exception to the zero pop-ups rule: the user pressed the button.
+/// With RAMPART_NO_PRIVILEGED_TOOLS (tests) it runs the script in dry-run mode without any prompt.
+enum KillSwitchScript {
+    struct Result { var ok: Bool; var output: String }
+
+    /// The script, only from this app's own signed bundle (its code signature must validate).
+    static func locate(bundle: String = Bundle.main.bundlePath) -> String? {
+        guard let p = KillSwitch.bundledScript(inBundle: bundle) else { return nil }
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: bundle) as CFURL, [], &code) == errSecSuccess, let code,
+              SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), nil) == errSecSuccess else { return nil }
+        return p
+    }
+
+    static func run(script: String, dryRun: Bool) -> Result {
+        let proc = Process(); let pipe = Pipe()
+        if dryRun {
+            proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+            proc.arguments = [script, "--dry-run"]
+        } else {
+            let sh = "/bin/sh '" + script.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            let shell = sh.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            proc.arguments = ["-e", "do shell script \"\(shell)\" with administrator privileges with prompt \"\(Product.name) Super Kill Switch: turn off everything \(Product.name) is doing to your network.\""]
+        }
+        proc.standardOutput = pipe; proc.standardError = pipe
+        do { try proc.run() } catch { return Result(ok: false, output: error.localizedDescription) }
+        proc.waitUntilExit()
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        return Result(ok: proc.terminationStatus == 0, output: out)
     }
 }

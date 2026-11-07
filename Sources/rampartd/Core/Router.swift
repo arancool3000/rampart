@@ -30,7 +30,7 @@ final class Router {
         case .quarantine, .restore, .deleteQuarantined, .allow, .fixPosture, .setWebProtection, .updateSignatures,
              .setSettings, .setRealtime, .remediate, .addAllowRule, .removeAllowRule,
              .allowRemoteTool, .revokeRemoteTool, .setRemoteLockdown, .disableProtection, .requestUninstall, .uninstall,
-             .restoreQuarantinedTo, .exportQuarantined, .sandboxRun, .liftEmergencyLockdown: return true
+             .restoreQuarantinedTo, .exportQuarantined, .sandboxRun, .liftEmergencyLockdown, .killSwitch: return true
         default: return false
         }
     }
@@ -60,6 +60,7 @@ final class Router {
         case .emergencyStatus: return "emergencyStatus"; case .emergencyLockdown: return "emergencyLockdown"
         case .emergencyRescan: return "emergencyRescan"; case .liftEmergencyLockdown: return "liftEmergencyLockdown"
         case .emergencyAck: return "emergencyAck"; case .checkURLChain: return "checkURLChain"
+        case .emergencyNetwork: return "emergencyNetwork"; case .killSwitch: return "killSwitch"
         case .deceptionStatus: return "deceptionStatus"; case .deceptionSetDecoys: return "deceptionSetDecoys"
         case .deceptionSetMaze: return "deceptionSetMaze"; case .deceptionRemoveAll: return "deceptionRemoveAll"
         case .deceptionSetTarpit: return "deceptionSetTarpit"; case .deceptionSetTone: return "deceptionSetTone"
@@ -296,6 +297,7 @@ final class Router {
             case .uninstall(let token):
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
                 try g.redeem(token, peer: peer, purpose: .uninstall, minutes: 10)
+                Emergency.shutdown(p)   // the emergency anchor goes before anything else
                 try p.beginUninstall()
                 _ = send(.ok)
             case .checkURL(let url):
@@ -349,6 +351,10 @@ final class Router {
                 _ = send(.emergency(try Emergency.lift(p, token: token, force: force, peer: peer)))
             case .emergencyAck(let ids):
                 _ = send(.emergency(try Emergency.ack(p, ids)))
+            case .emergencyNetwork(let keep, let token):
+                _ = send(.emergency(try keep ? Emergency.keepBlocking(p) : Emergency.restoreNetwork(p, token: token, peer: peer)))
+            case .killSwitch(let token):
+                _ = send(.killSwitch(try KillSwitchExec.authorizedRun(p, token: token, peer: peer)))
             case .checkURLChain(let url):
                 guard let deep = p.services.deep else { throw ServiceError.unavailable("link-chain checks") }
                 guard url.utf8.count <= 8192 else { throw ServiceError.failed("URL too long") }

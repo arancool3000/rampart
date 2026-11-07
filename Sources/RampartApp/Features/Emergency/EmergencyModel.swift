@@ -16,21 +16,53 @@ final class EmergencyModel {
     var busy = false
     var wifiMessage: String?
     var copied = false
+    /// The service didn't answer the last poll. With a network lockdown last seen active, the screen shows the sudo command.
+    var unreachable = false
+    var killSwitchReport: String?
+    var fetchedAt = Date()
+    var now = Date()
     @ObservationIgnored private var poll: Timer?
+    @ObservationIgnored private var ticker: Timer?
     @ObservationIgnored private var observers = 0
+    @ObservationIgnored private var alwaysOn = false
 
     var active: Bool { status?.state.active ?? false }
     var escalated: Bool { status?.escalation != nil }
+    var networkBlocked: Bool { active && (status?.state.isNetworkBlocked ?? false) }
+    /// Live countdown for an automatic network block (nil = none / kept / manual).
+    var secondsLeft: Int? {
+        guard networkBlocked, let s = status?.networkSecondsLeft else { return nil }
+        return max(0, s - Int(now.timeIntervalSince(fetchedAt)))
+    }
+    var countdownText: String? { secondsLeft.map { String(format: "%d:%02d", $0 / 60, $0 % 60) } }
+    /// Dead-man safety: the network was blocked last time we heard from the service, and now it doesn't answer.
+    var showSudoEscape: Bool { unreachable && (networkBlocked || UserDefaults.standard.bool(forKey: Self.lastBlockedKey)) }
+    static let lastBlockedKey = "emergency.lastSeenNetworkBlocked"
+    var killSwitchVisible: Bool {
+        KillSwitch.buttonVisible(lockdownActive: active, networkBlocked: networkBlocked,
+                                 webProtectionOn: AppModel.shared.status.webProtectionOn, daemonReachable: !unreachable)
+    }
+
+    /// Called once the app is connected: lockdown status is watched for the whole app lifetime (not only while the
+    /// Emergency screen or banner is on screen), so a lockdown always notifies.
+    func startAlways() {
+        guard !alwaysOn else { return }
+        alwaysOn = true
+        start()
+    }
 
     func start() {
         observers += 1
         guard poll == nil else { return }
         Task { await refresh() }
         poll = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in Task { @MainActor in await EmergencyModel.shared.refresh() } }
+        ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            MainActor.assumeIsolated { let m = EmergencyModel.shared; if m.networkBlocked { m.now = Date() }; m.updateBadge() }
+        }
     }
     func stop() {
         observers = max(0, observers - 1)
-        if observers == 0 { poll?.invalidate(); poll = nil }
+        if observers == 0 && !alwaysOn { poll?.invalidate(); poll = nil; ticker?.invalidate(); ticker = nil }
     }
 
     private var client: DaemonClient { AppModel.shared.client }
@@ -38,16 +70,32 @@ final class EmergencyModel {
     private func apply(_ o: EmergencyBridge.Outcome) async {
         switch o {
         case .status(let s):
-            status = s; unsupported = false; error = nil
+            let old = status
+            status = s; unsupported = false; error = nil; unreachable = false; fetchedAt = Date(); now = fetchedAt
+            UserDefaults.standard.set(s.state.active && s.state.isNetworkBlocked, forKey: Self.lastBlockedKey)
+            if let n = EmergencyNotice.transition(from: old, to: s), old != nil || s.state.active { Notifier.shared.lockdown(n) }
+            updateBadge()
             let done = EmergencyAppActions.perform(s)
             if !done.isEmpty, case .status(let s2) = await EmergencyBridge.ack(client: client, ids: done) { status = s2 }
         case .unsupported: unsupported = true
-        case .error(let e): error = e
+        case .error(let e): error = e; unreachable = true
         }
     }
 
+    /// Red menu bar state with a minute countdown for an automatic network block.
+    func updateBadge() {
+        ChromeState.shared.setLockdownBadge(active ? (secondsLeft.map { "\(max(1, ($0 + 59) / 60))m" } ?? "") : nil)
+    }
+
+    /// Status pushed by the service the moment a lockdown starts, changes or ends (subscribeEvents stream).
+    func receivePush(_ d: Data) { Task { await apply(EmergencyBridge.decode(d)) } }
+
     func refresh() async {
-        guard AppModel.shared.mode == .live else { unsupported = AppModel.shared.mode != .demo; return }
+        guard AppModel.shared.mode == .live else {
+            unsupported = AppModel.shared.mode != .demo
+            if AppModel.shared.mode == .offline { unreachable = true }
+            return
+        }
         await apply(await EmergencyBridge.fetch(client: client))
     }
 
@@ -70,6 +118,41 @@ final class EmergencyModel {
         }
     }
 
+    /// "Restore internet now": admin password, then the network block goes. No readiness gate.
+    func restoreInternet() async {
+        busy = true; defer { busy = false }
+        switch await EmergencyBridge.adminToken(client: client) {
+        case .failure(let why): error = why.message
+        case .success(let token): await apply(await EmergencyBridge.restoreNetwork(client: client, token: token))
+        }
+    }
+
+    func keepBlocking() async {
+        busy = true; defer { busy = false }
+        await apply(await EmergencyBridge.keepBlocking(client: client))
+    }
+
+    /// Super Kill Switch. Touch ID (or the Mac password), then path A (service, 3 s) or path B (bundled script).
+    func killSwitch() async {
+        busy = true; defer { busy = false }
+        let noPriv = ProcessInfo.processInfo.environment["RAMPART_NO_PRIVILEGED_TOOLS"] == "1"
+        if !noPriv { guard await KillSwitchAuth.confirm() else { error = "Super Kill Switch cancelled."; return } }
+        // Wi-Fi auto-disconnect lives in the app.
+        var w = PublicWiFiHost.shared.guardian.settings; w.disconnectInsecureWiFi = false; PublicWiFiHost.shared.guardian.settings = w
+        if AppModel.shared.mode == .live, !noPriv, case .success(let token) = await EmergencyBridge.adminToken(client: client),
+           case .success(let r) = await EmergencyBridge.killSwitch(client: client, token: token) {
+            killSwitchReport = r.summary + "\n" + r.steps.map { "\($0.ok ? "✓" : "✗") \($0.title)" }.joined(separator: "\n")
+            await refresh(); return
+        }
+        guard let script = KillSwitchScript.locate() else {
+            killSwitchReport = "The service didn't answer and the kill switch script isn't available in this copy. In Terminal run: sudo rampart killswitch"
+            return
+        }
+        let r = KillSwitchScript.run(script: script, dryRun: noPriv)
+        killSwitchReport = (r.ok ? "" : "The administrator prompt was cancelled or the script failed. In Terminal run: sudo rampart killswitch\n") + r.output
+        await refresh()
+    }
+
     func turnWiFiOff() { wifiMessage = EmergencyAppActions.turnWiFiOff() ?? "Wi-Fi is off." }
 
     func copyReport() {
@@ -83,7 +166,7 @@ final class EmergencyModel {
 /// Calm, honest copy in one place.
 enum EmergencyCopy {
     static let intro = "If something dangerous is running, Emergency Lockdown isolates this Mac in seconds: it freezes the program, quarantines its files, cuts the network, locks your passwords and blocks remote access. Your own apps keep working."
-    static let auto = "Turns on by itself only for confirmed, critical threats (known malware, ransomware, password theft, data being sent out, or attempts to switch \(Product.name) off). Never for notes, test files or things you've allowed."
-    static let stays = "Lockdown stays on until the threat is gone: a fresh scan is clean, the file is quarantined, and nothing critical has happened for 2 minutes. It also stays on after a restart. You can always lift it with your administrator password."
+    static let auto = "Turns on by itself only for confirmed, critical threats, and cuts the internet by itself only for an active attack (ransomware, or data being sent out by malware, or two independent signals). Never for health issues like a missing permission, notes, test files or things you've allowed."
+    static let stays = "Lift it any time with your administrator password; the checklist below is advice, not a lock. An automatic network block ends by itself after 10 minutes and never comes back after a restart. If the app can't reach the service, run \(EmergencyStatus.sudoEscape) in Terminal."
     static let limits = "Without Apple's Endpoint Security entitlement \(Product.name) acts right after a program starts, not before. Network containment and process freezing need the installed system service; in other modes each step is recorded but not carried out."
 }

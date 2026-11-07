@@ -1,6 +1,7 @@
 import Foundation
 import RampartShared
 import Security
+import RampartGuard
 
 // rampartd — Rampart protection daemon.
 //   As root (LaunchDaemon): state in /Library/Application Support/Rampart, socket /var/run/rampart.sock.
@@ -124,6 +125,12 @@ for w in services.wiring { logInfo("wired \(w)") }
 let protection = Protection(runtime: runtime, services: services)
 // hx9: feed-lost / impostor detections from the event hub, and DoH pin failures, reach the detection store.
 DaemonWiring.hub?.onDetection = { protection.handle($0) }
+// A telemetry source that is down / not permitted (missing Full Disk Access) is a health note, logged once per problem.
+DaemonHooks.healthNotes = { DaemonWiring.hub?.healthNotes ?? [] }
+DaemonWiring.hub?.onHealthNote = { n in
+    guard n.count == 1 else { return }
+    protection.activity.add(.system, n.message, detail: n.detail, outcome: "needs attention", severity: .low, event: .other, actor: .system)
+}
 (services.web as? WebProtection)?.onDetection = { protection.handle($0) }
 // Emergency Lockdown: re-applies a persisted lockdown and starts its watch timer.
 Emergency.start(protection)
@@ -131,7 +138,10 @@ Emergency.start(protection)
 if let dec = DaemonWiring.deception {
     dec.notify = { m in protection.activity.add(.detection, m.title, detail: m.body, outcome: "decoy", severity: m.severity, event: .deceptionEvent, actor: .system) }
     dec.onLureDetection = { d in protection.handle(d) }
-    dec.onEmergency = { why in _ = try? Emergency.manual(protection, peer: .local, reason: "Cat & Mouse: " + why) }
+    // An automatic signal (not a manual lockdown): it goes through the corroboration policy and never cuts the network alone.
+    dec.onEmergency = { why in
+        Emergency.automatic(protection, reason: EmergencyTriggerReason(kind: .deception, summary: "Cat & Mouse: " + why, confidence: 90), detection: nil)
+    }
 }
 let router = Router(protection)
 let server = IPCServer(path: runtime.socketPath, router: router, userMode: runtime.userMode)
@@ -179,6 +189,8 @@ func shutdown(_ why: String) {
     logInfo("shutting down (\(why))")
     protection.activity.add(.system, "\(Product.name) protection stopped", detail: why, event: .serviceStopped, actor: .system)
     scheduler.stop()
+    // The emergency pf anchor never outlives the daemon (SIGTERM, bootout, uninstall), like DNS below.
+    Emergency.shutdown(protection)
     services.realtime?.stop()
     if let w = services.web, w.isOn { try? w.setOn(false) }
     (services.web as? WebProtection)?.restoreOnExit()

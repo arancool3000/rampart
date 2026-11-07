@@ -495,8 +495,11 @@ uninstall_rampart() {
   run pkill -f "$HELPER" 2>/dev/null || true
   run pkill -x Rampart 2>/dev/null || true
   restore_dns
-  # pf anchor (only ever loaded under com.apple/250.Rampart; never in pf.conf).
-  run pfctl -a com.apple/250.Rampart -F all 2>/dev/null || true
+  # pf anchors (never in pf.conf): blocklist 250, emergency 249, remote access 251, the lure, and anything else named Rampart.
+  for a in com.apple/249.RampartEmergency com.apple/250.Rampart com.apple/251.RampartRemote app.rampart/lure \
+           $( (pfctl -s Anchors 2>/dev/null; pfctl -a com.apple -s Anchors 2>/dev/null) | tr -d ' \t' | grep -i rampart | sort -u); do
+    run pfctl -a "$a" -F all 2>/dev/null || true
+  done
 
   echo "==> Removing files"
   # Fixed root-owned paths only; rm on a symlink removes the link, never its target.

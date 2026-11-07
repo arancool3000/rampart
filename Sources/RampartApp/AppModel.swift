@@ -483,6 +483,7 @@ final class AppModel {
             demoTimer?.invalidate()
             await refresh()
             subscribe()
+            EmergencyModel.shared.startAlways()
         } else {
             // No sample data: show the honest "service isn't running" state with a Retry button.
             if mode == .live || mode == .demo { clearDemo() }
@@ -662,6 +663,7 @@ final class AppModel {
         eventHandle?.cancel()
         eventHandle = client.stream(.subscribeEvents, onMessage: { resp in
             if case .event(let d) = resp { AppModel.shared.receive(detection: d) }
+            if case .emergency(let d) = resp { EmergencyModel.shared.receivePush(d) }
             return true
         }, onEnd: { _ in
             AppModel.shared.eventHandle = nil

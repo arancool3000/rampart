@@ -227,12 +227,50 @@ public struct ProtectionStatus: Codable, Sendable {
     public var definitionsUpdated: Date? = nil
     /// `IPC.version` of the daemon that answered; nil = a daemon older than v6.
     public var ipcVersion: Int? = nil
+    /// Health problems of the real-time feed (missing Full Disk Access, a source that stopped), one entry per
+    /// problem with a repeat count. These are status notes, never detections and never a lockdown trigger.
+    public var healthNotes: [HealthNote]? = nil
     public init(realtimeOn: Bool = false, sources: [String: Bool] = [:], webProtectionOn: Bool = false,
                 fullDiskAccess: Bool = false, lastScan: Date? = nil, signatureVersion: String = "0",
                 xprotectVersion: String? = nil, securityScore: Int? = nil, openDetections: Int = 0) {
         self.realtimeOn = realtimeOn; self.sources = sources; self.webProtectionOn = webProtectionOn
         self.fullDiskAccess = fullDiskAccess; self.lastScan = lastScan; self.signatureVersion = signatureVersion
         self.xprotectVersion = xprotectVersion; self.securityScore = securityScore; self.openDetections = openDetections
+    }
+}
+
+/// One deduplicated health problem ("Real-time monitoring needs Full Disk Access"), shown as a status note.
+public struct HealthNote: Codable, Hashable, Sendable, Identifiable {
+    public enum Fix: String, Codable, Sendable { case fullDiskAccess, restartService, none }
+    public var id: String            // stable key, e.g. "source:eslogger"
+    public var source: String
+    public var message: String
+    public var detail: String
+    public var fix: Fix
+    public var count: Int
+    public var firstSeen: Date
+    public var lastSeen: Date
+    public init(id: String, source: String, message: String, detail: String, fix: Fix, count: Int = 1, firstSeen: Date = Date(), lastSeen: Date = Date()) {
+        self.id = id; self.source = source; self.message = message; self.detail = detail; self.fix = fix
+        self.count = count; self.firstSeen = firstSeen; self.lastSeen = lastSeen
+    }
+
+    /// Permission (TCC / Full Disk Access) failures of a telemetry source: eslogger's ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED etc.
+    public static func isPermissionError(_ s: String?) -> Bool {
+        guard let l = s?.lowercased() else { return false }
+        return ["not permitted", "not_permitted", "full disk access", "tcc", "eperm", "operation not permitted", "not authorized", "err_not_privileged"].contains { l.contains($0) }
+    }
+
+    /// The note for a telemetry source that is down.
+    public static func sourceDown(_ name: String, lastError: String?, at date: Date = Date()) -> HealthNote {
+        if isPermissionError(lastError) {
+            return HealthNote(id: "source:\(name)", source: name, message: "Real-time monitoring needs Full Disk Access",
+                              detail: "macOS didn't allow \(Product.name)'s event feed (\(name)) to start. Turn on Full Disk Access for \(Product.name), then it starts by itself.",
+                              fix: .fullDiskAccess, firstSeen: date, lastSeen: date)
+        }
+        return HealthNote(id: "source:\(name)", source: name, message: "Real-time monitoring paused (\(name) stopped)",
+                          detail: (lastError.map { "\($0). " } ?? "") + "\(Product.name) keeps restarting it. This is a health issue, not an attack.",
+                          fix: .restartService, firstSeen: date, lastSeen: date)
     }
 }
 
@@ -296,6 +334,12 @@ public enum IPCRequest: Codable, Sendable {
     case emergencyRescan
     case liftEmergencyLockdown(token: String, force: Bool)
     case emergencyAck(actionIDs: [String])
+    // v8: lockdown safety. keep=true: "Keep blocking" (no token needed); keep=false: "Restore internet now" (admin token,
+    // or a root peer). Both answered with `.emergency(Data)`.
+    case emergencyNetwork(keep: Bool, token: String?)
+    // v8: Super Kill Switch; token from requestDisableProtection after Touch ID / password (root peer: none needed).
+    // Answered with `.killSwitch(Data)` (JSON of RampartGuard.KillSwitch.Report).
+    case killSwitch(token: String?)
     // v6: deep URL chain check (redirect chain + page signals), served off the IPC thread
     case checkURLChain(url: String)   // -> .urlVerdict(Data) with JSON of RampartWeb.ChainReport
     // v7: Cat & Mouse (RampartGuard Deception*); answered with `.deception(Data)` (JSON of DeceptionStatus)
@@ -346,6 +390,7 @@ public enum IPCResponse: Codable, Sendable {
     case sandboxReport(Data)  // JSON of rampartd SandboxReport (mirrored in the app's QuarantineManager.swift)
     // v6
     case emergency(Data)      // JSON of RampartGuard.EmergencyStatus
+    case killSwitch(Data)     // JSON of RampartGuard.KillSwitch.Report
     // v7
     case deception(Data)          // JSON of RampartGuard.DeceptionStatus
     case deceptionEvidence(Data)  // JSON of RampartGuard.DeceptionEvidence

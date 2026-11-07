@@ -69,6 +69,7 @@ cp Packaging/app.rampart.userdaemon.plist    "$APP/Contents/Library/LaunchAgents
 [ -d Extensions ] && [ -n "$(ls -A Extensions 2>/dev/null)" ] && cp -RL Extensions "$APP/Contents/Resources/Extensions"
 cp Packaging/app.rampart.daemon.plist Packaging/app.rampart.agent.plist "$APP/Contents/Resources/"
 install -m 755 Packaging/rampart-setup.sh "$APP/Contents/Resources/rampart-setup.sh"
+install -m 755 Packaging/killswitch.sh "$APP/Contents/Resources/killswitch.sh"   # Super Kill Switch (path B), sealed by the bundle signature
 [ -d Rules ] && [ -n "$(ls -A Rules 2>/dev/null)" ] && cp -RL Rules "$APP/Contents/Resources/Rules"
 for b in "$BIN"/*.bundle; do [ -e "$b" ] && cp -R "$b" "$APP/Contents/Resources/"; done
 plutil -lint "$APP/Contents/Info.plist" >/dev/null

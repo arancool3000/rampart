@@ -42,6 +42,8 @@ commands:
   health                              daemon mode, uptime, CPU, memory, event sources, recent errors
   remote [report|allow <id> [min]|revoke <id>|lockdown on|off]   remote-access lockdown
   tamper                              tamper-protection status
+  emergency [status|off]              lockdown status; `sudo rampart emergency off` lifts it and restores the internet
+  killswitch                          Super Kill Switch (sudo): turns off everything RamPart does to the network
   check-url <url>                     URL verdict (lookalikes, blocklists, punycode, ...)
   scam <text|url> [--kind K]          scam check of a message, email or URL
   web-lookup <host>                   is this host on the daemon's blocklists?
@@ -296,6 +298,9 @@ case "eicar":
         }
         exit(0)
     } catch { fail("could not write \(path): \(error.localizedDescription)") }
+case "emergency", "killswitch":
+    // Escape hatches that must work even when the app is gone or the service is hung: handled before connecting.
+    EmergencyCLI.run(command, args, json: json, socketPath: socketPath, user: useUser)
 default: break
 }
 

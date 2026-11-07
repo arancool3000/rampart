@@ -67,3 +67,11 @@ During development nothing may cause any dialog on the user's screen. Banned whi
 - LocalAuthentication evaluatePolicy, the general NSPasteboard (reading or writing), NSWorkspace open, Apple Events, Accessibility, Location, Bluetooth or Local Network prompts.
 - Launching dist/Rampart.app or any .app bundle.
 Code must make these impossible by default: `rampartd` must honour `RAMPART_NO_PRIVILEGED_TOOLS=1` by refusing to spawn any of the tools above.
+
+The ONE exception: the **Super Kill Switch** (user-triggered only). After Touch ID (LocalAuthentication, password fallback) the app asks the service (IPC `killSwitch`, 3 s ceiling); if the service doesn't answer, it runs the bundled, signed `Contents/Resources/killswitch.sh` (from `Packaging/killswitch.sh`) through the macOS administrator prompt. With `RAMPART_NO_PRIVILEGED_TOOLS=1` there is no prompt: the script runs in dry-run mode and prints its commands. `sudo rampart killswitch` and `sudo rampart emergency off` are the Terminal escape hatches.
+
+### Emergency Lockdown safety (user incident 2026-11-07)
+- Telemetry source failures (eslogger not permitted / missing Full Disk Access / never started / crashed) are `HealthNote`s in `ProtectionStatus.healthNotes`, deduplicated with a count. Never detections, never tampering, never a lockdown trigger (`EmergencyTriggerPolicy.isHealthIssue`).
+- Automatic triggers go through `EmergencyNetworkPolicy`: a single signal may alert / freeze / quarantine; tamper and deception signals alone do nothing; the network is cut only for a ransomware burst, exfiltration plus a malicious detection, or two independent strong signals within 10 minutes. Automatic network blocks expire after 10 minutes unless the user chooses Keep blocking, are never re-applied after a restart, and are unloaded on SIGTERM / bootout / uninstall. Only a manual lockdown persists.
+- An authenticated admin (or a root peer) can always lift lockdown or restore the internet: readiness is advice, never a gate.
+

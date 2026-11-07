@@ -17,6 +17,11 @@ final class ChromeState {
     private(set) var menuBarInserted: Bool
     private(set) var hasThreat = false
     private(set) var isScanning = false
+    /// Lockdown in the menu bar: nil = off; "" = on (internet on or kept blocked); "9m" = automatic block countdown.
+    /// Read only by MenuBarLabel; changes at most once a minute.
+    private(set) var lockdownBadge: String?
+
+    func setLockdownBadge(_ b: String?) { if b != lockdownBadge { lockdownBadge = b } }
 
     private init() {
         menuBarInserted = Headless.active ? false : (UserDefaults.standard.object(forKey: Self.menuBarKey) as? Bool ?? true)
@@ -48,10 +53,23 @@ struct MenuBarLabel: View {
     let chrome = ChromeState.shared
     var body: some View {
         Group {
-            if chrome.hasThreat { Image(systemName: "exclamationmark.shield") } else { Image(nsImage: BrandImages.menuBarTemplate) }
+            if let b = chrome.lockdownBadge {
+                // Red, not a template image: the lockdown must be visible at a glance.
+                HStack(spacing: 2) {
+                    Image(nsImage: Self.redLock)
+                    if !b.isEmpty { Text(b) }
+                }
+            } else if chrome.hasThreat { Image(systemName: "exclamationmark.shield") } else { Image(nsImage: BrandImages.menuBarTemplate) }
         }
-            .accessibilityLabel(chrome.hasThreat ? "\(Product.name): item needs attention" : "\(Product.name): protected")
+            .accessibilityLabel(chrome.lockdownBadge != nil ? "\(Product.name): emergency lockdown on" : chrome.hasThreat ? "\(Product.name): item needs attention" : "\(Product.name): protected")
     }
+
+    static let redLock: NSImage = {
+        let cfg = NSImage.SymbolConfiguration(paletteColors: [.systemRed])
+        let img = NSImage(systemSymbolName: "lock.shield.fill", accessibilityDescription: "Lockdown")?.withSymbolConfiguration(cfg) ?? NSImage()
+        img.isTemplate = false
+        return img
+    }()
 }
 
 /// PasteGuard's status, published by PasteGuardHost (which lives with the AI/behaviour modules) and read by

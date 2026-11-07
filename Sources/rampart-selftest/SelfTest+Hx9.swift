@@ -1,5 +1,6 @@
 import Foundation
 import RampartShared
+import RampartGuard
 import RampartTelemetry
 import RampartSigning
 
@@ -56,25 +57,31 @@ extension SelfTest {
         hx9ImpostorDetection()
     }
 
-    // Losing the real-time feed (e.g. FDA revoked) must raise a high-severity Detection, exactly once.
+    // Losing the real-time feed (e.g. FDA missing / revoked) is a HEALTH NOTE, deduplicated with a count: never a
+    // Detection, never tampering, never an emergency trigger (user incident 2026-11-07).
     private static func hx9FeedLostWhenSourceGoesBlind() {
         let hub = EventHub()
         let src = StubSource(name: "eslogger-stub")
         hub.add(src)
-        let detLock = NSLock(); var dets: [Detection] = []
+        let detLock = NSLock(); var dets: [Detection] = []; var notes: [HealthNote] = []
         hub.onDetection = { d in detLock.lock(); dets.append(d); detLock.unlock() }
+        hub.onHealthNote = { n in detLock.lock(); notes.append(n); detLock.unlock() }
         hub.start { _ in }
         hub.checkHealthNow()
-        check(detLock.withLock { dets.isEmpty }, "no feed-lost Detection while the source is healthy")
+        check(detLock.withLock { dets.isEmpty && notes.isEmpty }, "no health note while the source is healthy")
         src.goBlind()
         hub.checkHealthNow()
-        func lostCount() -> Int { detLock.withLock { dets.filter { $0.name.contains("lost its real-time event feed") }.count } }
-        let lost = detLock.withLock { dets.filter { $0.name.contains("lost its real-time event feed") } }
-        check(lost.count == 1 && lost.first?.severity == .high && lost.first?.confidence == 85,
-              "a blinded primary source raises exactly one high-severity feed-lost Detection")
+        check(detLock.withLock { dets.isEmpty }, "a blinded source (eslogger not permitted) raises no Detection")
+        check(hub.healthNotes.count == 1 && hub.healthNotes.first?.fix == .fullDiskAccess
+              && hub.healthNotes.first?.message == "Real-time monitoring needs Full Disk Access",
+              "a not-permitted source becomes one 'needs Full Disk Access' health note")
         hub.checkHealthNow()   // still down
-        check(lostCount() == 1, "the feed-lost Detection is not repeated on every tick while the source stays down")
+        check(detLock.withLock { notes.count } == 1 && hub.healthNotes.first?.count == 1, "the note is not repeated on every tick while the source stays down")
         hub.stop()
+        // The legacy feed-lost shape and an eslogger not-permitted error never trigger an emergency.
+        let legacy = EventHub.feedLostDetectionForTest(name: "eslogger", lastError: "ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED")
+        check(EmergencyTriggerPolicy.isHealthIssue(legacy) && EmergencyTriggerPolicy.evaluate(legacy) == nil,
+              "feed-lost (eslogger not permitted) is a health issue, never an emergency trigger")
     }
 
     private static func hx9ImpostorDetection() {

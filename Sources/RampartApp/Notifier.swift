@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import UserNotifications
 import RampartShared
+import RampartGuard
 
 /// UNUserNotificationCenter wrapper. Threats always notify (they can be downgraded to banners in System Settings).
 /// Everything else is rate-limited to one non-critical notification per hour and honours per-category toggles.
@@ -9,7 +10,7 @@ import RampartShared
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifier()
 
-    enum Category: String { case threat = "app.rampart.threat", scan = "app.rampart.scan", network = "app.rampart.network", update = "app.rampart.update", weekly = "app.rampart.weekly", wifi = "app.rampart.wifi" }
+    enum Category: String { case threat = "app.rampart.threat", scan = "app.rampart.scan", network = "app.rampart.network", update = "app.rampart.update", weekly = "app.rampart.weekly", wifi = "app.rampart.wifi", lockdown = "app.rampart.lockdown" }
 
     private let defaults = UserDefaults.standard
     private var lastNonCritical: Date? {
@@ -30,7 +31,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let threat = UNNotificationCategory(identifier: Category.threat.rawValue, actions: [review, allow], intentIdentifiers: [])
         let stay = UNNotificationAction(identifier: "stayConnected", title: "Stay connected", options: [])
         let wifi = UNNotificationCategory(identifier: Category.wifi.rawValue, actions: [stay], intentIdentifiers: [])
-        center.setNotificationCategories([threat, wifi])
+        let restore = UNNotificationAction(identifier: "restoreInternet", title: EmergencyNotice.restoreAction, options: [.foreground])
+        let details = UNNotificationAction(identifier: "lockdownDetails", title: EmergencyNotice.detailsAction, options: [.foreground])
+        let lockdown = UNNotificationCategory(identifier: Category.lockdown.rawValue, actions: [restore, details], intentIdentifiers: [])
+        center.setNotificationCategories([threat, wifi, lockdown])
         center.getNotificationSettings { s in
             let ok = s.authorizationStatus == .authorized || s.authorizationStatus == .provisional
             DispatchQueue.main.async { MainActor.assumeIsolated { Notifier.shared.authorized = ok } }
@@ -109,6 +113,19 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         [.banner, .list]
     }
 
+    /// Lockdown on / internet blocked / internet restored: always time-sensitive, never rate-limited.
+    /// The notification is the ONLY user-visible signal when no window is open (user incident 2026-11-07).
+    func lockdown(_ n: EmergencyNotice) {
+        lastLockdownNotice = n
+        post(.lockdown, title: n.title, body: n.body, critical: true)
+        // Notifications off: bring the app forward on the Emergency screen instead (never in headless/dev runs).
+        if authorized == false, EmergencyAppActions.sessionActionsAllowed, n.kind == .engaged || n.kind == .networkBlocked {
+            AppModel.shared.selection = .emergency
+            NSApp.activate(ignoringOtherApps: true)
+        }
+    }
+    private(set) var lastLockdownNotice: EmergencyNotice?
+
     /// "Disconnecting from insecure Wi-Fi…" with a "Stay connected" action (PublicWiFiGuard grace period).
     func wifiDisconnectScheduled(networkName: String, reason: String) {
         // hx8: the network name is chosen by whoever runs the access point. Clean it and keep it short so it
@@ -138,6 +155,16 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                                                          pending: PublicWiFiHost.shared.pendingDisconnect != nil) else { return }
                 n.wifiActionToken = nil
                 PublicWiFiHost.shared.stayConnected()
+            }
+            return
+        }
+        if ["restoreInternet", "lockdownDetails"].contains(response.actionIdentifier)
+            || response.notification.request.content.categoryIdentifier == Category.lockdown.rawValue {
+            let restore = response.actionIdentifier == "restoreInternet"
+            await MainActor.run {
+                NSApp.activate(ignoringOtherApps: true)
+                AppModel.shared.selection = .emergency
+                if restore { Task { await EmergencyModel.shared.killSwitch() } }
             }
             return
         }

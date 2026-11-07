@@ -32,13 +32,13 @@ enum Emergency {
 
     // MARK: lifecycle
 
-    /// Daemon start: a persisted lockdown is re-applied (it survives reboots) and the watch timer starts.
+    /// Daemon start: a persisted MANUAL lockdown is re-applied (it survives reboots). An automatic one comes back
+    /// without its network block, and any leftover emergency anchor is removed. Then the watch timer starts.
     static func start(_ p: Protection) {
         let c = ctl(p)
-        if c.isActive {
-            c.log("Daemon restarted: lockdown re-applied")
-            q.async { reapply(p, c) }
-        }
+        let reapplyNet = c.prepareForRestart()
+        if c.isActive { q.async { reapply(p, c, network: reapplyNet) } }
+        if !reapplyNet { q.async { unloadNetwork(p, c, why: "start: no network block wanted") } }
         let t = DispatchSource.makeTimerSource(queue: q)
         t.schedule(deadline: .now() + 15, repeating: 15, leeway: .seconds(2))
         t.setEventHandler { watch(p, c) }
@@ -48,15 +48,39 @@ enum Emergency {
 
     /// Called for every stored detection. Auto-triggers only per EmergencyTriggerPolicy.
     static func consider(_ d: Detection, protection p: Protection) {
+        // Health problems (a telemetry source down / not permitted / missing Full Disk Access) are never a trigger.
+        if EmergencyTriggerPolicy.isHealthIssue(d) { return }
         let c = ctl(p)
-        if c.isActive { _ = c.noteDetection(d); return }
         let allow: (Detection) -> Bool = { d in
             if let h = d.sha256, p.runtime.config.allowlist.contains(h) { return true }
             if let path = d.path, p.runtime.config.exclusions.contains(where: { path == $0 || path.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }) { return true }
             return false
         }
-        guard let reason = EmergencyTriggerPolicy.evaluate(d, isAllowlisted: allow) else { return }
-        q.async { engage(p, reason: reason, detection: d) }
+        let reason = EmergencyTriggerPolicy.evaluate(d, isAllowlisted: allow)
+        if c.isActive {
+            _ = c.noteDetection(d)
+            guard let reason else { return }
+            let a = c.assess(reason)
+            if a.containNetwork, !c.state.isNetworkBlocked {
+                q.async { if c.upgradeToNetwork(why: a.why) { applyNetwork(c, enforce: enforcing(p) && !c.state.dryRun); notify(p, c, .networkBlocked) } }
+            }
+            return
+        }
+        guard let reason else { return }
+        automatic(p, reason: reason, detection: d)
+    }
+
+    /// Every automatic trigger goes through the safety policy: corroboration, no network on a single signal.
+    static func automatic(_ p: Protection, reason: EmergencyTriggerReason, detection: Detection?) {
+        let c = ctl(p)
+        let a = c.assess(reason)
+        guard a.engage else {
+            c.log("Signal recorded, no lockdown: \(reason.summary). \(a.why)")
+            p.activity.add(.system, "Suspicious signal noted (no lockdown)", detail: reason.summary, outcome: "watching", severity: .medium,
+                           detectionID: reason.detectionID, event: .detection, actor: .system, reason: a.why)
+            return
+        }
+        q.async { engage(p, reason: reason, detection: detection, containNetwork: a.containNetwork, why: a.why) }
     }
 
     // MARK: IPC entry points (Router)
@@ -64,7 +88,7 @@ enum Emergency {
     static func status(_ p: Protection) throws -> Data { try JSONEncoder.rampart.encode(ctl(p).status(mode: mode(p))) }
 
     static func manual(_ p: Protection, peer: Peer, reason note: String) throws -> Data {
-        q.sync { engage(p, reason: .manual(uid: peer.uid, note: note), detection: nil) }
+        q.sync { engage(p, reason: .manual(uid: peer.uid, note: note), detection: nil, containNetwork: true, why: "You turned on Emergency Lockdown.") }
         return try status(p)
     }
 
@@ -89,34 +113,93 @@ enum Emergency {
     }
 
     /// Lift: token from requestDisableProtection, redeemed for a settings session (admin auth); undo actions.
-    static func lift(_ p: Protection, token: String, force: Bool, peer: Peer) throws -> Data {
+    /// The owner is authorized by a root peer (`sudo rampart emergency off`) or by redeeming an admin token.
+    /// User incident 2026-11-07: lifting failed behind the readiness gate; an authorized lift now always succeeds.
+    static func authorize(_ p: Protection, token: String?, peer: Peer) throws {
+        if peer.uid == 0 { return }
         guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
+        guard let token, !token.isEmpty else { throw ServiceError.denied(EmergencyError.notAuthorized.description) }
+        do { try g.redeem(token, peer: peer, purpose: .settings, minutes: 5) }
+        catch { throw ServiceError.denied(EmergencyError.notAuthorized.description + " (\(error.localizedDescription))") }
+    }
+
+    static func lift(_ p: Protection, token: String, force: Bool, peer: Peer) throws -> Data {
         let c = ctl(p)
-        guard c.isActive else { throw ServiceError.failed(EmergencyError.notActive.description) }
-        if let r = c.readiness(), !r.ready, !force {
-            throw ServiceError.failed(EmergencyError.notReady(r.items.filter { !$0.met }.map(\.title)).description)
+        guard c.isActive else {
+            // Nothing recorded, but a stale anchor may still block: always clean up for the owner.
+            try authorize(p, token: token, peer: peer)
+            unloadNetwork(p, c, why: "lift while not active"); return try status(p)
         }
-        var authorized = false
-        do { try g.redeem(token, peer: peer, purpose: .settings, minutes: 5); authorized = true } catch { throw ServiceError.denied(EmergencyError.notAuthorized.description + " (\(error.localizedDescription))") }
+        try authorize(p, token: token, peer: peer)
+        let ready = c.readiness()?.ready ?? true
         let undo: [EmergencyAction]
-        do { undo = try c.lift(authorized: authorized, force: force) } catch let e as EmergencyError { throw ServiceError.failed(e.description) }
-        let enforce = enforcing(p) && !c.state.dryRun
+        do { undo = try c.lift(authorized: true, force: true) } catch let e as EmergencyError { throw ServiceError.failed(e.description) }
+        undoActions(p, c, undo)
+        let who = peer.uid == 0 ? "root (command line)" : "an administrator"
+        p.activity.add(.system, "Emergency lockdown lifted", detail: "Lifted by \(who)" + (ready ? "; all checks passed" : "; lifted before every check passed"),
+                       outcome: "lifted", severity: .medium, event: .lockdownLifted, actor: .user)
+        notify(p, c, .lifted)
+        return try status(p)
+    }
+
+    /// Undo: always unloads the network anchor (whatever the action's recorded state), resumes frozen processes,
+    /// re-enables paused startup items. Every step is independent.
+    static func undoActions(_ p: Protection, _ c: EmergencyController, _ undo: [EmergencyAction]) {
+        let enforce = enforcing(p)
+        unloadNetwork(p, c, why: "lift")
         for a in undo {
             switch a.kind {
             case .suspendProcesses:
                 if enforce { for pid in a.pids where ProcessKiller.info(pid) != nil { _ = Darwin.kill(pid, SIGCONT) } }
-            case .networkContainment:
-                let cmds = firewall.unloadCommands(token: c.state.pfToken)
-                if enforce { _ = run(cmds) }
             case .pauseLaunchItems:
                 if enforce { _ = run(a.undoCommands) }
             default: break
             }
             c.log("Undone: \(a.title)\(enforce ? "" : " (dry run)")")
         }
-        p.activity.add(.system, "Emergency lockdown lifted", detail: force ? "lifted before every check passed" : "all checks passed", outcome: "lifted", severity: .medium,
-                       event: .lockdownLifted, actor: .user)
+    }
+
+    /// "Restore internet now": the admin password (or root) ends the network block. No readiness gate.
+    static func restoreNetwork(_ p: Protection, token: String?, peer: Peer) throws -> Data {
+        let c = ctl(p)
+        try authorize(p, token: token, peer: peer)
+        if c.isActive { try? c.restoreNetwork(authorized: true, by: peer.uid == 0 ? "root (command line)" : "an administrator") }
+        unloadNetwork(p, c, why: "restore internet")
+        p.activity.add(.system, "Internet restored", detail: "The emergency network block was removed by \(peer.uid == 0 ? "root" : "an administrator").",
+                       outcome: "restored", severity: .medium, event: .lockdownLifted, actor: .user)
+        notify(p, c, .networkRestored)
         return try status(p)
+    }
+
+    /// "Keep blocking": the automatic network block no longer expires.
+    static func keepBlocking(_ p: Protection) throws -> Data {
+        ctl(p).keepBlocking()
+        return try status(p)
+    }
+
+    /// Removes the emergency anchor (idempotent; only the enforcing root daemon runs pfctl).
+    static func unloadNetwork(_ p: Protection, _ c: EmergencyController, why: String) {
+        guard enforcing(p) else { return }
+        _ = run(firewall.unloadCommands(token: c.state.pfToken))
+        c.update { $0.pfToken = nil }
+        logInfo("emergency: network anchor unloaded (\(why))")
+    }
+
+    /// SIGTERM / bootout / uninstall: the emergency anchor never outlives the daemon (like DNS on SIGTERM). A manual
+    /// lockdown is re-applied by the next start; an automatic one is not.
+    static func shutdown(_ p: Protection) {
+        let c = ctl(p)
+        lock.lock(); timer?.cancel(); timer = nil; lock.unlock()
+        let cmds = EmergencyRecovery.onShutdown(c, firewall: firewall)
+        if enforcing(p) { _ = run(cmds) }
+        logInfo("emergency: network anchor unloaded (daemon stopping)")
+    }
+
+    /// `sudo rampart emergency off` when the daemon can't be reached: works on the state file directly. Root only.
+    static func offline(stateRoot: URL, dryRun: Bool) -> [String] {
+        EmergencyRecovery.offline(statePath: stateRoot.appendingPathComponent("emergency.json").path, firewall: firewall, dryRun: dryRun,
+                                  run: { let s = runCapture($0).0; return s == 0 || $0.acceptableExitCodes.contains(s) },
+                                  signal: { Darwin.kill($0, SIGCONT) == 0 })
     }
 
     /// The app reports what it did in the user session (vault locked, clipboard cleared, banner shown).
@@ -132,18 +215,47 @@ enum Emergency {
 
     // MARK: engage / execute
 
-    private static func engage(_ p: Protection, reason: EmergencyTriggerReason, detection: Detection?) {
+    private static func engage(_ p: Protection, reason: EmergencyTriggerReason, detection: Detection?, containNetwork: Bool, why: String) {
         let c = ctl(p)
         let enforce = enforcing(p)
         let ctx = context(p, reason: reason, detection: detection)
-        let actions = EmergencyPlanner.plan(reason, context: ctx, firewall: firewall)
-        guard c.engage(reason, actions: actions, dryRun: !enforce) else { return }
-        logWarn("EMERGENCY LOCKDOWN: \(reason.summary)\(enforce ? "" : " (dry run)")")
-        p.activity.add(.system, "Emergency lockdown", detail: reason.summary, outcome: enforce ? "locked down" : "locked down (dry run)", severity: .critical, detectionID: reason.detectionID,
-                       event: .lockdownStarted, actor: reason.detectionID != nil ? .system : nil, reason: reason.summary,
-                       action: (enforce ? "" : "Practice run, nothing was changed: ") + actions.map(\.title).prefix(8).joined(separator: "; "))
+        let actions = EmergencyPlanner.plan(reason, context: ctx, firewall: firewall, containNetwork: containNetwork)
+        guard c.engage(reason, actions: actions, dryRun: !enforce, networkWhy: why) else { return }
+        logWarn("EMERGENCY LOCKDOWN: \(reason.summary)\(containNetwork ? "" : " (internet left on)")\(enforce ? "" : " (dry run)")")
+        let what = [reason.pid.map { "process \($0)" }, reason.path.map { "file \($0)" }, reason.detectionName.map { "detection \($0)" }].compactMap { $0 }.joined(separator: ", ")
+        p.activity.add(.system, "Emergency lockdown", detail: reason.summary + (what.isEmpty ? "" : " (\(what))"),
+                       outcome: enforce ? (containNetwork ? "locked down, internet blocked" : "locked down, internet on") : "locked down (dry run)",
+                       severity: .critical, detectionID: reason.detectionID,
+                       event: .lockdownStarted, actor: reason.kind == .manual ? .user : .system, reason: why,
+                       action: (enforce ? "" : "Practice run, nothing was changed: ") + actions.filter { $0.state == .planned }.map(\.title).prefix(8).joined(separator: "; "))
         execute(p, c, actions, enforce: enforce, detection: detection)
+        notify(p, c, .engaged)
     }
+
+    // MARK: user-facing notification (user incident 2026-11-07: lockdown engaged silently)
+
+    enum NoticeKind: String { case engaged, networkBlocked, networkRestored, expired, lifted }
+
+    /// Root cause of the silent lockdown: the alert was an app-side action that ran only when the app happened to
+    /// poll (Emergency screen or banner on screen); the root daemon has no GUI session to post from. Now the daemon
+    /// pushes the status to every subscribed app at once, and launches the app (or its agent) in the console user's
+    /// session so it can post the time-sensitive notification even when no window is open.
+    static func notify(_ p: Protection, _ c: EmergencyController, _ kind: NoticeKind) {
+        let st = c.status(mode: mode(p))
+        if let d = try? JSONEncoder.rampart.encode(st) { p.broadcastEmergency(d) }
+        logInfo("emergency notice: \(kind.rawValue) — \(EmergencyNotice.text(st, kind: kind.rawValue).title)")
+        lastNotice = (kind.rawValue, Date())
+        if p.subscriberCount == 0 { launchAppForNotice() }
+    }
+    nonisolated(unsafe) static var lastNotice: (kind: String, date: Date)?
+
+    private static func launchAppForNotice() {
+        guard getuid() == 0, !Privileged.noPrivilegedTools else { return }
+        let uid = consoleUID()
+        guard uid != 0 else { return }
+        _ = run([GuardCommand("/bin/launchctl", ["kickstart", "gui/\(uid)/app.rampart.agent"], acceptableExitCodes: [3, 113], note: "start the app to show the lockdown notice")])
+    }
+
 
     private static func context(_ p: Protection, reason: EmergencyTriggerReason, detection: Detection?) -> EmergencyContext {
         var tree: [(pid: Int32, path: String)] = []
@@ -225,9 +337,9 @@ enum Emergency {
         c.updateAction(.networkContainment, state: ok ? .done : .failed, result: ok ? "pf emergency anchor loaded" : "pfctl failed")
     }
 
-    private static func reapply(_ p: Protection, _ c: EmergencyController) {
+    private static func reapply(_ p: Protection, _ c: EmergencyController, network: Bool) {
         let enforce = enforcing(p) && !c.state.dryRun
-        applyNetwork(c, enforce: enforce)
+        if network { applyNetwork(c, enforce: enforce) }
         p.services.guardian?.setLockdown(true)
         if enforce, let a = c.state.actions.first(where: { $0.kind == .suspendProcesses }) {
             for pid in a.pids where ProcessKiller.info(pid) != nil && !ProcessKiller.isPlatformBinary(pid) { _ = Darwin.kill(pid, SIGSTOP) }
@@ -238,6 +350,13 @@ enum Emergency {
     private static func watch(_ p: Protection, _ c: EmergencyController) {
         let st = c.state
         guard st.active else { return }
+        // Automatic network containment ends by itself after 10 minutes unless the user chose "Keep blocking".
+        if c.expireNetworkIfDue() {
+            unloadNetwork(p, c, why: "automatic block expired")
+            p.activity.add(.system, "Internet restored", detail: "The automatic network block ended after 10 minutes.", outcome: "restored",
+                           severity: .medium, event: .lockdownLifted, actor: .system)
+            notify(p, c, .expired)
+        }
         // Process won't stop: a suspended pid is running again, or the quarantined payload runs under a new pid.
         if let a = st.actions.first(where: { $0.kind == .suspendProcesses }), a.state == .done {
             for pid in a.pids where isRunningNotStopped(pid) { c.noteSignal(.processWontStop); break }

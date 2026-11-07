@@ -27,6 +27,7 @@ extension SelfTest {
             ("hx7", SelfTest.hx7Checks),
             ("hx9", SelfTest.hx9Checks),
             ("emergency", SelfTest.emergencyChecks),
+            ("emergencysafety", SelfTest.emergencySafetyChecks),
             ("hx6", SelfTest.hx6Checks),
             ("hx1", SelfTest.hx1Checks),
             ("hx5", SelfTest.hx5Checks),

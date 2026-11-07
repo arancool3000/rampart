@@ -96,6 +96,12 @@ public final class EventHub {
     /// ("lost its event feed") or a process is impersonating a RamPart helper. The daemon routes these to
     /// the detection store / UI so protection state can flip to "not protected".
     public var onDetection: ((Detection) -> Void)?
+    /// A telemetry source is down (not permitted / missing Full Disk Access / stopped / crashed). Called with the
+    /// deduplicated note (count 1 the first time, then the running count). Never a Detection, never tampering.
+    public var onHealthNote: ((HealthNote) -> Void)?
+    private var notes: [String: HealthNote] = [:]
+    /// One entry per problem with a repeat count (user incident 2026-11-07: dozens of identical "feed lost" detections).
+    public var healthNotes: [HealthNote] { lock.withLock { Array(notes.values) }.sorted { $0.id < $1.id } }
     private let lock = NSLock()
     private let selfPid = getpid()
     private var healthTimer: DispatchSourceTimer?
@@ -140,6 +146,10 @@ public final class EventHub {
             } catch {
                 lock.withLock { running[s.name] = false; errors[s.name] = String(describing: error) }
                 log.error("source \(s.name, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+                // Never started (e.g. eslogger not permitted without Full Disk Access): a status note, not a detection.
+                let hr = s as? SourceHealthReporting
+                let n = noteDown(s.name, lastError: hr?.lastError ?? String(describing: error))
+                onHealthNote?(n)
             }
         }
         startHealthMonitor()
@@ -185,9 +195,10 @@ public final class EventHub {
             if !healthy && !wasDown {
                 lock.withLock { _ = downSources.insert(s.name); self.running[s.name] = false; errors[s.name] = hr?.lastError ?? "stopped" }
                 log.error("telemetry source \(s.name, privacy: .public) is down — real-time protection is blind")
-                onDetection?(Self.feedLostDetection(name: s.name, lastError: hr?.lastError))
+                let n = noteDown(s.name, lastError: hr?.lastError)
+                onHealthNote?(n)
             } else if healthy && wasDown {
-                lock.withLock { downSources.remove(s.name); self.running[s.name] = true; errors[s.name] = nil }
+                lock.withLock { downSources.remove(s.name); self.running[s.name] = true; errors[s.name] = nil; notes[s.name] = nil }
                 log.notice("telemetry source \(s.name, privacy: .public) recovered")
             }
             // Keep retrying a down-but-available source instead of staying blind forever.
@@ -200,6 +211,23 @@ public final class EventHub {
         }
     }
 
+    /// Records (or counts) the health note for a down source. Flapping (restart, down again) increments the count.
+    private func noteDown(_ name: String, lastError: String?) -> HealthNote {
+        lock.withLock {
+            let now = Date()
+            if var n = notes[name] {
+                n.count += 1; n.lastSeen = now
+                if HealthNote.isPermissionError(lastError) && n.fix != .fullDiskAccess { let f = HealthNote.sourceDown(name, lastError: lastError, at: n.firstSeen); n.message = f.message; n.detail = f.detail; n.fix = f.fix }
+                notes[name] = n; return n
+            }
+            let n = HealthNote.sourceDown(name, lastError: lastError, at: now)
+            notes[name] = n; return n
+        }
+    }
+
+    /// Legacy shape of the feed-lost signal, kept for callers that still build it. It is a health issue
+    /// (EmergencyTriggerPolicy.isHealthIssue) and is never raised by the hub any more.
+    public static func feedLostDetectionForTest(name: String, lastError: String?) -> Detection { feedLostDetection(name: name, lastError: lastError) }
     static func feedLostDetection(name: String, lastError: String?) -> Detection {
         Detection(name: "\(Product.name) lost its real-time event feed",
                   category: .suspicious, severity: .high, confidence: 85,

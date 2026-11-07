@@ -311,6 +311,8 @@ extension Protection {
 enum DaemonHooks {
     /// Forwarded clipboard events go into the EventHub (its ClipboardMemory), not straight to the engine.
     static var ingestClipboard: ((SecurityEvent) -> Void)?
+    /// Deduplicated telemetry health notes (EventHub.healthNotes), shown as a status note in the app.
+    nonisolated(unsafe) static var healthNotes: (() -> [HealthNote])?
 }
 
 extension Protection {

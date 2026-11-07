@@ -13,7 +13,7 @@ import RampartShared
 
 public struct EmergencyTriggerReason: Codable, Hashable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case manual, confirmedMalware, ransomware, credentialTheft, tampering, exfiltration
+        case manual, confirmedMalware, ransomware, credentialTheft, tampering, exfiltration, deception
     }
     public var kind: Kind
     public var summary: String
@@ -46,8 +46,22 @@ public enum EmergencyTriggerPolicy {
         return hay.contains("eicar") || hay.contains("com.rampart.test") || hay.contains("rampart-test")
     }
 
+    /// Telemetry / service health problems (a source that is down, not permitted, never started or crashed, missing Full
+    /// Disk Access). These are status notes, never tampering and never a lockdown trigger.
+    public static func isHealthIssue(_ d: Detection) -> Bool {
+        let hay = ([d.name] + d.evidence.flatMap { [$0.title, $0.detail] }).joined(separator: " ").lowercased()
+        if hay.contains("lost its real-time event feed") || hay.contains("telemetry source") || hay.contains("real-time protection is blind") { return true }
+        if hay.contains("eslogger") && (HealthNote.isPermissionError(hay) || hay.contains("is down") || hay.contains("stopped") || hay.contains("crash")) { return true }
+        if hay.contains("es_new_client_result") || hay.contains("full disk access") { return true }
+        return false
+    }
+
+    /// Tamper kinds that are real evidence of an external actor (kill signal from another process, our binary or plist
+    /// modified, launchctl bootout / launch item removed by someone else). Anything else is not counted as tampering.
+    public static let evidentTamperKinds: Set<String> = ["killAttempt", "unloadAttempt", "binaryTamper", "plistTamper", "launchItemRemoved", "fileTamper"]
+
     public static func evaluate(_ d: Detection, isAllowlisted: (Detection) -> Bool = { _ in false }) -> EmergencyTriggerReason? {
-        guard d.severity >= .high, !isTestArtifact(d), !isAllowlisted(d) else { return nil }
+        guard d.severity >= .high, !isTestArtifact(d), !isAllowlisted(d), !isHealthIssue(d) else { return nil }
         let text = ([d.name] + d.evidence.map { $0.title + " " + $0.detail }).joined(separator: " ").lowercased()
         let behaviour = d.evidence.contains { $0.source == .behaviour && $0.score >= 60 }
         func reason(_ k: EmergencyTriggerReason.Kind, _ s: String) -> EmergencyTriggerReason {
@@ -56,7 +70,10 @@ public enum EmergencyTriggerPolicy {
         }
         // Tampering with RamPart itself (high severity from the tamper detector).
         if d.name.hasPrefix("Tampering with \(Product.name)") && d.confidence >= 80 {
-            return reason(.tampering, "Something tried to switch off or alter \(Product.name)")
+            let kind = String(d.name.dropFirst("Tampering with \(Product.name): ".count))
+            guard evidentTamperKinds.contains(kind) else { return nil }
+            let who = d.evidence.first.map { $0.detail } ?? ""
+            return reason(.tampering, "Another program tried to switch off or alter \(Product.name) (\(kind)\(who.isEmpty ? "" : ": " + who.prefix(160)))")
         }
         if d.category == .ransomware, d.confidence >= behaviourConfidence, behaviour || text.contains("canary") {
             return reason(.ransomware, "Ransomware-like activity (canary files touched or mass file changes)")
@@ -209,7 +226,24 @@ public struct EmergencyContext: Sendable {
 public enum EmergencyPlanner {
     public static let tmutil = "/usr/bin/tmutil", launchctl = "/bin/launchctl", kill = "/bin/kill"
 
-    public static func plan(_ reason: EmergencyTriggerReason, context c: EmergencyContext, firewall: EmergencyFirewall = EmergencyFirewall()) -> [EmergencyAction] {
+    /// `containNetwork` false (an automatic trigger without high-confidence active-attack evidence): only the
+    /// non-disruptive steps run (alert, freeze, quarantine, snapshot, vault lock); network, clipboard, remote-access
+    /// and startup-item steps are planned as skipped.
+    public static func plan(_ reason: EmergencyTriggerReason, context c: EmergencyContext, firewall: EmergencyFirewall = EmergencyFirewall(),
+                            containNetwork: Bool = true) -> [EmergencyAction] {
+        var out = planAll(reason, context: c, firewall: firewall)
+        guard !containNetwork else { return out }
+        let disruptive: Set<EmergencyAction.Kind> = [.networkContainment, .clearClipboard, .remoteLockdown, .pauseLaunchItems]
+        for i in out.indices where disruptive.contains(out[i].kind) {
+            out[i].state = .skipped
+            out[i].result = out[i].kind == .networkContainment
+                ? "Internet left on: one automatic signal is not enough to cut the network."
+                : "Not needed for an automatic response without a confirmed active attack."
+        }
+        return out
+    }
+
+    private static func planAll(_ reason: EmergencyTriggerReason, context c: EmergencyContext, firewall: EmergencyFirewall) -> [EmergencyAction] {
         var out: [EmergencyAction] = []
         out.append(EmergencyAction(kind: .alert, runner: .app, title: "Alert you right away",
                                    detail: "Critical notification and an in-app banner: \(reason.summary).", undoable: false, undoNote: "Nothing to undo."))
@@ -309,7 +343,75 @@ public struct EmergencyState: Codable, Hashable, Sendable {
     public var appActionsDone: [String] = []
     public var log: [EmergencyLogEntry] = []
     public var liftedAt: Date?
+    // Safety fields (optional so older emergency.json files still decode).
+    /// true = started by an automatic trigger (never persists a network block across restarts).
+    public var automatic: Bool?
+    /// The pf emergency anchor is (meant to be) loaded right now.
+    public var networkBlocked: Bool?
+    /// Automatic network containment ends by itself at this time unless the user chose "Keep blocking".
+    public var networkExpiresAt: Date?
+    public var keepBlocking: Bool?
+    /// Why the network was or wasn't cut, in plain words.
+    public var networkWhy: String?
     public init() {}
+    public var isAutomatic: Bool { automatic ?? (reason.map { $0.kind != .manual } ?? false) }
+    public var isNetworkBlocked: Bool { networkBlocked ?? (active && actions.contains { $0.kind == .networkContainment && ($0.state == .done || $0.state == .dryRun || $0.state == .planned || $0.state == .failed) }) }
+}
+
+/// One strong automatic signal, kept for corroboration.
+public struct EmergencySignal: Codable, Hashable, Sendable {
+    public var kind: EmergencyTriggerReason.Kind
+    public var key: String
+    public var date: Date
+    public init(kind: EmergencyTriggerReason.Kind, key: String, date: Date) { self.kind = kind; self.key = key; self.date = date }
+}
+
+/// What an automatic trigger may do.
+public struct EmergencyAssessment: Hashable, Sendable {
+    public var engage: Bool
+    public var containNetwork: Bool
+    public var why: String
+}
+
+/// Auto-lockdown safety rules (user incident 2026-11-07: a missing Full Disk Access grant was read as tampering and cut
+/// the network with no way back). Automatic triggers may alert, freeze and quarantine. The network is cut only on
+/// high-confidence active-attack evidence: a ransomware burst, exfiltration plus a malicious detection, or at least two
+/// independent strong signals (different kinds) within `window`. A single tamper or deception signal never locks down.
+public enum EmergencyNetworkPolicy {
+    public static let window: TimeInterval = 600
+    /// After an administrator lifts a lockdown, automatic triggers can't cut the network again for this long
+    /// (ransomware excepted) and tamper / deception signals alone are ignored.
+    public static let liftCooldown: TimeInterval = 1800
+    /// Automatic network containment expires on its own after this long unless the user confirms "Keep blocking".
+    public static let autoNetworkLifetime: TimeInterval = 600
+
+    public static func assess(_ r: EmergencyTriggerReason, recent: [EmergencySignal], now: Date, liftedAt: Date? = nil) -> EmergencyAssessment {
+        if r.kind == .manual { return EmergencyAssessment(engage: true, containNetwork: true, why: "You turned on Emergency Lockdown.") }
+        let live = recent.filter { now.timeIntervalSince($0.date) <= window && $0.date <= now.addingTimeInterval(5) }
+        let kinds = Set(live.map(\.kind) + [r.kind])
+        let independent = kinds.count >= 2
+        let cooling = liftedAt.map { now.timeIntervalSince($0) < liftCooldown && now >= $0 } ?? false
+        switch r.kind {
+        case .ransomware:
+            return EmergencyAssessment(engage: true, containNetwork: true, why: "Ransomware-like burst of file changes: the network is cut to stop it spreading or phoning home.")
+        case .tampering, .deception:
+            if cooling || !independent {
+                return EmergencyAssessment(engage: false, containNetwork: false, why: "A single \(r.kind == .tampering ? "tamper" : "decoy") signal is only reported; it needs a second, independent signal.")
+            }
+            return EmergencyAssessment(engage: true, containNetwork: true, why: "Two independent signals: \(kinds.map(\.rawValue).sorted().joined(separator: " + ")).")
+        case .exfiltration:
+            let malicious = live.contains { [.confirmedMalware, .credentialTheft, .ransomware].contains($0.kind) }
+            let net = !cooling && (malicious || independent)
+            return EmergencyAssessment(engage: true, containNetwork: net,
+                                       why: net ? "Data is being sent out and a malicious program was found: the network is cut." : "Data may be leaving this Mac; the program is frozen, the internet stays on.")
+        case .confirmedMalware, .credentialTheft:
+            let net = !cooling && independent
+            return EmergencyAssessment(engage: true, containNetwork: net,
+                                       why: net ? "Two independent signals: \(kinds.map(\.rawValue).sorted().joined(separator: " + ")). The network is cut." : "The program is frozen and its files quarantined. The internet stays on: one signal isn't enough to cut it.")
+        case .manual:
+            return EmergencyAssessment(engage: true, containNetwork: true, why: "")
+        }
+    }
 }
 
 public struct EmergencyReadiness: Codable, Hashable, Sendable {
@@ -327,6 +429,10 @@ public struct EmergencyStatus: Codable, Hashable, Sendable {
     public var mode: String            // "enforcing" or "dry run"
     public var honestNote: String
     public var report: String
+    /// Seconds left on an automatic network block (nil = none, or it doesn't expire).
+    public var networkSecondsLeft: Int? = nil
+    /// Works from Terminal even when the app or the service is broken.
+    public static let sudoEscape = "sudo rampart emergency off"
     public init(state: EmergencyState, readiness: EmergencyReadiness?, escalation: EmergencyEscalation?, mode: String, honestNote: String, report: String) {
         self.state = state; self.readiness = readiness; self.escalation = escalation; self.mode = mode; self.honestNote = honestNote; self.report = report
     }
@@ -351,6 +457,7 @@ public final class EmergencyController: @unchecked Sendable {
     public let clock: GuardClock
     private let lock = NSLock()
     private var s: EmergencyState
+    private var signals: [EmergencySignal] = []
 
     public init(path: String, clock: GuardClock = .live) {
         self.path = path; self.clock = clock
@@ -372,9 +479,21 @@ public final class EmergencyController: @unchecked Sendable {
 
     public func log(_ t: String) { lock.lock(); logLocked(t); save(); lock.unlock() }
 
+    /// Records an automatic trigger and decides what it may do (see EmergencyNetworkPolicy).
+    public func assess(_ r: EmergencyTriggerReason) -> EmergencyAssessment {
+        lock.lock(); defer { lock.unlock() }
+        let now = clock.now()
+        let a = EmergencyNetworkPolicy.assess(r, recent: signals, now: now, liftedAt: s.liftedAt)
+        if r.kind != .manual {
+            signals.append(EmergencySignal(kind: r.kind, key: r.detectionName ?? r.summary, date: now))
+            signals = signals.filter { now.timeIntervalSince($0.date) <= EmergencyNetworkPolicy.window }.suffix(64)
+        }
+        return a
+    }
+
     /// Starts lockdown (no-op returning false if already active; the new reason is logged).
     @discardableResult
-    public func engage(_ reason: EmergencyTriggerReason, actions: [EmergencyAction], dryRun: Bool) -> Bool {
+    public func engage(_ reason: EmergencyTriggerReason, actions: [EmergencyAction], dryRun: Bool, networkWhy: String? = nil) -> Bool {
         lock.lock(); defer { save(); lock.unlock() }
         if s.active { logLocked("Another trigger while locked down: \(reason.summary)"); s.lastCriticalAt = clock.now(); return false }
         let keep = s.log.suffix(50)
@@ -383,8 +502,80 @@ public final class EmergencyController: @unchecked Sendable {
         s.active = true; s.startedAt = clock.now(); s.reason = reason; s.actions = actions; s.dryRun = dryRun
         s.lastCriticalAt = reason.kind == .manual ? nil : clock.now()
         s.triggerResolved = reason.kind == .manual
-        logLocked("EMERGENCY LOCKDOWN ON\(dryRun ? " (dry run)" : ""): \(reason.summary)")
+        s.automatic = reason.kind != .manual
+        let net = actions.contains { $0.kind == .networkContainment && $0.state == .planned }
+        s.networkBlocked = net
+        s.keepBlocking = reason.kind == .manual
+        s.networkExpiresAt = net && reason.kind != .manual ? clock.now().addingTimeInterval(EmergencyNetworkPolicy.autoNetworkLifetime) : nil
+        s.networkWhy = networkWhy
+        logLocked("EMERGENCY LOCKDOWN ON\(dryRun ? " (dry run)" : ""): \(reason.summary)\(net ? "" : " (internet left on)")")
         return true
+    }
+
+    /// An active automatic lockdown without a network block gets one (a second, independent signal arrived).
+    @discardableResult
+    public func upgradeToNetwork(why: String) -> Bool {
+        lock.lock(); defer { save(); lock.unlock() }
+        guard s.active, !s.isNetworkBlocked, let i = s.actions.firstIndex(where: { $0.kind == .networkContainment }) else { return false }
+        s.actions[i].state = .planned; s.actions[i].result = ""
+        s.networkBlocked = true; s.networkWhy = why
+        s.networkExpiresAt = s.isAutomatic ? clock.now().addingTimeInterval(EmergencyNetworkPolicy.autoNetworkLifetime) : nil
+        logLocked("Network cut: \(why)")
+        return true
+    }
+
+    /// Seconds until an automatic network block ends by itself (nil = no block, or it was kept / manual).
+    public func networkSecondsLeft() -> Int? {
+        let st = state
+        guard st.active, st.isNetworkBlocked, st.keepBlocking != true, let e = st.networkExpiresAt else { return nil }
+        return max(0, Int(e.timeIntervalSince(clock.now()).rounded(.up)))
+    }
+
+    /// True once an automatic network block has expired: the block is marked off and the daemon must unload the anchor.
+    public func expireNetworkIfDue() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard s.active, s.isNetworkBlocked, s.keepBlocking != true, let e = s.networkExpiresAt, clock.now() >= e else { return false }
+        markNetworkOffLocked("Internet restored automatically after \(Int(EmergencyNetworkPolicy.autoNetworkLifetime / 60)) minutes (you didn't choose Keep blocking)")
+        save()
+        return true
+    }
+
+    /// "Keep blocking": the user confirms the automatic network block; it no longer expires.
+    public func keepBlocking() {
+        lock.lock(); defer { save(); lock.unlock() }
+        guard s.active, s.isNetworkBlocked else { return }
+        s.keepBlocking = true; s.networkExpiresAt = nil
+        logLocked("You chose to keep the network blocked")
+    }
+
+    /// "Restore internet now": ends the network block only (lockdown stays on for the other steps). No readiness gate.
+    public func restoreNetwork(authorized: Bool, by who: String = "an administrator") throws {
+        guard authorized else { throw EmergencyError.notAuthorized }
+        lock.lock(); defer { save(); lock.unlock() }
+        guard s.active else { throw EmergencyError.notActive }
+        markNetworkOffLocked("Internet restored by \(who)")
+    }
+
+    private func markNetworkOffLocked(_ note: String) {
+        s.networkBlocked = false; s.networkExpiresAt = nil; s.keepBlocking = false
+        if let i = s.actions.firstIndex(where: { $0.kind == .networkContainment }), s.actions[i].state != .skipped {
+            s.actions[i].state = .undone; s.actions[i].result = note
+        }
+        logLocked(note)
+    }
+
+    /// Daemon start or reboot with a persisted lockdown. An automatic lockdown comes back WITHOUT its network block
+    /// (it is never re-applied); only a manual lockdown keeps blocking. Returns true when the network block must be re-applied.
+    public func prepareForRestart() -> Bool {
+        lock.lock(); defer { save(); lock.unlock() }
+        guard s.active else { return false }
+        if s.isAutomatic {
+            if s.isNetworkBlocked { markNetworkOffLocked("Daemon restarted: automatic network block not re-applied") }
+            else { logLocked("Daemon restarted: lockdown kept, internet stays on") }
+            return false
+        }
+        logLocked("Daemon restarted: manual lockdown re-applied")
+        return s.isNetworkBlocked
     }
 
     public func updateAction(_ kind: EmergencyAction.Kind, state st: EmergencyAction.State, result: String, change: ((inout EmergencyAction) -> Void)? = nil) {
@@ -400,7 +591,7 @@ public final class EmergencyController: @unchecked Sendable {
     @discardableResult
     public func noteDetection(_ d: Detection) -> [EmergencyEscalation.Signal] {
         lock.lock(); defer { save(); lock.unlock() }
-        guard s.active else { return [] }
+        guard s.active, !EmergencyTriggerPolicy.isHealthIssue(d) else { return [] }
         var new: [EmergencyEscalation.Signal] = []
         if d.severity >= .high && !EmergencyTriggerPolicy.isTestArtifact(d) { s.lastCriticalAt = clock.now(); s.rescanClean = false }
         if let h = d.sha256, s.quarantinedHashes.contains(h) { new.append(.payloadReappeared) }
@@ -443,24 +634,25 @@ public final class EmergencyController: @unchecked Sendable {
         return EmergencyEscalation(signals: st.signals)
     }
 
-    /// Lifting always needs the admin-authenticated token flow (`authorized` is the redeem outcome). When the issue
-    /// isn't fixed yet, `force` must also be set (the user is never locked out, but it's a deliberate choice).
-    /// Returns the actions to undo (the daemon runs their undo commands).
+    /// Lifting needs the admin-authenticated token flow (or a root peer); `authorized` is that outcome. An authorized
+    /// lift ALWAYS succeeds: the readiness checklist is advice, never a gate for the owner (`force` is kept for the log).
+    /// Returns the actions to undo; the network block is always among them (the daemon always unloads the anchor).
     public func lift(authorized: Bool, force: Bool = false) throws -> [EmergencyAction] {
         guard authorized else { throw EmergencyError.notAuthorized }
         guard let r = readiness() else { throw EmergencyError.notActive }
-        if !r.ready && !force { throw EmergencyError.notReady(r.items.filter { !$0.met }.map(\.title)) }
         lock.lock(); defer { save(); lock.unlock() }
-        let undo = s.actions.filter { $0.undoable && ($0.state == .done || $0.state == .dryRun) && $0.runner == .daemon }
-        s.active = false; s.liftedAt = clock.now()
+        let undo = s.actions.filter { $0.runner == .daemon && ($0.kind == .networkContainment || ($0.undoable && ($0.state == .done || $0.state == .dryRun || $0.state == .failed))) }
+        s.active = false; s.liftedAt = clock.now(); s.networkBlocked = false; s.networkExpiresAt = nil
         for i in s.actions.indices where s.actions[i].undoable && s.actions[i].state == .done { s.actions[i].state = .undone }
         logLocked("Lockdown lifted by an administrator\(r.ready ? "" : " before every check passed")")
         return undo
     }
 
     public func status(mode: String) -> EmergencyStatus {
-        EmergencyStatus(state: state, readiness: readiness(), escalation: escalation(), mode: mode,
-                        honestNote: EmergencyStatus.encryptionNote, report: EmergencyReport.text(state, clock.now()))
+        var st = EmergencyStatus(state: state, readiness: readiness(), escalation: escalation(), mode: mode,
+                                 honestNote: EmergencyStatus.encryptionNote, report: EmergencyReport.text(state, clock.now()))
+        st.networkSecondsLeft = networkSecondsLeft()
+        return st
     }
 }
 
@@ -479,7 +671,10 @@ public enum EmergencyReport {
             if let p = r.path { o += "File: \(p)\n" }
             if let h = r.sha256 { o += "SHA-256: \(h)\n" }
             if let pid = r.pid { o += "Process ID: \(pid)\n" }
+            o += "Started by: \(r.kind == .manual ? "you" : "an automatic trigger")\n"
         }
+        o += "Internet: \(s.isNetworkBlocked ? "blocked" : "on")\(s.networkWhy.map { " (\($0))" } ?? "")\n"
+        o += "If the app can't lift it: \(EmergencyStatus.sudoEscape)\n"
         if !s.signals.isEmpty { o += "Escalation: " + s.signals.map { EmergencyEscalation.describe($0) }.joined(separator: " ") + "\n" }
         o += "\nActions:\n"
         for a in s.actions { o += "- \(a.title): \(a.state.rawValue)\(a.result.isEmpty ? "" : " (\(a.result))")\n" }

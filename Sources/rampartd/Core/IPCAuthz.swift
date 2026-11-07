@@ -206,6 +206,13 @@ enum IPCAuthz {
         case .emergencyLockdown:
             // Locking down is the safe direction, but it suspends processes and cuts the network: RamPart's own clients only.
             return .adminClient
+        case .emergencyNetwork(let keep, _):
+            // Keep blocking is the safe direction; restoring the internet is checked again by the admin token in Emergency.
+            return keep ? .sessionUser : .adminClient
+        case .killSwitch:
+            // RamPart's own app or CLI, plus the admin token (Touch ID / password) checked in KillSwitchExec. Not
+            // .adminClientWeakening: the token itself is the user-presence proof, the app holds no settings session.
+            return .adminClient
         case .liftEmergencyLockdown:
             return .adminClientWeakening
         case .listDetections, .listQuarantine, .posture, .persistence, .activity, .connections, .wifi, .networkStats,

@@ -33,7 +33,7 @@ extension SelfTest {
         check(EmergencyTriggerPolicy.evaluate(det("Unsigned code read browser credentials", cat: .infostealer, conf: 92, src: .behaviour, score: 92))?.kind == .credentialTheft, "emergency fires on credential theft")
         check(EmergencyTriggerPolicy.evaluate(det("Data exfiltration to paste site", cat: .suspicious, sev: .high, conf: 93, src: .behaviour, score: 93))?.kind == .exfiltration, "emergency fires on exfiltration")
         check(EmergencyTriggerPolicy.evaluate(det("Mass mailing burst", cat: .suspicious, sev: .high, conf: 91, src: .behaviour, score: 91))?.kind == .exfiltration, "emergency fires on mass mailing")
-        check(EmergencyTriggerPolicy.evaluate(det("Tampering with \(Product.name): bootout", cat: .suspicious, sev: .high, conf: 90, src: .behaviour, score: 90))?.kind == .tampering, "emergency fires on tamper attempt")
+        check(EmergencyTriggerPolicy.evaluate(det("Tampering with \(Product.name): unloadAttempt", cat: .suspicious, sev: .high, conf: 90, src: .behaviour, score: 90))?.kind == .tampering, "emergency fires on tamper attempt")
         check(EmergencyTriggerPolicy.evaluate(det("Self-defence: x", cat: .suspicious, sev: .high, conf: 85, src: .behaviour, score: 85)) == nil, "emergency not on self-defence note")
 
         // MARK: action plan
@@ -108,8 +108,11 @@ extension SelfTest {
         check((try? c2.lift(authorized: redeem(nil))) == nil, "emergency lift without token refused")
         check((try? c2.lift(authorized: redeem("forged.501.9999999999.deadbeef"))) == nil, "emergency lift with forged token refused")
         if case .success(let tok) = flow.issueToken(peerUID: 501, isAdmin: true, authorizationOK: true) {
-            do { _ = try c2.lift(authorized: redeem(tok)); check(false, "emergency lift refused while not ready") }
-            catch { check((error as? EmergencyError).map { if case .notReady = $0 { return true }; return false } ?? false, "emergency lift refused while not ready") }
+            // User incident 2026-11-07: an authenticated admin lift always succeeds (readiness is advice, never a gate).
+            let c2b = EmergencyController(path: tmp.appendingPathComponent("e2b.json").path, clock: gc)
+            c2b.engage(reason, actions: plan, dryRun: true)
+            let ok = c2b.readiness()?.ready == false && (try? c2b.lift(authorized: redeem(tok))) != nil
+            check(ok && !c2b.isActive, "emergency admin lift always succeeds, even before every check passed")
             check(!redeem(tok), "emergency token is single-use")
         } else { check(false, "emergency token issue") }
         c2.noteRescan(clean: true, triggerGone: true)
