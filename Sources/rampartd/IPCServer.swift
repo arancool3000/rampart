@@ -9,7 +9,16 @@ final class IPCServer {
     let router: Router
     let userMode: Bool
     private var listenFD: Int32 = -1
-    private let connSem = DispatchSemaphore(value: 64)
+    // Connection accounting (red-team fix: 80 idle sockets used to lock every client out for 5 minutes).
+    // A connection is "idle" until its first complete frame arrives; idle ones are evicted oldest-first
+    // when a uid hits its cap or the global cap is reached, and get only `firstFrameTimeout` to speak.
+    static let maxConnections = 64
+    static let maxPerUID = 24
+    static let firstFrameTimeout = 5
+    private struct Conn { let fd: Int32; let uid: uid_t; let opened: Date; var spoke: Bool }
+    private let connLock = NSLock()
+    private var conns: [Int: Conn] = [:]
+    private var nextConnID = 0
     private let connQ = DispatchQueue(label: "app.rampart.ipc.conn", attributes: .concurrent)
 
     init(path: String, router: Router, userMode: Bool) { self.path = path; self.router = router; self.userMode = userMode }
@@ -85,13 +94,33 @@ final class IPCServer {
             _ = fcntl(cfd, F_SETFD, FD_CLOEXEC)
             var one: Int32 = 1
             setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            if connSem.wait(timeout: .now()) == .timedOut { close(cfd); continue }
+            var uid: uid_t = 0, gid: gid_t = 0
+            guard getpeereid(cfd, &uid, &gid) == 0, let cid = admit(cfd, uid: uid) else { close(cfd); continue }
             connQ.async { [self] in
-                defer { connSem.signal() }
-                serve(cfd)
+                defer { release(cid) }
+                serve(cfd, cid: cid)
             }
         }
     }
+
+    /// Registers a new connection, evicting the oldest idle one of the same uid (or overall) when full.
+    /// Returns nil if there is no room and nothing idle to evict.
+    private func admit(_ fd: Int32, uid: uid_t) -> Int? {
+        connLock.lock(); defer { connLock.unlock() }
+        func evictOldestIdle(_ filter: (Conn) -> Bool) -> Bool {
+            guard let (k, c) = conns.filter({ !$0.value.spoke && filter($0.value) }).min(by: { $0.value.opened < $1.value.opened }) else { return false }
+            shutdown(c.fd, SHUT_RDWR)          // its serve() sees EOF and releases the slot
+            conns[k] = nil
+            return true
+        }
+        if conns.values.filter({ $0.uid == uid }).count >= Self.maxPerUID, !evictOldestIdle({ $0.uid == uid }) { return nil }
+        if conns.count >= Self.maxConnections, !evictOldestIdle({ _ in true }) { return nil }
+        nextConnID += 1
+        conns[nextConnID] = Conn(fd: fd, uid: uid, opened: Date(), spoke: false)
+        return nextConnID
+    }
+    private func markSpoke(_ cid: Int) { connLock.lock(); conns[cid]?.spoke = true; connLock.unlock() }
+    private func release(_ cid: Int) { connLock.lock(); conns[cid] = nil; connLock.unlock() }
 
     private func peer(of fd: Int32) -> Peer? {
         var uid: uid_t = 0, gid: gid_t = 0
@@ -101,7 +130,7 @@ final class IPCServer {
         return Peer(uid: uid, gid: gid, pid: pid)
     }
 
-    private func serve(_ fd: Int32) {
+    private func serve(_ fd: Int32, cid: Int) {
         var subscription: UUID?
         defer {
             if let s = subscription { router.p.unsubscribe(s) }
@@ -113,9 +142,11 @@ final class IPCServer {
             _ = IPC.writeFrame(fd: fd, (try? IPC.encode(IPCResponse.error("not permitted"))) ?? Data())
             return
         }
-        // Idle timeout for request reads (subscriptions clear it).
-        var tv = timeval(tv_sec: 300, tv_usec: 0)
+        // A new connection must send its first request quickly; afterwards the idle timeout is 300 s
+        // (subscriptions clear it).
+        var tv = timeval(tv_sec: Self.firstFrameTimeout, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var first = true
         let writeLock = NSLock()
         var alive = true
         let send: (IPCResponse) -> Bool = { r in
@@ -124,7 +155,12 @@ final class IPCServer {
             if !IPC.writeFrame(fd: fd, data) { alive = false }
             return alive
         }
-        while let frame = IPC.readFrame(fd: fd) {
+        while let frame = IPC.readFrame(fd: fd, maxLength: IPC.maxRequestLength) {
+            if first {
+                first = false; markSpoke(cid)
+                tv = timeval(tv_sec: 300, tv_usec: 0)
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+            }
             let req: IPCRequest
             do { req = try JSONDecoder.rampart.decode(IPCRequest.self, from: frame) }
             catch { _ = send(.error("malformed request")); return }

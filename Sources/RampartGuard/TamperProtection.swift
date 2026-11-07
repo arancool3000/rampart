@@ -28,9 +28,49 @@ public final class TamperDetector: @unchecked Sendable {
     private var recent: [String: Date] = [:]
     public var dedupeWindow: TimeInterval = 5
 
+    // Update awareness: app-bundle changes and launch-plist edits by tools are held for `updateGrace` seconds and
+    // reported only if the bundle / plist is not RamPart's afterwards. Pending items are flushed on every inspect()
+    // and by flushPending() (the daemon should call it from a timer every few seconds).
+    public var updateGrace: TimeInterval = 30
+    /// Is the bundle at this path a valid RamPart build? Default: RamPartIdentity.isValidBundle (static code check).
+    public var bundleValidator: @Sendable (String) -> Bool
+    /// Is the launch plist at this path RamPart's own job? Default: RamPartIdentity.isOurPlist.
+    public var plistValidator: @Sendable (String) -> Bool
+    /// Is the RamPart service still running? The detector lives in the service, so true by default.
+    public var serviceAlive: @Sendable () -> Bool = { true }
+    private struct Pending { var detection: Detection; let path: String; let isPlist: Bool; var due: Date }
+    private var pending: [String: Pending] = [:]
+
     public init(paths: GuardPaths = .standard, ownPIDs: @escaping @Sendable () -> Set<Int32> = { [getpid()] },
                 trustedTeamIDs: Set<String> = []) {
         self.paths = paths; self.ownPIDs = ownPIDs; self.trustedTeamIDs = trustedTeamIDs
+        let p = paths
+        bundleValidator = { RamPartIdentity.isValidBundle($0, trustedTeamIDs: trustedTeamIDs) }
+        plistValidator = { RamPartIdentity.isOurPlist($0, paths: p) }
+    }
+
+    /// Number of held (not yet decided) bundle/plist changes.
+    public var pendingCount: Int { lock.lock(); defer { lock.unlock() }; return pending.count }
+
+    private func hold(_ d: Detection, key: String, path: String, isPlist: Bool, at date: Date) {
+        lock.lock(); defer { lock.unlock() }
+        let due = max(date, Date()).addingTimeInterval(updateGrace)
+        if var p = pending[key] { p.due = max(p.due, due); pending[key] = p }   // keep the first detection, extend the window
+        else if pending.count < 256 { pending[key] = Pending(detection: d, path: path, isPlist: isPlist, due: due) }
+    }
+
+    /// Decides held changes whose grace period is over (all of them with `force`). Returns the ones that are tampering.
+    public func flushPending(now: Date = Date(), force: Bool = false) -> [Detection] {
+        lock.lock()
+        let ready = pending.filter { force || $0.value.due <= now }
+        for k in ready.keys { pending[k] = nil }
+        lock.unlock()
+        return ready.values.sorted { $0.detection.date < $1.detection.date }.compactMap { p in
+            if p.isPlist {
+                return FileManager.default.fileExists(atPath: p.path) && plistValidator(p.path) ? nil : p.detection
+            }
+            return bundleValidator(paths.appBundle) && serviceAlive() ? nil : p.detection
+        }
     }
 
     public static let launchctlUnloadVerbs: Set<String> = ["bootout", "unload", "disable", "remove", "kill", "stop"]
@@ -69,8 +109,8 @@ public final class TamperDetector: @unchecked Sendable {
     }
 
     public func inspect(_ ev: SecurityEvent) -> [Detection] {
-        if isSelf(ev.process) { return [] }
-        var out: [Detection] = []
+        var out: [Detection] = flushPending()
+        if isSelf(ev.process) { return out }
         switch ev.kind {
         case .exec:
             out += inspectExec(ev)
@@ -78,11 +118,17 @@ public final class TamperDetector: @unchecked Sendable {
             for p in [ev.path, ev.destPath].compactMap({ $0 }) where paths.isProtected(p) {
                 if ev.kind == .fileClose, ev.detail["modified"] == "0" { continue }
                 let isPlist = paths.isPlist(p)
+                // A plist rewritten with RamPart's own job definition (e.g. by our installer) is not tampering.
+                if isPlist, ev.kind != .fileDelete, ev.kind != .xattrDelete, p != ev.path || ev.kind != .fileRename,
+                   FileManager.default.fileExists(atPath: p), plistValidator(p) { continue }
                 let kind: TamperKind = isPlist ? .plistTamper : (paths.isCritical(p) ? .configTamper : .fileTamper)
                 let sev: Severity = isPlist || paths.isCritical(p) ? .critical : .high
                 guard dedupe("\(kind.rawValue):\(p):\(ev.process?.pid ?? 0)", at: ev.date) else { continue }
-                out.append(detection(kind, severity: sev, score: sev == .critical ? 92 : 80, title: "\(ev.kind.rawValue) on a protected \(Product.name) file",
-                                     detail: p, ev: ev, path: p))
+                let d = detection(kind, severity: sev, score: sev == .critical ? 92 : 80, title: "\(ev.kind.rawValue) on a protected \(Product.name) file",
+                                  detail: p, ev: ev, path: p)
+                // App-bundle changes may be an update in progress: decide once the bundle has settled.
+                if !isPlist, !paths.isCritical(p), paths.isInAppBundle(p) { hold(d, key: "bundle", path: p, isPlist: false, at: ev.date); continue }
+                out.append(d)
             }
         case .persistenceRemoved:
             let label = ev.detail["label"] ?? ev.detail["executable"] ?? ev.path ?? ""
@@ -95,7 +141,8 @@ public final class TamperDetector: @unchecked Sendable {
                 let targetPID = ev.detail["target_pid"].flatMap { Int32($0) }
                 let targetPath = ev.detail["target_path"] ?? ""
                 let sig = ev.detail["sig"] ?? "?"
-                if (targetPID.map { ownPIDs().contains($0) } ?? false) || paths.isProtected(targetPath),
+                // Only the service matters: quitting or killing the app's UI process is not tampering.
+                if (targetPID.map { ownPIDs().contains($0) } ?? false) || paths.isServiceBinary(targetPath),
                    dedupe("signal:\(targetPID ?? 0):\(ev.process?.pid ?? 0)", at: ev.date) {
                     out.append(detection(.killAttempt, severity: .critical, score: 90, title: "Signal \(sig) sent to \(Product.name)",
                                          detail: "target pid \(targetPID ?? 0) \(targetPath)", ev: ev, path: targetPath.isEmpty ? nil : targetPath))
@@ -112,6 +159,10 @@ public final class TamperDetector: @unchecked Sendable {
         let tool = ((args.first ?? p.path) as NSString).lastPathComponent
         let joined = args.joined(separator: " ")
         let lower = joined.lowercased()
+        if Self.killers.contains(tool) {
+            guard killTargetsService(tool: tool, args: Array(args.dropFirst())), dedupe("kill:\(p.pid)", at: ev.date) else { return [] }
+            return [detection(.killAttempt, severity: .critical, score: 90, title: "\(tool) aimed at \(Product.name)", detail: joined, ev: ev, path: nil)]
+        }
         let mentionsUs = paths.isOurLabel(joined) || lower.contains("rampartd") || lower.contains("rampart")
             || args.contains(where: { paths.isProtected($0) })
         guard mentionsUs else { return [] }
@@ -120,17 +171,23 @@ public final class TamperDetector: @unchecked Sendable {
             guard dedupe("unload:\(joined)", at: ev.date) else { return [] }
             return [detection(.unloadAttempt, severity: .critical, score: 95, title: "launchctl used against \(Product.name)", detail: joined, ev: ev, path: nil)]
         }
-        if Self.killers.contains(tool), lower.contains("rampart") {
-            guard dedupe("kill:\(p.pid)", at: ev.date) else { return [] }
-            return [detection(.killAttempt, severity: .critical, score: 90, title: "\(tool) aimed at \(Product.name)", detail: joined, ev: ev, path: nil)]
-        }
         if Self.fileMutators.contains(tool), let target = args.first(where: paths.isProtected) {
             guard dedupe("mutate:\(p.pid):\(target)", at: ev.date) else { return [] }
             let isPlist = paths.isPlist(target)
             let unlocking = tool == "chflags" && args.contains(where: { $0.contains("noschg") || $0.contains("nouchg") })
-            return [detection(isPlist || unlocking ? .plistTamper : .fileTamper, severity: isPlist || unlocking ? .critical : .high, score: isPlist || unlocking ? 92 : 80,
+            let d = detection(isPlist || unlocking ? .plistTamper : .fileTamper, severity: isPlist || unlocking ? .critical : .high, score: isPlist || unlocking ? 92 : 80,
                               title: unlocking ? "Immutable flag being cleared on a \(Product.name) file" : "\(tool) run on a protected \(Product.name) path",
-                              detail: joined, ev: ev, path: target)]
+                              detail: joined, ev: ev, path: target)
+            if !unlocking {
+                // Plist edited by a tool (not removed): judge the content once the tool is done.
+                if isPlist, tool != "rm" { hold(d, key: "plist:\(target)", path: target, isPlist: true, at: ev.date); return [] }
+                // Anything aimed only at the app bundle may be an update (ditto / rm -rf / mv): decide once it settles.
+                let targets = args.dropFirst().filter(paths.isProtected)
+                if !targets.isEmpty, targets.allSatisfy({ paths.isInAppBundle($0) && !paths.isCritical($0) }) {
+                    hold(d, key: "bundle", path: target, isPlist: false, at: ev.date); return []
+                }
+            }
+            return [d]
         }
         if Self.resetters.contains(tool), paths.isOurLabel(joined) {
             guard dedupe("reset:\(p.pid)", at: ev.date) else { return [] }
@@ -141,6 +198,30 @@ public final class TamperDetector: @unchecked Sendable {
             return [detection(.exclusionOfSelf, severity: .high, score: 85, title: "Attempt to exclude \(Product.name) from scanning", detail: joined, ev: ev, path: nil)]
         }
         return []
+    }
+
+    /// kill / pkill / killall: true only if the target is the RamPart service (daemon, watchdog, bundled helper),
+    /// not the app's UI process. kill takes pids; pkill matches a pattern against the name (or, with -f, the
+    /// full command line); killall matches exact process names.
+    private func killTargetsService(tool: String, args: [String]) -> Bool {
+        let flags = args.filter { $0.hasPrefix("-") }
+        let operands = args.filter { !$0.hasPrefix("-") }
+        if tool == "kill" {
+            let own = ownPIDs()
+            return operands.compactMap { Int32($0) }.contains { own.contains($0) }
+        }
+        let ci = flags.contains { $0 == "-i" || $0 == "-I" } || tool == "killall" && flags.contains("-I")
+        let full = tool == "pkill" && flags.contains { $0.hasPrefix("-") && !$0.hasPrefix("--") && $0.dropFirst().contains("f") }
+        let norm: (String) -> String = { ci ? $0.lowercased() : $0 }
+        if tool == "killall" {
+            let names = paths.serviceNames.map(norm)
+            return operands.contains { names.contains(norm($0)) }
+        }
+        let haystacks = (full ? paths.serviceCommandLines + paths.serviceNames : paths.serviceNames).map(norm)
+        return operands.contains { pat in
+            let p = norm(pat).replacingOccurrences(of: "^", with: "").replacingOccurrences(of: "$", with: "")
+            return !p.isEmpty && haystacks.contains { $0.contains(p) }
+        }
     }
 
     /// For the daemon's settings handler: refuse exclusions that cover our own install paths and raise a detection.

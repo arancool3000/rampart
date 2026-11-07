@@ -154,6 +154,14 @@ final class Router {
             case .getSettings:
                 _ = send(.settings(p.settings()))
             case .setSettings(let s):
+                // New exclusions broader than one user-owned subfolder need an admin-authenticated session
+                // (requestDisableProtection + disableProtection(token, minutes: 0)).
+                let old = Set(p.runtime.config.exclusions)
+                let added = s.exclusions.map { ($0 as NSString).expandingTildeInPath }.filter { $0.hasPrefix("/") && !old.contains($0) }
+                if let broad = added.first(where: { !PathScope.isNarrowUserScope($0, uid: peer.uid) }),
+                   !(p.services.guardian?.hasAuthenticatedSession(peer) ?? false) {
+                    throw ServiceError.denied("excluding \(broad) needs administrator confirmation (authenticate first)")
+                }
                 _ = send(.settings(p.setSettings(s)))
             case .pauseScan(let paused):
                 if p.scanControl.setPaused(paused) == 0 { throw ServiceError.failed("no scan is running") }
@@ -173,6 +181,13 @@ final class Router {
             case .listAllowRules:
                 _ = send(.allowRules(p.allowRules.all()))
             case .addAllowRule(let r):
+                // Hash / file / signing rules stay token-free ("Not a Threat"); folder rules broader than one
+                // user-owned subfolder need an admin-authenticated session.
+                if r.scope == .folder, !PathScope.isNarrowUserScope(r.value, uid: peer.uid),
+                   !(p.services.guardian?.hasAuthenticatedSession(peer) ?? false) {
+                    if let why = AllowRuleStore.validate(r) { throw ServiceError.failed(why) }
+                    throw ServiceError.denied("trusting the folder \(r.value) needs administrator confirmation (authenticate first)")
+                }
                 _ = try p.addAllowRule(r)
                 _ = send(.allowRules(p.allowRules.all()))
             case .removeAllowRule(let id):
@@ -204,8 +219,15 @@ final class Router {
                 _ = send(.disableToken(t))
             case .disableProtection(let token, let minutes):
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
-                try g.redeem(token, peer: peer, purpose: .pause, minutes: minutes)
-                p.pauseProtection(minutes: minutes)
+                if minutes <= 0 {
+                    // minutes == 0: authenticate a 10-minute settings session (broad exclusions / folder rules)
+                    // without pausing protection.
+                    try g.redeem(token, peer: peer, purpose: .settings, minutes: 10)
+                    p.activity.add(.settings, "Administrator confirmed a settings change", outcome: "settings session (10 min)")
+                } else {
+                    try g.redeem(token, peer: peer, purpose: .pause, minutes: minutes)
+                    p.pauseProtection(minutes: minutes)
+                }
                 _ = send(.ok)
             case .requestUninstall(let auth):
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }

@@ -80,6 +80,9 @@ final class GuardService {
         }
     }
 
+    /// True while `peer` holds an admin-authenticated session (any purpose); needed for broad exclusions / folder rules.
+    func hasAuthenticatedSession(_ peer: Peer) -> Bool { flow?.hasActiveSession(uid: peer.uid) ?? false }
+
     func redeem(_ token: String, peer: Peer, purpose: ProtectionDisableFlow.Purpose, minutes: Int) throws {
         guard let flow else { throw ServiceError.unavailable("tamper protection key") }
         if case .failure(let f) = flow.redeem(token, peerUID: peer.uid, purpose: purpose, sessionSeconds: Double(max(1, minutes)) * 60) {
@@ -116,6 +119,8 @@ final class GuardService {
         t.schedule(deadline: .now() + 10, repeating: 5, leeway: .seconds(1))
         t.setEventHandler { [weak self] in
             guard let self else { return }
+            // Update awareness: decide held bundle / plist changes whose grace period is over.
+            for d in self.detector.flushPending() { self.onDetection?(d) }
             let policy = self.loadPolicy()
             let r = self.monitor.report(policy: policy)
             for d in self.monitor.detections(from: r) { self.onDetection?(d) }

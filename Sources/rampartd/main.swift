@@ -55,6 +55,19 @@ if printConfig {
     print(String(data: try! enc.encode(runtime.config), encoding: .utf8)!)
     exit(0)
 }
+// One daemon per state root (red-team fix): two instances on the same root both wrote config, detections and the vault.
+let stateLockFD: Int32 = {
+    try? FileManager.default.createDirectory(at: runtime.root, withIntermediateDirectories: true)
+    let path = runtime.root.appendingPathComponent("rampartd.lock").path
+    let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
+    guard fd >= 0, flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        FileHandle.standardError.write(Data("rampartd: another rampartd is using \(runtime.root.path)\n".utf8))
+        exit(75)
+    }
+    _ = ftruncate(fd, 0); let pid = Data("\(getpid())\n".utf8); _ = pid.withUnsafeBytes { write(fd, $0.baseAddress, pid.count) }
+    return fd   // held open (and locked) for the life of the process
+}()
+_ = stateLockFD
 DLog.shared.verbose = verbose
 DLog.shared.openFile(runtime.logFile)
 logInfo("rampartd \(Product.version) starting pid=\(getpid()) uid=\(getuid()) root=\(runtime.root.path) mode=\(runtime.userMode ? "user" : "system")")

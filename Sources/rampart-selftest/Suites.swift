@@ -19,6 +19,7 @@ extension SelfTest {
             ("publicwifi", SelfTest.publicWiFiChecks),
             ("fp1", SelfTest.fp1Checks),
             ("sandbox", SelfTest.sandboxChecks),
+            ("redteam", SelfTest.redTeamChecks),
             ("fp2", SelfTest.fp2Checks),
         ]
     }

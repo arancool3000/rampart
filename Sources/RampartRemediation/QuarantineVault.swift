@@ -179,7 +179,24 @@ public final class QuarantineVault: @unchecked Sendable {
         if !FileManager.default.fileExists(atPath: parent) {
             try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         }
-        let tmp = (parent as NSString).appendingPathComponent(".rampart-restore-\(id.uuidString)")
+        // Pin the destination folder (red-team fix): open it once, refuse if it resolves anywhere other than the
+        // path that was checked (a symlink swapped in after the caller's checks, e.g. to /Library/LaunchDaemons),
+        // and do the final create/rename relative to that descriptor so later swaps cannot redirect the write.
+        let dfd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard dfd >= 0 else { throw RemediationError.ioError("open \(parent): \(String(cString: strerror(errno)))") }
+        defer { close(dfd) }
+        var pbuf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(dfd, F_GETPATH, &pbuf) == 0 else { throw RemediationError.ioError("F_GETPATH \(parent)") }
+        let realParent = String(cString: pbuf)
+        guard realParent == parent || realParent == "/private" + parent else {
+            throw RemediationError.ioError("destination folder \(parent) resolves to \(realParent); refusing to restore through a link")
+        }
+        let destName = (dest as NSString).lastPathComponent
+        if enforceProtectedPaths && ProtectedPaths.isProtected((realParent as NSString).appendingPathComponent(destName)) {
+            throw RemediationError.protectedPath(dest)
+        }
+        let tmpName = ".rampart-restore-\(id.uuidString)"
+        let tmp = (parent as NSString).appendingPathComponent(tmpName)
         defer { try? FileManager.default.removeItem(atPath: tmp) }
         if meta.isDirectory {
             try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: false)
@@ -190,21 +207,22 @@ public final class QuarantineVault: @unchecked Sendable {
             guard r.succeeded else { throw RemediationError.commandFailed("ditto -x: \(r.stderr)") }
             let name = (meta.record.originalPath as NSString).lastPathComponent
             let extracted = (tmp as NSString).appendingPathComponent(name)
-            guard renamex_np(extracted, dest, UInt32(RENAME_EXCL)) == 0 else {
+            guard renameatx_np(dfd, tmpName + "/" + name, dfd, destName, UInt32(RENAME_EXCL)) == 0 else {
                 throw errno == EEXIST ? RemediationError.destinationExists(dest) : RemediationError.ioError("rename: \(String(cString: strerror(errno)))")
             }
         } else {
-            let fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+            let fd = openat(dfd, tmpName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
             guard fd >= 0 else { throw RemediationError.ioError("create \(tmp): \(String(cString: strerror(errno)))") }
             let ok = plain.withUnsafeBytes { plain.isEmpty || write(fd, $0.baseAddress, plain.count) == plain.count }
-            fsync(fd); close(fd)
-            guard ok else { throw RemediationError.ioError("write \(tmp)") }
+            fsync(fd)
+            guard ok else { close(fd); throw RemediationError.ioError("write \(tmp)") }
             for (name, value) in meta.xattrs where name != "com.apple.quarantine" || options.reapplyQuarantineXattr {
-                Xattr.set(tmp, name, value)
+                _ = value.withUnsafeBytes { fsetxattr(fd, name, $0.baseAddress, value.count, 0, 0) }
             }
-            if getuid() == 0 { lchown(tmp, meta.record.ownerUID, meta.groupID) }
-            chmod(tmp, meta.record.mode & 0o7777)
-            guard renamex_np(tmp, dest, UInt32(RENAME_EXCL)) == 0 else {
+            if getuid() == 0 { fchown(fd, meta.record.ownerUID, meta.groupID) }
+            fchmod(fd, meta.record.mode & 0o7777)
+            close(fd)
+            guard renameatx_np(dfd, tmpName, dfd, destName, UInt32(RENAME_EXCL)) == 0 else {
                 throw errno == EEXIST ? RemediationError.destinationExists(dest) : RemediationError.ioError("rename: \(String(cString: strerror(errno)))")
             }
         }
