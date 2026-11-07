@@ -8,6 +8,7 @@ import RampartSigning
 extension SelfTest {
     static func fp2Checks() {
         ownDataExclusionChecks()
+        appleSecurityDataChecks()
         let fm = FileManager.default
         let home = NSHomeDirectory() + "/RampartSelfTestFP2-\(getpid())"   // fake home: nothing real is touched
         defer { try? fm.removeItem(atPath: home) }
@@ -160,4 +161,22 @@ extension SelfTest {
         check(coord.scan(paths: [own]).detections.isEmpty, "fp2: explicit scan of RamPart's data folder reports nothing")
         check(coord.scanFile(at: other + "/com.rampart.test.eicar.com").detection?.name == EICAR.detectionName, "fp2: EICAR elsewhere is still detected")
     }
+}
+
+extension SelfTest {
+    static func appleSecurityDataChecks() {
+        let real = "/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Resources/XProtect.yara"
+        if FileManager.default.fileExists(atPath: real) { check(OwnData.isAppleSecurityRuleData(real), "SIP-protected XProtect rules exempt") }
+        let prot = "/var/protected/xprotect/XProtect.bundle/Contents/Resources/XProtect.yara"
+        if FileManager.default.fileExists(atPath: prot) { check(OwnData.isAppleSecurityRuleData(prot), "Apple-signed /var/protected XProtect rules exempt") }
+        // A look-alike written by malware has no SIP flag, so it is still scanned.
+        let tmp = NSTemporaryDirectory() + "com.rampart.test.\(UUID().uuidString)/XProtect.bundle/Contents/Resources"
+        try? FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        let fake = tmp + "/XProtect.yara"; FileManager.default.createFile(atPath: fake, contents: Data("x".utf8))
+        check(!OwnData.isAppleSecurityRuleData(fake), "fake XProtect outside protected roots still scanned")
+        check(!OwnData.isAppleSecurityRuleData("/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/MacOS/XProtect"), "executables in XProtect never exempt")
+        check(!WalkOptions().isExcluded("/Library/Apple/System/Library/CoreServices/XProtect.bundle"), "walker does not skip /Library/Apple wholesale")
+        try? FileManager.default.removeItem(atPath: (tmp as NSString).deletingLastPathComponent.replacingOccurrences(of: "/XProtect.bundle/Contents", with: ""))
+    }
+
 }
