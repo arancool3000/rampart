@@ -33,9 +33,13 @@ public final class AutoLock {
         observe(ws, NSWorkspace.sessionDidResignActiveNotification) { _ in true }
         observe(dist, Notification.Name("com.apple.screenIsLocked")) { $0.lockOnScreenLock }
         observe(dist, Notification.Name("com.apple.screensaver.didstart")) { $0.lockOnScreenLock }
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkIdle() }
         }
+        // .common so the idle check keeps running while a modal panel (Save/Open, alerts) or a menu is open;
+        // a default-mode timer pauses there, which left the vault unlocked behind an idle Save panel.
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     public func stop() {
@@ -50,8 +54,9 @@ public final class AutoLock {
     }
 
     private func checkIdle() {
-        guard idleMinutes > 0 else { return }
-        if Self.systemIdleSeconds >= Double(idleMinutes * 60) { fire() }
+        // Never "off": a zero or negative value (corrupt settings) falls back to 5 minutes.
+        let minutes = idleMinutes > 0 ? min(idleMinutes, 1440) : 5
+        if Self.systemIdleSeconds >= Double(minutes * 60) { fire() }
     }
 
     private func fire() { stop(); onLock() }
@@ -65,9 +70,15 @@ public final class ClipboardGuard {
     private var pending: DispatchWorkItem?
     public private(set) var clearsAt: Date?
 
-    public func copy(_ secret: String, clearAfter seconds: Int = 30) {
+    /// Bounds for the auto-clear delay; secrets are never left on the clipboard indefinitely.
+    nonisolated public static let clearRange = 5...600
+
+    public func copy(_ secret: String, clearAfter requested: Int = 30) {
+        let seconds = min(Self.clearRange.upperBound, max(Self.clearRange.lowerBound, requested))
         let pb = NSPasteboard.general
-        pb.clearContents()
+        // currentHostOnly keeps the secret off Universal Clipboard (it would otherwise sync to the user's
+        // iPhone/iPad and other Macs). Must be called before writing.
+        pb.prepareForNewContents(with: .currentHostOnly)
         let item = NSPasteboardItem()
         item.setString(secret, forType: .string)
         item.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
@@ -76,7 +87,6 @@ public final class ClipboardGuard {
         pb.writeObjects([item])
         let count = pb.changeCount
         pending?.cancel()
-        guard seconds > 0 else { clearsAt = nil; return }
         clearsAt = Date().addingTimeInterval(Double(seconds))
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {

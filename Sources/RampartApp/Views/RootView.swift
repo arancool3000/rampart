@@ -12,30 +12,43 @@ struct RootView: View {
         @Bindable var model = model
         NavigationSplitView {
             List(selection: $model.selection) {
-                Section {
-                    ForEach(SidebarItem.core) { item in
-                        NavigationLink(value: item) { SidebarRow(item: item) }
-                            .accessibilityHint("Command \(SidebarItem.core.firstIndex(of: item)! + 1)")
+                if model.sidebarMode == .protection {
+                    Section {
+                        ForEach(SidebarItem.core) { item in
+                            NavigationLink(value: item) { SidebarRow(item: item) }
+                                .accessibilityHint("Command \(SidebarItem.core.firstIndex(of: item)! + 1)")
+                        }
                     }
-                }
-                Section(isExpanded: $toolsExpanded) {
-                    ForEach(SidebarItem.tools) { item in
-                        NavigationLink(value: item) { SidebarRow(item: item) }
+                    Section(isExpanded: $toolsExpanded) {
+                        ForEach(SidebarItem.tools) { item in
+                            NavigationLink(value: item) { SidebarRow(item: item) }
+                        }
+                    } header: {
+                        Text("Tools")
+                            .help(toolsExpanded ? "Hide tools" : "Show tools")
+                            .accessibilityHint(toolsExpanded ? "Collapses the tools list" : "Expands the tools list")
                     }
-                } header: {
-                    Text("Tools")
-                        .help(toolsExpanded ? "Hide tools" : "Show tools")
-                        .accessibilityHint(toolsExpanded ? "Collapses the tools list" : "Expands the tools list")
+                } else {
+                    Section {
+                        ForEach(SidebarItem.refreshItems) { item in
+                            NavigationLink(value: item) { SidebarRow(item: item) }
+                                .accessibilityHint("Command \(SidebarItem.refreshItems.firstIndex(of: item)! + 1)")
+                        }
+                    }
                 }
             }
+            .safeAreaInset(edge: .top, spacing: 0) { SidebarModePicker() }
             .navigationSplitViewColumnWidth(min: 210, ideal: 236, max: 260)
             .safeAreaInset(edge: .top) { SidebarBrand() }
             .safeAreaInset(edge: .bottom) { SidebarFooter() }
         } detail: {
             VStack(spacing: 0) {
+                // Emergency lockdown banner (shows only while a lockdown is on; tap opens the Emergency screen).
+                EmergencyBanner { model.selection = .emergency }
                 Group {
                 if model.isDemo { DemoBanner() }
                 if model.isOffline { OfflineBanner() }
+                else if model.mode == .live && (model.daemonOutdated || model.lastError == DaemonClient.outdatedMessage) { OutdatedDaemonBanner() }
                 else if let err = model.lastError, model.mode == .live { ErrorBanner(message: err) }
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
@@ -64,6 +77,16 @@ struct RootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .rampartShowOnboarding)) { _ in showOnboarding = true }
         .onAppear { AnimationGate.shared.start() }
+        .onAppear {
+            // The remembered mode decides the first screen.
+            if model.sidebarMode == .refresh, !(model.selection?.isRefresh ?? false) { model.selection = .refreshSmart }
+        }
+        .onChange(of: model.selection) { _, new in
+            // Something outside the sidebar (a notification, the menu bar, ⌘-shortcut) chose a screen of the other mode.
+            guard let new else { return }
+            let want: SidebarMode = new.isRefresh ? .refresh : .protection
+            if want != model.sidebarMode { model.sidebarMode = want }
+        }
     }
 
     @ViewBuilder private var detail: some View {
@@ -76,7 +99,9 @@ struct RootView: View {
         case .posture: PostureView()
         case .rules: RulesView()
         // Tools: see FeatureRouter (one line per feature).
-        case .scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess: FeatureRouter.view(for: model.selection ?? .dashboard)
+        case .scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess, .refresh, .emergency, .catAndMouse: FeatureRouter.view(for: model.selection ?? .dashboard)
+        case .refreshSmart, .refreshStorage, .refreshMap, .refreshSpeed, .refreshStartup, .refreshLargeOld, .refreshDuplicates, .refreshLeftovers, .refreshSettings:
+            RefreshDestinationView(item: model.selection ?? .refreshSmart)
         case .settings: SettingsView(standalone: false)
         }
     }
@@ -246,6 +271,25 @@ struct SidebarBrand: View {
     }
 }
 
+/// The app talks to an older background service (e.g. the installed daemon after an app update).
+struct OutdatedDaemonBanner: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        HStack(spacing: Spacing.s) {
+            Image(systemName: "arrow.triangle.2.circlepath.circle.fill").foregroundStyle(Color.statusAttention)
+                .symbolRenderingMode(.hierarchical)
+            Text(DaemonClient.outdatedMessage).font(.callout).lineLimit(2)
+            Spacer()
+            Button("Update Background Service…") { FullProtectionInstaller.shared.run() }
+                .controlSize(.small)
+                .help("Installs the background service that ships with this app. macOS asks for your password once.")
+        }
+        .bannerChrome()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Notice: \(DaemonClient.outdatedMessage)")
+    }
+}
+
 struct ErrorBanner: View {
     let message: String
     @Environment(AppModel.self) private var model
@@ -370,6 +414,21 @@ struct EmptyStateView: View {
 
 extension Notification.Name {
     static let rampartOnboardingAdvance = Notification.Name("app.rampart.onboardingAdvance")
+}
+
+/// Segmented "Protection | Refresh" switch at the top of the sidebar (same style as Refresh's section picker).
+struct SidebarModePicker: View {
+    @Environment(AppModel.self) private var model
+    var body: some View {
+        Picker("Mode", selection: Binding(get: { model.sidebarMode }, set: { model.switchMode($0) })) {
+            ForEach(SidebarMode.allCases) { Text($0.title).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(.horizontal, Spacing.m).padding(.vertical, Spacing.s)
+        .accessibilityLabel("Sidebar mode")
+        .help("Switch between protection and Refresh (storage and speed) tools. ⌥⌘1 / ⌥⌘2")
+    }
 }
 
 struct SidebarRow: View {

@@ -189,6 +189,11 @@ public struct ScamChecker: Sendable {
     /// Cheap structural cues that aren't phrases.
     static func structuralSignals(_ text: String, linkCount: Int) -> [ScamSignal] {
         var out: [ScamSignal] = []
+        if AIInjection.detected(text) {
+            out.append(ScamSignal(id: "text.ai.injection", category: .ai, title: "Hidden instructions for an AI assistant",
+                                  explanation: "This text tries to instruct an AI or security tool (or hides text only a machine would read). Honest messages don't do that; treat it as manipulation.",
+                                  score: 55))
+        }
         let letters = text.filter(\.isLetter)
         if letters.count > 40 {
             let upper = letters.filter(\.isUppercase).count

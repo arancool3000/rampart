@@ -153,7 +153,7 @@ struct ScanChoiceCard: View {
             Text(kind.title).font(.title3.weight(.semibold)).fontDesign(.rounded).padding(.top, 4)
             Text(kind.detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let subtitle {
-                Text(subtitle).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Text(SafeText.path(subtitle)).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             } else if kind == .custom {
                 Text("Or drop files here").font(.caption).foregroundStyle(.tertiary)
             }
@@ -287,7 +287,9 @@ struct RunningScanView: View {
                     }
                     HStack(spacing: Spacing.l) {
                         Label(Fmt.duration(Date().timeIntervalSince(progress.started)), systemImage: "timer")
-                        if let eta = progress.etaSeconds { Label("About \(Fmt.duration(eta)) left", systemImage: "hourglass") }
+                        if progress.stalled { Label("Checking a large file…", systemImage: "doc.badge.clock") }
+                        else if let eta = progress.etaSeconds { Label("About \(Fmt.duration(eta)) left", systemImage: "hourglass") }
+                        if progress.timedOut > 0 { Label("\(progress.timedOut) file\(progress.timedOut == 1 ? "" : "s") took too long and were skipped", systemImage: "clock.badge.exclamationmark") }
                         Label("\(progress.found) item\(progress.found == 1 ? "" : "s") found", systemImage: "ladybug")
                     }
                     .font(.callout).foregroundStyle(.secondary).monospacedDigit()
@@ -299,7 +301,7 @@ struct RunningScanView: View {
                                     .font(.caption2.weight(.bold))
                                     .foregroundStyle(i == 0 ? Color.rampartTeal : Color.statusProtected)
                                     .frame(width: 14)
-                                Text(p.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                                Text(SafeText.path(p.replacingOccurrences(of: NSHomeDirectory(), with: "~")))
                                     .font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
                             }
                             .opacity(1 - Double(i) * 0.13)
@@ -413,8 +415,8 @@ struct DetectionRowSummary: View {
         HStack(spacing: Spacing.m) {
             Image(systemName: detection.severity.symbol).foregroundStyle(detection.severity.tint)
             VStack(alignment: .leading) {
-                Text(detection.name).font(.body.weight(.medium))
-                Text(detection.path ?? "—").font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Text(SafeText.line(detection.name)).font(.body.weight(.medium))
+                Text(detection.path.map { SafeText.path($0) } ?? "—").font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             Spacer()
             Badge(text: detection.category.label)

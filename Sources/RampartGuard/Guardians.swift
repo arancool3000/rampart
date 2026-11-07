@@ -108,7 +108,9 @@ public final class GuardianLoop: @unchecked Sendable {
     public let isRunning: @Sendable (String) -> Bool
     /// Reads a sealed backup of a file (binary or plist) when the live copy is bad. Default: SealedStore backup.
     public var interval: TimeInterval = 1
-    public var maxBackoff: TimeInterval = 60
+    /// hx5: was 60 s. An attacker who re-boots-out a partner every time it comes back pushed the ring into minute-long
+    /// gaps; 8 s keeps the worst-case gap short while still stopping a flapping job from spinning the CPU.
+    public var maxBackoff: TimeInterval = 8
     private let lock = NSLock()
     private var failures: [String: Int] = [:]
     private var nextAllowed: [String: Date] = [:]
@@ -119,8 +121,31 @@ public final class GuardianLoop: @unchecked Sendable {
                 isRunning: (@Sendable (String) -> Bool)? = nil) {
         self.role = role; self.ring = ring; self.store = store; self.manifest = manifest; self.clock = clock
         self.isRunning = isRunning ?? { label in
-            runner.run(Self.launchctl, ["print", "system/\(label)"], timeout: 3).stdout.contains("pid = ")
+            Self.isLive(printOutput: runner.run(Self.launchctl, ["print", "system/\(label)"], timeout: 3).stdout)
         }
+    }
+
+    /// hx5: "pid = N" alone is not liveness. A job frozen with SIGSTOP (or `launchctl kill SIGSTOP`) still has a pid,
+    /// launchd never restarts it, and the old check reported it healthy forever. A stopped or zombie process now
+    /// counts as not running, so the partner gets `kickstart -k` (SIGKILL works on a stopped process).
+    public static func isLive(printOutput: String, state: (Int32) -> UInt32? = GuardianLoop.processStatus) -> Bool {
+        guard let pid = parsePID(printOutput), pid > 1 else { return false }
+        guard let st = state(pid) else { return false }
+        return st != UInt32(SSTOP) && st != UInt32(SZOMB)
+    }
+    public static func parsePID(_ printOutput: String) -> Int32? {
+        for line in printOutput.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("pid = "), let n = Int32(t.dropFirst(6).trimmingCharacters(in: .whitespaces)) { return n }
+        }
+        return nil
+    }
+    /// BSD process status (SRUN, SSTOP, SZOMB...), nil if the pid does not exist.
+    public static let processStatus: (Int32) -> UInt32? = { pid in
+        var bi = proc_bsdinfo()
+        let sz = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sz) == sz else { return nil }
+        return bi.pbi_status
     }
 
     public static func rebootstrap(_ j: GuardianJob) -> [GuardCommand] {
@@ -145,19 +170,23 @@ public final class GuardianLoop: @unchecked Sendable {
                                   plistIntact: fileIntact(j.plist), restoredFiles: [], commands: [], notes: [])
             if c.healthy { lock.lock(); failures[j.label] = 0; nextAllowed[j.label] = nil; lock.unlock(); checks.append(c); continue }
             lock.lock()
-            if let na = nextAllowed[j.label], now < na {
+            // hx5: a clock moved backwards would otherwise stretch the back-off for as long as the jump.
+            if let na = nextAllowed[j.label], now < na, na.timeIntervalSince(now) <= maxBackoff {
                 lock.unlock(); c.notes.append("in back-off until \(na)"); checks.append(c); continue
             }
             let n = (failures[j.label] ?? 0) + 1
             failures[j.label] = n
-            let delay = min(maxBackoff, pow(2, Double(min(n, 10) - 1)))   // 1,2,4,...,60 s
+            let delay = min(maxBackoff, pow(2, Double(min(n, 10) - 1)))   // 1,2,4,8 s
             nextAllowed[j.label] = now.addingTimeInterval(delay)
             backoff = max(backoff, delay)
             lock.unlock()
 
             for (path, intact) in [(j.plist, c.plistIntact), (j.binary, c.binaryIntact)] where intact == false || !FileManager.default.fileExists(atPath: path) {
                 if let store, store.hasBackup(for: path) {
-                    let (_, restored) = store.restoreIfNeeded(path, dryRun: dryRun)
+                    // hx5: binaries and plists are raw files: restore the payload whose hash matches the manifest,
+                    // not the JSON envelope (which launchd cannot run).
+                    let restored = store.restoreRawIfNeeded(path, expectedSHA: manifest?.entries[path],
+                                                            mode: path == j.binary ? 0o755 : 0o644, dryRun: dryRun)
                     if restored {
                         c.restoredFiles.append(path)
                         if path == j.binary { c.commands.append(GuardCommand("/bin/chmod", ["755", path], note: "binary must be executable")) }
@@ -271,10 +300,11 @@ public struct TamperResponder: Sendable {
 public enum TamperCopy {
     public static let whatItDoes =
         "Scripts and malware running as your user can't turn \(Product.name) off: protection can only be paused or removed " +
-        "with your administrator password through \(Product.name) itself. Attempts to stop, unload, delete or edit it, " +
-        "even by admin-level scripts, are detected, undone from sealed backups, and reported to you."
+        "with your administrator password through \(Product.name) itself. Attempts to stop, unload, delete or edit it that " +
+        "\(Product.name) can see are detected, undone from sealed backups where possible, and reported to you."
     public static let limit =
         "No antivirus can stop a person who deliberately restarts into Recovery Mode and removes it, and macOS lets a " +
-        "root process stop any background service for a moment. \(Product.name) makes that moment short and visible " +
-        "rather than pretending it can't happen."
+        "root process stop any background service. A root process can also read the sealing key, clear immutable flags, " +
+        "or unload all three guardians at once; \(Product.name) makes most of that loud and short-lived, but it cannot " +
+        "make it impossible."
 }

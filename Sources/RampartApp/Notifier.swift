@@ -71,7 +71,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         // De-duplicate repeated reports of the same detection within 10 minutes.
         if let last = recentThreatIDs[d.id], Date().timeIntervalSince(last) < 600 { return }
         recentThreatIDs[d.id] = Date()
-        let name = d.path.map { ($0 as NSString).lastPathComponent } ?? d.name
+        // hx8: the name comes from the file system or the detection; one clean, short, quoted line.
+        let name = SafeText.line(d.path.map { ($0 as NSString).lastPathComponent } ?? d.name, max: 60)
         if d.category == .ransomware {
             post(.threat, title: "\(Product.name) stopped suspicious file changes", body: "\"\(name)\" started changing many files. It's been stopped.", critical: true)
         } else if d.resolved {
@@ -87,7 +88,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         post(.scan, title: "\(r.kind.title) finished", body: body, critical: false)
     }
 
-    func post(_ cat: Category, title: String, body: String, critical: Bool) {
+    func post(_ cat: Category, title: String, body: String, critical: Bool, userInfo: [String: String] = [:]) {
         if !critical {
             if let last = lastNonCritical, Date().timeIntervalSince(last) < 3600 { return }   // max 1/hour
             lastNonCritical = Date()
@@ -98,6 +99,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         c.body = body
         c.threadIdentifier = cat.rawValue
         c.categoryIdentifier = cat.rawValue
+        if !userInfo.isEmpty { c.userInfo = userInfo }
         if critical { c.interruptionLevel = .timeSensitive } else { c.interruptionLevel = .passive }
         if defaults.bool(forKey: "notif.sounds") { c.sound = .default }
         center.add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { _ in }
@@ -109,14 +111,37 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// "Disconnecting from insecure Wi-Fi…" with a "Stay connected" action (PublicWiFiGuard grace period).
     func wifiDisconnectScheduled(networkName: String, reason: String) {
-        post(.wifi, title: "Disconnecting from insecure Wi-Fi…", body: "\(networkName): \(reason) Choose Stay connected to keep using it.", critical: true)
+        // hx8: the network name is chosen by whoever runs the access point. Clean it and keep it short so it
+        // can't carry a second, fake RamPart sentence.
+        let name = SafeText.line(networkName, max: 32)
+        let token = UUID().uuidString
+        wifiActionToken = token
+        post(.wifi, title: "Disconnecting from insecure Wi-Fi…", body: "\"\(name)\": \(SafeText.line(reason, max: 140)) Choose Stay connected to keep using it.",
+             critical: true, userInfo: ["wifiToken": token])
+    }
+
+    /// hx8: "Stay connected" is honoured only for the newest Wi-Fi notification while its disconnect is pending.
+    private(set) var wifiActionToken: String?
+
+    static func shouldHonourStayConnected(category: String, token: String?, expected: String?, pending: Bool) -> Bool {
+        guard category == Category.wifi.rawValue, pending, let token, let expected else { return false }
+        return token == expected
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
         if response.actionIdentifier == "stayConnected" {
-            await MainActor.run { PublicWiFiHost.shared.stayConnected() }
+            let category = response.notification.request.content.categoryIdentifier
+            let token = response.notification.request.content.userInfo["wifiToken"] as? String
+            await MainActor.run {
+                let n = Notifier.shared
+                guard Notifier.shouldHonourStayConnected(category: category, token: token, expected: n.wifiActionToken,
+                                                         pending: PublicWiFiHost.shared.pendingDisconnect != nil) else { return }
+                n.wifiActionToken = nil
+                PublicWiFiHost.shared.stayConnected()
+            }
             return
         }
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier || ["review", "allow"].contains(response.actionIdentifier) else { return }
         let isThreat = response.notification.request.content.categoryIdentifier == Category.threat.rawValue
         await MainActor.run {
             NSApp.activate(ignoringOtherApps: true)

@@ -20,6 +20,8 @@ public struct DNSFilterConfig: Sendable {
     public var blockPrivateRelay: Bool
     /// Block when an upstream answer's CNAME chain points at a blocked domain (CNAME cloaking).
     public var inspectCNAMEs: Bool
+    /// Where learned DoH key pins persist (root-owned dir in the daemon). nil = in-memory for this run.
+    public var pinStateURL: URL? = nil
 
     /// Default: 127.0.0.1:53 as root, 127.0.0.1:5353 for development (non-root).
     public init(listenAddress: String = "127.0.0.1",
@@ -73,10 +75,11 @@ public struct DNSQueryLogEntry: Codable, Sendable {
 }
 
 public enum DNSFilterServerError: Error, CustomStringConvertible {
-    case badAddress(String), socket(String, Int32)
+    case badAddress(String), notLoopback(String), socket(String, Int32)
     public var description: String {
         switch self {
         case .badAddress(let a): return "invalid listen address \(a)"
+        case .notLoopback(let a): return "refusing to listen on non-loopback address \(a) (would be an open resolver)"
         case .socket(let op, let e): return "\(op) failed: \(String(cString: strerror(e))) (errno \(e))"
         }
     }
@@ -107,16 +110,71 @@ public final class DNSFilterServer: @unchecked Sendable {
     public private(set) var boundPort: UInt16 = 0
     private var statsStore: [DNSQueryLogEntry.Verdict: Int] = [:]
 
+    // Resource limits (hx4): a local flood can't exhaust threads, sockets or DoH connections.
+    public static let maxInFlight = 256
+    public static let maxTCPConnections = 32
+    private var inFlight = 0
+    private var tcpConnections = 0
+    /// Upstream health for the DNS-restore watchdog (see `upstreamHealthy`).
+    private var consecutiveUpstreamFailures = 0
+    private var lastUpstreamSuccess: Date?
+    public private(set) var droppedNonLocal = 0
+
     public init(config: DNSFilterConfig = DNSFilterConfig(), blocklist: DomainBlocklist = DomainBlocklist()) {
         self.config = config
         self._blocklist = blocklist
         self.cache = DNSResponseCache(capacity: config.cacheCapacity)
-        self.doh = DoHClient(upstreams: config.upstreams, timeout: config.upstreamTimeout)
+        self.doh = DoHClient(upstreams: config.upstreams, timeout: config.upstreamTimeout,
+                             pins: DoHPinStore(stateURL: config.pinStateURL))
     }
 
     deinit { stop() }
 
     public var isRunning: Bool { stateLock.lock(); defer { stateLock.unlock() }; return running }
+
+    /// False after 5+ consecutive DoH failures with no success in the last 60 s. The daemon watchdog should
+    /// then restore the original DNS (`DNSSwitcher.restore()`) so the Mac is never left without DNS.
+    public var upstreamHealthy: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if consecutiveUpstreamFailures < 5 { return true }
+        return lastUpstreamSuccess.map { Date().timeIntervalSince($0) < 60 } ?? false
+    }
+
+    /// Loopback only: 127.0.0.0/8 or ::1. Anything else would make this an open resolver.
+    public static func isLoopbackAddress(_ address: String) -> Bool {
+        guard let b = DNSWire.addressBytes(address) else { return false }
+        if b.count == 4 { return b[0] == 127 }
+        return b == [UInt8](repeating: 0, count: 15) + [1]
+    }
+
+    /// True when a datagram/connection source is loopback (127/8, ::1, or ::ffff:127.x).
+    static func isLoopbackPeer(_ ss: sockaddr_storage) -> Bool {
+        var s = ss
+        switch Int32(ss.ss_family) {
+        case AF_INET:
+            return withUnsafePointer(to: &s) { $0.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                (UInt32(bigEndian: $0.pointee.sin_addr.s_addr) >> 24) == 127 } }
+        case AF_INET6:
+            let bytes: [UInt8] = withUnsafePointer(to: &s) { $0.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { p in
+                var a = p.pointee.sin6_addr; return withUnsafeBytes(of: &a) { Array($0) } } }
+            if bytes == [UInt8](repeating: 0, count: 15) + [1] { return true }
+            return bytes.prefix(12) == [0,0,0,0,0,0,0,0,0,0,0xFF,0xFF] && bytes[12] == 127
+        default: return false
+        }
+    }
+
+    private func acquireSlot() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard inFlight < Self.maxInFlight else { return false }
+        inFlight += 1; return true
+    }
+    private func releaseSlot() { stateLock.lock(); inFlight = max(0, inFlight - 1); stateLock.unlock() }
+    private func noteUpstream(ok: Bool) {
+        stateLock.lock()
+        if ok { consecutiveUpstreamFailures = 0; lastUpstreamSuccess = Date() } else { consecutiveUpstreamFailures += 1 }
+        stateLock.unlock()
+    }
+    private func noteDroppedNonLocal() { stateLock.lock(); droppedNonLocal += 1; stateLock.unlock() }
 
     public var stats: [String: Int] {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -130,6 +188,7 @@ public final class DNSFilterServer: @unchecked Sendable {
     public func start() throws {
         stateLock.lock(); defer { stateLock.unlock() }
         guard !running else { return }
+        guard Self.isLoopbackAddress(config.listenAddress) else { throw DNSFilterServerError.notLoopback(config.listenAddress) }
         let (addr, len, family) = try Self.makeSockaddr(config.listenAddress, port: config.port)
         let u = try Self.openSocket(family: family, type: SOCK_DGRAM, addr: addr, len: len)
         var port = Self.localPort(u)
@@ -249,10 +308,14 @@ public final class DNSFilterServer: @unchecked Sendable {
                 fp.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buf, buf.count, 0, $0, &fromLen) }
             }
             guard n > 0 else { continue }
+            // Defence in depth: the socket is bound to loopback, but never answer an off-host source.
+            guard Self.isLoopbackPeer(from) else { noteDroppedNonLocal(); continue }
             let packet = Data(buf[0..<n])
             let client = from, clientLen = fromLen
+            guard acquireSlot() else { continue }   // overloaded: drop (client retries)
             work.async { [weak self] in
-                self?.handle(packet, client: Self.describe(client), transport: "udp") { reply, limit in
+                guard let self else { return }
+                self.handle(packet, client: Self.describe(client), transport: "udp") { reply, limit in
                     let out = limit.map { DNSWire.truncateIfNeeded(reply.data, limit: $0, query: reply.query) } ?? reply.data
                     var c = client
                     _ = out.withUnsafeBytes { raw in
@@ -260,7 +323,8 @@ public final class DNSFilterServer: @unchecked Sendable {
                             cp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(fd, raw.baseAddress, out.count, 0, $0, clientLen) }
                         }
                     }
-                }
+                    self.releaseSlot()
+                } dropped: { self.releaseSlot() }
             }
         }
     }
@@ -275,6 +339,12 @@ public final class DNSFilterServer: @unchecked Sendable {
                 fp.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(fd, $0, &fromLen) }
             }
             guard c >= 0 else { continue }
+            guard Self.isLoopbackPeer(from) else { noteDroppedNonLocal(); close(c); continue }
+            stateLock.lock()
+            let full = tcpConnections >= Self.maxTCPConnections
+            if !full { tcpConnections += 1 }
+            stateLock.unlock()
+            if full { close(c); continue }
             var tv = timeval(tv_sec: 10, tv_usec: 0)
             setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
             setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
@@ -284,6 +354,7 @@ public final class DNSFilterServer: @unchecked Sendable {
             DispatchQueue.global().async { [weak self] in
                 self?.tcpConnection(c, client: clientName)
                 close(c)
+                if let self { self.stateLock.lock(); self.tcpConnections -= 1; self.stateLock.unlock() }
             }
         }
     }
@@ -304,7 +375,8 @@ public final class DNSFilterServer: @unchecked Sendable {
             guard len >= 12, let msg = readExactly(fd, len) else { return }
             let sem = DispatchSemaphore(value: 0)
             let box = ReplyBox()
-            handle(msg, client: client, transport: "tcp") { reply, _ in box.data = reply.data; sem.signal() }
+            handle(msg, client: client, transport: "tcp", respond: { reply, _ in box.data = reply.data; sem.signal() },
+                   dropped: { sem.signal() })
             guard sem.wait(timeout: .now() + config.upstreamTimeout * 3) == .success, let out = box.data,
                   out.count <= 65_535 else { return }
             var frame = Data([UInt8(out.count >> 8), UInt8(out.count & 0xFF)]); frame.append(out)
@@ -332,15 +404,20 @@ public final class DNSFilterServer: @unchecked Sendable {
     }
 
     /// `respond(reply, udpLimit)`; udpLimit is the max UDP payload for this client (nil for TCP).
-    func handle(_ packet: Data, client: String, transport: String, respond: @escaping @Sendable (Reply, Int?) -> Void) {
+    /// `dropped` runs instead of `respond` when no reply is sent (responses, oversize packets).
+    func handle(_ packet: Data, client: String, transport: String, respond: @escaping @Sendable (Reply, Int?) -> Void,
+                dropped: @escaping @Sendable () -> Void = {}) {
         let started = Date()
+        // Never answer a message with QR set: replying to responses enables reflection loops between resolvers.
+        if packet.count >= 3, packet[packet.startIndex + 2] & 0x80 != 0 { dropped(); return }
+        guard packet.count <= 65_535 else { dropped(); return }
         guard let query = try? DNSMessage.parse(packet), !query.isResponse else {
             if let fe = DNSWire.buildFormErr(raw: packet), let fq = try? DNSMessage.parse(fe) {
                 record(DNSQueryLogEntry(date: started, name: "", type: "", verdict: .formerr, answers: [],
                                         rcode: Int(DNSRCode.formErr), client: client, transport: transport,
                                         milliseconds: 0))
                 respond(Reply(data: fe, query: fq), nil)
-            }
+            } else { dropped() }
             return
         }
         let udpLimit: Int? = transport == "udp" ? (query.ednsPayloadSize ?? 512) : nil
@@ -361,6 +438,19 @@ public final class DNSFilterServer: @unchecked Sendable {
                                     milliseconds: Date().timeIntervalSince(started) * 1000, error: error))
         }
 
+        // 0. Bootstrap: the DoH upstream hostnames are answered from pinned addresses so resolving them never
+        //    loops back through this resolver (which would leave the Mac without DNS).
+        if q.qclass == 1, q.type == DNSType.a || q.type == DNSType.aaaa,
+           let pinned = DoHClient.bootstrapAddresses[q.name] {
+            var r = DNSMessage(id: query.id, flags: DNSWire.responseFlags(for: query, rcode: DNSRCode.noError))
+            r.questions = [q]
+            for a in pinned {
+                guard let bytes = DNSWire.addressBytes(a), bytes.count == (q.type == DNSType.a ? 4 : 16) else { continue }
+                r.answers.append(DNSResourceRecord(name: q.name, type: q.type, ttl: 300, rdata: Data(bytes), value: a))
+            }
+            finish(r.serialize(), .forwarded, rule: "bootstrap", list: "bootstrap")
+            return
+        }
         // 1. Canaries.
         var canaries = config.canaryDomains.map(DNSWire.normalize)
         if config.blockPrivateRelay { canaries += ["mask.icloud.com", "mask-h2.icloud.com"] }
@@ -388,6 +478,7 @@ public final class DNSFilterServer: @unchecked Sendable {
             guard let self else { return }
             switch result {
             case .success(let (data, url)):
+                self.noteUpstream(ok: true)
                 if allowRule == nil, self.config.inspectCNAMEs, let m = try? DNSMessage.parse(data) {
                     for rr in m.answers where rr.type == DNSType.cname {
                         if let target = rr.value, case .blocked(let rule, let src) = self.blocklist.verdict(for: target) {
@@ -401,6 +492,7 @@ public final class DNSFilterServer: @unchecked Sendable {
                 finish(data, allowRule == nil ? .forwarded : .allowlisted, rule: allowRule,
                        list: allowRule == nil ? nil : "allowlist", upstream: url.host)
             case .failure(let e):
+                self.noteUpstream(ok: false)
                 self.log.error("DoH failed for \(q.name, privacy: .public): \(e.description, privacy: .public)")
                 finish(DNSWire.buildError(for: query, rcode: DNSRCode.servFail), .servfail, error: e.description)
             }

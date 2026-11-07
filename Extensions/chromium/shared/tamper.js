@@ -48,11 +48,8 @@
   const start = () => mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["onsubmit", "onkeydown", "onkeyup", "onkeypress", "oninput"] });
   if (document.documentElement) start(); else document.addEventListener("DOMContentLoaded", start);
 
-  // Keystroke listeners added to password fields after load (patched in the isolated world only;
-  // page-world listeners are visible via the MAIN-world hook message when present).
-  window.addEventListener("message", (e) => {
-    if (e.source === window && e.data && e.data.__rampart === "tamper" && typeof e.data.note === "string") note(e.data.note.slice(0, 120));
-  });
+  // (A window "message" listener for page-world tamper notes used to live here. Nothing sent
+  // them and any page could forge them, so it was removed: harden-hx6 N4.)
   setInterval(recheckAPIs, 5000);
 
   globalThis.RampartTamper = { drain: () => { const out = findings.slice(); findings.length = 0; return out; }, peek: () => findings.slice() };

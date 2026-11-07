@@ -4,8 +4,10 @@
 (() => {
   const api = typeof browser !== "undefined" ? browser : chrome;
   if (window.top !== window) return;
-  if (document.documentElement.hasAttribute("data-rampart-ready")) return;
-  document.documentElement.setAttribute("data-rampart-ready", "1");
+  // Run-once guard lives in the isolated world. (It used to be a data-rampart-ready attribute on
+  // <html>, which a page could pre-set in its own markup to switch RamPart off.)
+  if (globalThis.__rampartContentLoaded) return;
+  globalThis.__rampartContentLoaded = true;
 
   const H = globalThis.RampartHeuristics;
   const PAGE_URL = location.href;
@@ -54,47 +56,174 @@
     if (window.__rampartClipboardSeen) usesClipboardWrite = true;
     const imageAlts = Array.from(document.images).slice(0, 40).map((i) => (i.alt || "") + " " + (i.src || "").split("/").pop()).filter(Boolean);
     const externalScriptHosts = Array.from(new Set(Array.from(document.scripts).map((s) => { try { return s.src ? new URL(s.src).hostname : null; } catch { return null; } }).filter(Boolean))).slice(0, 30);
+    // Installer links and the main heading (fake-update / fake-download rules, W-X6-1).
+    const downloadLinks = [];
+    for (const a of document.querySelectorAll("a[href]")) {
+      if (downloadLinks.length >= 30) break;
+      try { const u = new URL(a.href, location.href); if (/\.(dmg|pkg|mpkg|zip|app|iso)$/i.test(u.pathname)) downloadLinks.push(u.href.slice(0, 500)); } catch {}
+    }
+    const h1 = ((document.querySelector("h1") || {}).innerText || "").slice(0, 200);
     return {
-      title: document.title || "", forms, usesClipboardWrite, overlayText: overlayText.trim().slice(0, 4000),
+      title: document.title || "", h1, downloadLinks, forms, usesClipboardWrite, overlayText: overlayText.trim().slice(0, 4000),
       visibleText: (document.body ? document.body.innerText || "" : "").slice(0, 12000), scriptSnippets: scripts, imageAlts, externalScriptHosts,
       hasWalletConnect, isTopFrame: true, isHTTPS: location.protocol === "https:",
     };
   }
 
-  // MARK: Rendering
+  // MARK: Rendering (N1, harden-hx6)
+  // Every RamPart surface lives in a CLOSED shadow root on a host element with a random tag name, so
+  // page scripts can't find, read, restyle or click our buttons (querySelector, .shadowRoot and
+  // innerText all stop at the host). Every handler also drops synthetic events (!e.isTrusted) and
+  // clicks that land in the first 500 ms (a click-through trick), and Trust/Continue are confirmed by
+  // the service worker, which checks the request came from our content script for this tab's host.
+  // Honest limit: the host element is still in the page's DOM, so a page can remove or hide it. For a
+  // block, the watchdog then moves the tab to RamPart's own extension page, which the site can't touch.
 
+  const CSS = `
+:host { all: initial !important; }
+*, *::before, *::after { box-sizing: border-box; font-family: -apple-system, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif; }
+.root { color: #0d1b2a; }
+.interstitial { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; overflow: auto;
+  background: radial-gradient(1200px 800px at 70% 20%, #0a2a3a 0%, #071320 60%, #050b14 100%); }
+.card { width: min(560px, 100%); background: rgba(255,255,255,0.96); border-radius: 18px; padding: 28px 30px; box-shadow: 0 30px 80px rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.4); }
+.card-small { width: min(440px, 100%); }
+.badge { display: inline-block; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #0a84a0; background: rgba(10,132,160,0.12); padding: 3px 9px; border-radius: 999px; margin-bottom: 14px; }
+h1 { font-size: 24px; font-weight: 700; margin: 0 0 8px; line-height: 1.2; color: #0d1b2a; }
+h2 { font-size: 18px; font-weight: 700; margin: 0 0 6px; color: #0d1b2a; }
+p { font-size: 15px; line-height: 1.45; margin: 0 0 10px; color: #2c3e50; }
+.host code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: #eef3f6; padding: 2px 6px; border-radius: 6px; color: #a33; }
+.reasons { margin: 12px 0 18px; padding: 0 0 0 18px; }
+.reasons li { font-size: 14px; line-height: 1.4; margin: 0 0 8px; color: #2c3e50; }
+.reasons strong { color: #0d1b2a; font-weight: 600; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+button { cursor: pointer; font: 600 14px -apple-system, "Helvetica Neue", Arial, sans-serif; border-radius: 999px; padding: 9px 18px; border: 0; }
+.primary { background: linear-gradient(180deg, #17b8cc, #0a84a0); color: #fff; box-shadow: 0 6px 18px rgba(10,132,160,0.35); }
+.secondary { background: #eef3f6; color: #2c3e50; }
+.primary:focus-visible, .secondary:focus-visible, .link:focus-visible, .close:focus-visible { outline: 3px solid rgba(23,184,204,0.5); }
+.foot { font-size: 12px; color: #6c7a89; margin-top: 14px; }
+.banner { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 16px; background: #fff6df; color: #4a3b00; border-bottom: 1px solid #f0d890; box-shadow: 0 4px 16px rgba(0,0,0,0.12); font-size: 14px; }
+.banner-danger { background: #ffe9e6; border-bottom-color: #f3b8b0; color: #5a1a12; }
+.banner .badge { margin: 0; }
+.banner-text { flex: 1 1 320px; line-height: 1.35; }
+.link { background: transparent; color: #0a84a0; padding: 4px 8px; text-decoration: underline; }
+.close { background: transparent; font-size: 20px; line-height: 1; padding: 0 6px; color: inherit; }
+.banner-reasons { flex-basis: 100%; margin: 4px 0 0; }
+.clip { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(5,11,20,0.55); padding: 24px; }
+.cmd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #0d1b2a; color: #ffd166; padding: 10px 12px; border-radius: 10px; white-space: pre-wrap; word-break: break-all; max-height: 140px; overflow: auto; margin: 8px 0 14px; }
+@media (prefers-color-scheme: dark) {
+  .card { background: rgba(18,28,40,0.98); border-color: rgba(255,255,255,0.12); }
+  h1, h2, .reasons strong { color: #f2f6f9; }
+  p, .reasons li { color: #c7d1db; }
+  .host code { background: #1e2b3a; color: #ff8a80; }
+  .secondary { background: #243447; color: #e6edf3; }
+}
+@media (prefers-reduced-motion: no-preference) { .card { animation: in 240ms ease-out; } @keyframes in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } } }
+`;
+
+  function randomTag() {
+    const b = new Uint8Array(12); crypto.getRandomValues(b);
+    const letters = Array.from(b, (x) => String.fromCharCode(97 + (x % 26))).join("");
+    return letters.slice(0, 5) + "-" + letters.slice(5);
+  }
+  const HOST_STYLE = {
+    full: "position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; max-width: none !important; max-height: none !important;",
+    banner: "position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; bottom: auto !important; width: 100% !important; height: auto !important; max-width: none !important;",
+  };
+  const BASE_STYLE = "all: initial !important; display: block !important; visibility: visible !important; opacity: 1 !important; pointer-events: auto !important; z-index: 2147483647 !important; margin: 0 !important; padding: 0 !important; border: 0 !important; background: transparent !important; overflow: visible !important; transform: none !important; filter: none !important; clip-path: none !important;";
+
+  const surfaces = new Set();   // live UI mounts
+  /** Mount a closed-shadow surface. kind: "full" | "banner". Uses the top layer (popover) when available. */
+  function mount(kind) {
+    const host = document.createElement(randomTag());
+    host.setAttribute("style", BASE_STYLE + HOST_STYLE[kind]);
+    const usePopover = typeof host.showPopover === "function";
+    if (usePopover) host.setAttribute("popover", "manual");
+    const root = host.attachShadow({ mode: "closed" });
+    const style = document.createElement("style"); style.textContent = CSS; root.appendChild(style);
+    const m = { host, root, kind, usePopover, shownAt: performance.now() };
+    m.attach = () => {
+      document.documentElement.appendChild(host);
+      if (usePopover) { try { host.showPopover(); } catch {} }
+      m.shownAt = performance.now();
+    };
+    m.remove = () => { surfaces.delete(m); try { if (usePopover) host.hidePopover(); } catch {} host.remove(); };
+    m.intact = () => {
+      if (!host.isConnected) return false;
+      if (usePopover) { try { if (!host.matches(":popover-open")) return false; } catch {} }
+      const cs = getComputedStyle(host);
+      if (cs.display === "none" || cs.visibility !== "visible" || Number(cs.opacity) < 0.95) return false;
+      if (kind === "full") { const r = host.getBoundingClientRect(); if (r.width < innerWidth * 0.9 || r.height < innerHeight * 0.9) return false; }
+      return true;
+    };
+    surfaces.add(m);
+    return m;
+  }
   function el(tag, attrs, children) {
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) { if (k === "text") e.textContent = v; else e.setAttribute(k, v); }
     for (const c of children || []) e.appendChild(c);
     return e;
   }
-  function removeUI() { for (const n of document.querySelectorAll(".rampart-root")) n.remove(); document.documentElement.classList.remove("rampart-locked"); }
+  /** Click handler that ignores synthetic events and clicks in the first 500 ms after the UI appeared. */
+  function onTrusted(m, button, fn) {
+    button.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!e.isTrusted) return;
+      if (performance.now() - m.shownAt < 500) return;
+      fn(e);
+    });
+  }
+  function removeUI() { for (const m of Array.from(surfaces)) if (m.kind !== "clip") m.remove(); document.documentElement.classList.remove("rampart-locked"); stopWatchdog(); }
+  const send = (msg) => api.runtime.sendMessage(msg).catch(() => null);
+
+  // Watchdog: if the page removes or hides a RamPart surface, put it back (banner, 3 times), or move
+  // the tab to the extension's own interstitial page (block).
+  let watchdog = null;
+  function startWatchdog() {
+    if (watchdog) return;
+    let banners = 0;
+    watchdog = setInterval(() => {
+      for (const m of Array.from(surfaces)) {
+        if (m.intact()) continue;
+        if (m.kind === "full" && shownLevel === "block" && !userContinued) { stopWatchdog(); send({ type: "openInterstitial" }); return; }
+        if (m.kind === "banner" && banners++ < 3) { m.host.setAttribute("style", BASE_STYLE + HOST_STYLE.banner); m.attach(); }
+      }
+    }, 750);
+  }
+  function stopWatchdog() { if (watchdog) { clearInterval(watchdog); watchdog = null; } }
+
+  function reasonList(cls, reasons) {
+    return el("ul", { class: cls }, (reasons || []).slice(0, 5).map((r) => el("li", {}, [el("strong", { text: String((r && r.title) || "") }), el("span", { text: " " + String((r && r.detail) || "") })])));
+  }
 
   function showInterstitial(resp) {
     if (shownLevel === "block" || userContinued) return;
     removeUI(); shownLevel = "block";
     const host = (() => { try { return new URL(PAGE_URL).hostname; } catch { return PAGE_URL; } })();
-    const reasons = (resp.reasons || []).slice(0, 5);
-    const root = el("div", { class: "rampart-root rampart-interstitial", role: "alertdialog", "aria-modal": "true", "aria-labelledby": "rampart-title" }, [
-      el("div", { class: "rampart-card" }, [
-        el("div", { class: "rampart-badge", text: "RamPart" }),
-        el("h1", { id: "rampart-title", text: "This page looks like a scam" }),
-        el("p", { class: "rampart-headline", text: resp.headline || "RamPart found strong signs that this page is trying to trick you." }),
-        el("p", { class: "rampart-host" }, [el("span", { text: "Address: " }), el("code", { text: host })]),
-        el("ul", { class: "rampart-reasons" }, reasons.map((r) => el("li", {}, [el("strong", { text: r.title }), el("span", { text: " " + (r.detail || "") })]))),
-        el("div", { class: "rampart-actions" }, [
-          el("button", { class: "rampart-primary", id: "rampart-back", text: "Go back" }),
-          el("button", { class: "rampart-secondary", id: "rampart-continue", text: "Continue anyway" }),
-        ]),
-        el("p", { class: "rampart-foot", text: resp.fallback ? "Checked with the extension's built-in rules. Open RamPart on your Mac for the full engine." : "Checked by RamPart on your Mac. Nothing about this page was sent to the cloud." }),
+    const m = mount("full");
+    const back = el("button", { class: "primary", text: "Go back" });
+    const cont = el("button", { class: "secondary", text: "Continue anyway" });
+    m.root.appendChild(el("div", { class: "root interstitial", role: "alertdialog", "aria-modal": "true", "aria-label": "RamPart: this page looks like a scam" }, [
+      el("div", { class: "card" }, [
+        el("div", { class: "badge", text: "RamPart" }),
+        el("h1", { text: "This page looks like a scam" }),
+        el("p", { class: "headline", text: resp.headline || "RamPart found strong signs that this page is trying to trick you." }),
+        el("p", { class: "host" }, [el("span", { text: "Address: " }), el("code", { text: host })]),
+        reasonList("reasons", resp.reasons),
+        el("div", { class: "actions" }, [back, cont]),
+        el("p", { class: "foot", text: resp.fallback ? "Checked with the extension's built-in rules. Open RamPart on your Mac for the full engine." : "Checked by RamPart on your Mac. Nothing about this page was sent to the cloud." }),
       ]),
-    ]);
-    document.documentElement.appendChild(root);
+    ]));
+    m.attach();
     document.documentElement.classList.add("rampart-locked");
-    root.querySelector("#rampart-back").focus();
-    root.querySelector("#rampart-back").onclick = () => { api.runtime.sendMessage({ type: "decision", url: PAGE_URL, decision: "wentBack" }); if (history.length > 1) history.back(); else location.replace("about:blank"); };
-    root.querySelector("#rampart-continue").onclick = () => { userContinued = true; api.runtime.sendMessage({ type: "decision", url: PAGE_URL, decision: "continued" }); removeUI(); showBanner(resp, true); };
+    back.focus();
+    onTrusted(m, back, () => { send({ type: "decision", decision: "wentBack" }); if (history.length > 1) history.back(); else location.replace("about:blank"); });
+    onTrusted(m, cont, async () => {
+      const ok = await send({ type: "continueSite" });
+      if (!ok || !ok.ok) return;
+      userContinued = true; removeUI(); showBanner(resp, true);
+    });
+    startWatchdog();
   }
 
   function showBanner(resp, afterContinue) {
@@ -103,56 +232,59 @@
     shownLevel = afterContinue ? "block" : "warn";
     const host = (() => { try { return new URL(PAGE_URL).hostname; } catch { return ""; } })();
     const top = (resp.reasons || [])[0];
-    const bar = el("div", { class: "rampart-root rampart-banner" + (afterContinue ? " rampart-banner-danger" : ""), role: "status" }, [
-      el("span", { class: "rampart-badge", text: "RamPart" }),
-      el("span", { class: "rampart-banner-text", text: afterContinue ? "You chose to continue on a page RamPart thinks is a scam. Don't enter passwords or payment details here." : (resp.headline || "This page has some warning signs.") + (top ? " " + top.title + "." : "") }),
-      el("button", { class: "rampart-link", id: "rampart-why", text: "Why?" }),
-      el("button", { class: "rampart-link", id: "rampart-trust", text: "Don't warn for " + host }),
-      el("button", { class: "rampart-close", id: "rampart-dismiss", "aria-label": "Dismiss", text: "×" }),
+    const m = mount("banner");
+    const why = el("button", { class: "link", text: "Why?" });
+    const trust = el("button", { class: "link", text: "Don't warn for " + host });
+    const dismiss = el("button", { class: "close", "aria-label": "Dismiss", text: "×" });
+    const bar = el("div", { class: "root banner" + (afterContinue ? " banner-danger" : ""), role: "status" }, [
+      el("span", { class: "badge", text: "RamPart" }),
+      el("span", { class: "banner-text", text: afterContinue ? "You chose to continue on a page RamPart thinks is a scam. Don't enter passwords or payment details here." : (resp.headline || "This page has some warning signs.") + (top && top.title ? " " + top.title + "." : "") }),
+      why, trust, dismiss,
     ]);
-    document.documentElement.appendChild(bar);
-    bar.querySelector("#rampart-dismiss").onclick = () => { bar.remove(); api.runtime.sendMessage({ type: "decision", url: PAGE_URL, decision: "dismissedBanner" }); };
-    bar.querySelector("#rampart-trust").onclick = () => { api.runtime.sendMessage({ type: "allowHost", host }); bar.remove(); };
-    bar.querySelector("#rampart-why").onclick = () => {
-      const list = el("ul", { class: "rampart-reasons rampart-banner-reasons" }, (resp.reasons || []).slice(0, 5).map((r) => el("li", {}, [el("strong", { text: r.title }), el("span", { text: " " + (r.detail || "") })])));
-      bar.appendChild(list); bar.querySelector("#rampart-why").remove();
-    };
+    m.root.appendChild(bar);
+    m.attach();
+    onTrusted(m, dismiss, () => { m.remove(); send({ type: "decision", decision: "dismissedBanner" }); });
+    onTrusted(m, trust, async () => { const ok = await send({ type: "allowHost", host }); if (ok && ok.ok) m.remove(); });
+    onTrusted(m, why, () => { bar.appendChild(reasonList("reasons banner-reasons", resp.reasons)); why.remove(); });
+    startWatchdog();
   }
 
-  function showClipboardWarning(resp, text, onCopyAnyway) {
-    const existing = document.querySelector(".rampart-clip"); if (existing) existing.remove();
+  let clipSurface = null;
+  function showClipboardWarning(resp, text, onCopyAnyway, onDontCopy) {
+    if (clipSurface) clipSurface.remove();
     const top = (resp.reasons || [])[0] || {};
-    const box = el("div", { class: "rampart-root rampart-clip", role: "alertdialog" }, [
-      el("div", { class: "rampart-card rampart-card-small" }, [
-        el("div", { class: "rampart-badge", text: "RamPart" }),
+    const m = mount("full"); m.kind = "clip"; clipSurface = m;
+    const block = el("button", { class: "primary", text: "Don't copy" });
+    const allow = el("button", { class: "secondary", text: "Copy anyway" });
+    m.root.appendChild(el("div", { class: "root clip", role: "alertdialog", "aria-label": "RamPart clipboard warning" }, [
+      el("div", { class: "card card-small" }, [
+        el("div", { class: "badge", text: "RamPart" }),
         el("h2", { text: top.title || "This site copied a command to your clipboard" }),
         el("p", { text: top.detail || "Pasting it into Terminal would run it with your permissions." }),
-        el("pre", { class: "rampart-cmd", text: String(text).slice(0, 400) }),
-        el("div", { class: "rampart-actions" }, [
-          el("button", { class: "rampart-primary", id: "rampart-clip-block", text: "Don't copy" }),
-          el("button", { class: "rampart-secondary", id: "rampart-clip-allow", text: "Copy anyway" }),
-        ]),
+        el("pre", { class: "cmd", text: String(text).slice(0, 400) }),
+        el("div", { class: "actions" }, [block, allow]),
       ]),
-    ]);
-    document.documentElement.appendChild(box);
-    box.querySelector("#rampart-clip-block").onclick = () => box.remove();
-    box.querySelector("#rampart-clip-allow").onclick = () => { box.remove(); onCopyAnyway && onCopyAnyway(); };
+    ]));
+    m.attach();
+    block.focus();
+    onTrusted(m, block, () => { m.remove(); clipSurface = null; onDontCopy && onDontCopy(); });
+    onTrusted(m, allow, () => { m.remove(); clipSurface = null; onCopyAnyway && onCopyAnyway(); });
   }
 
   function applyVerdict(resp, stage) {
     if (!resp || !resp.ok || resp.disabled || resp.allowlisted) return;
-    if (resp.action === "block") showInterstitial(resp);
+    if (resp.action === "block") { if (resp.continued) { userContinued = true; if (!surfaces.size) showBanner(resp, true); } else showInterstitial(resp); }
     else if (resp.action === "warn" && stage !== "url-only") showBanner(resp, false);
   }
 
   // MARK: Clipboard interception
 
-  async function screenClipboard(text, allowFn) {
+  async function screenClipboard(text, allowFn, denyFn) {
     if (!text || text.length > 5000) return true;
     if (!H.looksLikeShellCommand(text)) return true;
-    const resp = await api.runtime.sendMessage({ type: "checkClipboard", url: PAGE_URL, text }).catch(() => null);
+    const resp = await send({ type: "checkClipboard", text });
     if (!resp || !resp.ok || resp.action === "allow") return true;
-    showClipboardWarning(resp, text, allowFn);
+    showClipboardWarning(resp, text, allowFn, denyFn);
     return false;
   }
   document.addEventListener("copy", (e) => {
@@ -161,28 +293,52 @@
     e.preventDefault(); e.stopImmediatePropagation();
     screenClipboard(sel, () => { navigator.clipboard && navigator.clipboard.writeText(sel).catch(() => {}); });
   }, true);
-  // Programmatic writes are hooked in the MAIN world (shared/clipboard-main.js) and relayed here.
-  window.addEventListener("message", (e) => {
-    if (e.source !== window || !e.data || e.data.__rampart !== "clipboardWrite") return;
+
+  // Programmatic writes are hooked in the MAIN world (shared/clipboard-main.js) and reach us over a
+  // private MessageChannel (shared/clipboard-bridge.js), never through window messages (N4).
+  // Fallback for browsers whose manifest doesn't load the bridge at document_start yet (Safari, needs
+  // owner): same code, installed late, so a page that forges the handshake first can bypass screening.
+  function lateBridge() {
+    const bytes = new Uint8Array(16); crypto.getRandomValues(bytes);
+    const nonce = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    const ch = new MessageChannel(); const queue = []; let handler = null;
+    ch.port1.onmessage = (m) => {
+      const d = m.data;
+      if (!d || typeof d !== "object" || d.nonce !== nonce || d.type !== "clipboardWrite") return;
+      if (typeof d.id !== "number" || !Number.isSafeInteger(d.id) || typeof d.text !== "string") return;
+      const msg = { id: d.id, text: d.text.slice(0, 5000), sync: d.sync === true };
+      if (handler) handler(msg); else if (queue.length < 50) queue.push(msg);
+    };
+    window.postMessage({ __rampartBridge: true, nonce }, "*", [ch.port2]);
+    return { onWrite(fn) { handler = fn; for (const m of queue.splice(0)) fn(m); },
+             decide(id, allow, pending) { try { ch.port1.postMessage({ type: "clipboardDecision", nonce, id, allow: allow === true, pending: pending === true }); } catch {} } };
+  }
+  const bridge = globalThis.RampartClipboardBridge || lateBridge();
+  bridge.onWrite((w) => {
     window.__rampartClipboardSeen = true;
-    const text = String(e.data.text || "");
-    if (!H.looksLikeShellCommand(text) || H.isDeveloperHost(location.hostname)) { window.postMessage({ __rampart: "clipboardDecision", id: e.data.id, allow: true }, "*"); return; }
-    screenClipboard(text, () => window.postMessage({ __rampart: "clipboardDecision", id: e.data.id, allow: true }, "*")).then((ok) => { if (ok) window.postMessage({ __rampart: "clipboardDecision", id: e.data.id, allow: true }, "*"); else window.postMessage({ __rampart: "clipboardDecision", id: e.data.id, allow: false, pending: true }, "*"); });
+    const text = w.text;
+    if (w.sync) return;   // execCommand("copy"): the capture-phase copy handler above decides
+    if (!H.looksLikeShellCommand(text) || H.isDeveloperHost(location.hostname)) { bridge.decide(w.id, true); return; }
+    screenClipboard(text, () => bridge.decide(w.id, true), () => bridge.decide(w.id, false))
+      .then((ok) => { if (ok) bridge.decide(w.id, true); else bridge.decide(w.id, false, true); });
   });
 
   // MARK: Flow
 
-  api.runtime.onMessage.addListener((msg) => { if (msg && msg.type === "verdict") applyVerdict(msg.resp, msg.stage); });
+  api.runtime.onMessage.addListener((msg, sender) => {
+    if (!sender || sender.id !== api.runtime.id || sender.tab) return;   // only the service worker
+    if (msg && msg.type === "verdict") applyVerdict(msg.resp, msg.stage);
+  });
 
   async function run() {
     // 1. Early URL verdict from the navigation hook (may already be cached).
-    const early = await api.runtime.sendMessage({ type: "urlVerdict", url: PAGE_URL }).catch(() => null);
+    const early = await send({ type: "urlVerdict" });
     if (early) applyVerdict(early, "url");
     // 2. Full page check with signals; repeat once after late-loading overlays appear.
     const check = async () => {
       const signals = collectSignals();
       const tamper = globalThis.RampartTamper ? globalThis.RampartTamper.drain() : [];
-      const resp = await api.runtime.sendMessage({ type: "checkPage", url: PAGE_URL, signals, tamper }).catch(() => null);
+      const resp = await send({ type: "checkPage", signals, tamper });
       applyVerdict(resp, "page");
       return resp;
     };

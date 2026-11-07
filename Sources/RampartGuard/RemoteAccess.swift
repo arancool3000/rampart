@@ -95,7 +95,18 @@ public struct ListeningPort: Codable, Hashable, Sendable {
     public var proto: String
     public var pid: Int32?
     public var process: String
-    public init(port: Int, proto: String = "TCP", pid: Int32? = nil, process: String = "") { self.port = port; self.proto = proto; self.pid = pid; self.process = process }
+    /// Local bind address from lsof ("*", "127.0.0.1", "[::1]"...). Empty when unknown.
+    public var address: String = ""
+    public init(port: Int, proto: String = "TCP", pid: Int32? = nil, process: String = "", address: String = "") {
+        self.port = port; self.proto = proto; self.pid = pid; self.process = process; self.address = address
+    }
+    /// Identity ignores the bind address (added by hx5) so existing comparisons keep their meaning.
+    public static func == (a: ListeningPort, b: ListeningPort) -> Bool { a.port == b.port && a.proto == b.proto && a.pid == b.pid && a.process == b.process }
+    public func hash(into h: inout Hasher) { h.combine(port); h.combine(proto); h.combine(pid); h.combine(process) }
+    public var isLoopback: Bool {
+        let a = address.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        return a.hasPrefix("127.") || a == "::1" || a == "localhost"
+    }
 }
 
 public struct SharingServiceState: Codable, Hashable, Sendable {
@@ -178,7 +189,9 @@ public enum RemoteAccessParsers {
             switch k {
             case "p": pid = Int32(v); case "c": cmd = v
             case "n":
-                if let port = Int(v.split(separator: ":").last ?? ""), !v.contains("->") { out.append(ListeningPort(port: port, pid: pid, process: cmd)) }
+                if !v.contains("->"), let i = v.lastIndex(of: ":"), let port = Int(v[v.index(after: i)...]), (0...65535).contains(port) {
+                    out.append(ListeningPort(port: port, pid: pid, process: cmd, address: String(v[..<i])))
+                }
             default: break
             }
         }
@@ -252,8 +265,25 @@ public struct RemoteAllowance: Codable, Hashable, Identifiable, Sendable {
     public var name: String
     public var created: Date
     public var expires: Date?
-    public init(toolID: String, name: String, created: Date = Date(), expires: Date? = nil) { self.toolID = toolID; self.name = name; self.created = created; self.expires = expires }
-    public func isActive(at now: Date) -> Bool { expires.map { now < $0 } ?? true }
+    /// hx5: Team IDs seen on the tool when the user allowed it. When set, a process claiming the tool's identifier
+    /// but signed by anyone else (or ad-hoc) is not covered by the allowance: a look-alike can't ride on it.
+    public var teamIDs: [String]?
+    /// Longest time-limited allowance (a "1 hour" approval must not become a year through a bad request).
+    public static let maxMinutes = 7 * 24 * 60
+    /// Tolerated backwards clock drift before a time-limited allowance is treated as void.
+    public static let clockSkew: TimeInterval = 300
+    public init(toolID: String, name: String, created: Date = Date(), expires: Date? = nil, teamIDs: [String]? = nil) {
+        self.toolID = toolID; self.name = name; self.created = created; self.expires = expires; self.teamIDs = teamIDs
+    }
+    /// hx5: a time-limited allowance is void if the clock reads earlier than when it was granted (clock rolled back to
+    /// stretch it) or if its window is longer than `maxMinutes` (a forged or corrupt policy). Permanent allowances
+    /// (`expires == nil`) are an explicit user choice and stay active until revoked.
+    public func isActive(at now: Date) -> Bool {
+        guard let e = expires else { return true }
+        if now < created.addingTimeInterval(-Self.clockSkew) { return false }
+        if e.timeIntervalSince(created) > Double(Self.maxMinutes) * 60 + 1 { return false }
+        return now < e
+    }
 }
 
 /// Default deny. Persisted by the daemon (sealed) at `GuardPaths.remotePolicyFile`.
@@ -268,9 +298,13 @@ public struct RemoteAccessPolicy: Codable, Hashable, Sendable {
     public func allowance(for toolID: String, at now: Date) -> RemoteAllowance? {
         allowances.first { $0.toolID == toolID && $0.isActive(at: now) }
     }
-    public mutating func allow(_ tool: RemoteTool, minutes: Int?, now: Date = Date()) {
+    /// `minutes` nil = until revoked; otherwise clamped to 1...RemoteAllowance.maxMinutes (0 or negative is never
+    /// "forever"). `pinTeamIDs`: the daemon passes the Team IDs of the running tool so the allowance covers only it.
+    public mutating func allow(_ tool: RemoteTool, minutes: Int?, now: Date = Date(), pinTeamIDs: [String]? = nil) {
         allowances.removeAll { $0.toolID == tool.id }
-        allowances.append(RemoteAllowance(toolID: tool.id, name: tool.name, created: now, expires: minutes.map { now.addingTimeInterval(Double($0) * 60) }))
+        let m = minutes.map { min(max($0, 1), RemoteAllowance.maxMinutes) }
+        let pins = pinTeamIDs.map { Array(Set($0.filter { !$0.isEmpty })).sorted() }.flatMap { $0.isEmpty ? nil : $0 }
+        allowances.append(RemoteAllowance(toolID: tool.id, name: tool.name, created: now, expires: m.map { now.addingTimeInterval(Double($0) * 60) }, teamIDs: pins))
     }
     public mutating func revoke(_ toolID: String) { allowances.removeAll { $0.toolID == toolID } }
     public mutating func prune(now: Date = Date()) { allowances.removeAll { !$0.isActive(at: now) } }
@@ -285,6 +319,10 @@ public struct RemoteAccessReport: Codable, Hashable, Sendable {
     public var unknownListeners: [ListeningPort]   // watched ports held by something we could not identify
     public var blockedPorts: [Int]
     public var note: String
+    /// hx5: non-loopback listeners held by an unsigned or ad-hoc signed program (no Team ID). A renamed or re-signed
+    /// remote tool on a non-default port lands here instead of disappearing. Only filled when the probe supplies
+    /// signing info (the daemon enriches processes); weak signal, reported at low severity.
+    public var unsignedListeners: [ListeningPort] = []
     public var activeUnapproved: [RemoteToolFinding] { findings.filter { $0.active && !$0.allowed } }
 }
 
@@ -331,9 +369,23 @@ public final class RemoteAccessMonitor: @unchecked Sendable {
             guard let t = RemoteToolCatalogue.tool(id) else { continue }
             if on == true || byTool[id] != nil { var f = slot(t); f.serviceEnabled = on; byTool[id] = f }
         }
+        let procByPID = Dictionary(procs.map { ($0.pid, $0) }, uniquingKeysWith: { a, _ in a })
+        let claimed = Set(byTool.values.flatMap(\.pids))
+        var unsigned: [ListeningPort] = []
+        for l in listeners where !l.isLoopback {
+            guard let pid = l.pid, !claimed.contains(pid), let pr = procByPID[pid], pr.signingID != nil, !pr.isPlatformBinary,
+                  (pr.teamID ?? "").isEmpty, !pr.path.hasPrefix("/System/"), !pr.path.hasPrefix("/usr/libexec/"), !pr.path.hasPrefix("/usr/sbin/") else { continue }
+            if unsigned.count < 64, !unknown.contains(l) { unsigned.append(l) }
+        }
         var findings = byTool.values.map { f -> RemoteToolFinding in
             var f = f
-            if let a = policy.allowance(for: f.toolID, at: now) { f.allowed = true; f.allowedUntil = a.expires }
+            if let a = policy.allowance(for: f.toolID, at: now) {
+                // hx5: a pinned allowance covers only processes signed by the Team IDs seen when it was granted.
+                let pinned = a.teamIDs ?? []
+                let impostor = !pinned.isEmpty && f.pids.contains { pid in !pinned.contains(procByPID[pid]?.teamID ?? "") }
+                if !impostor { f.allowed = true; f.allowedUntil = a.expires }
+                else { f.matchedBy = Array(Set(f.matchedBy + ["signer differs from the approved one"])).sorted() }
+            }
             if !f.isAppleService && !f.pids.isEmpty && scamHit { f.scamContext = true; f.scamReason = scamReason }
             f.severity = !f.active ? .info : f.allowed ? .low : f.scamContext ? .critical : f.isAppleService ? .medium : .high
             f.pids.sort(); f.listeningPorts = Array(Set(f.listeningPorts)).sorted()
@@ -345,7 +397,9 @@ public final class RemoteAccessMonitor: @unchecked Sendable {
         } : []
         return RemoteAccessReport(generatedAt: now, lockdownEnabled: policy.lockdownEnabled, findings: findings, sharing: sharing, inbound: inbound,
                                   unknownListeners: unknown, blockedPorts: blocked,
-                                  note: "Remote access is blocked until you allow a tool. Allowances can be time-limited. Apple services are turned off in System Settings rather than killed.")
+                                  note: "Remote access is blocked until you allow a tool. Allowances can be time-limited. Apple services are turned off in System Settings rather than killed. " +
+                                        "A remote tool that is renamed, re-signed and moved to another port may not be recognised; unsigned programs accepting outside connections are listed separately.",
+                                  unsignedListeners: unsigned)
     }
 
     /// Detections for the daemon's feed: one per active unapproved tool (and one per unknown listener on a watched port).
@@ -359,6 +413,11 @@ public final class RemoteAccessMonitor: @unchecked Sendable {
             if f.scamContext { ev.append(Evidence(source: .behaviour, title: "Tech-support scam pattern", detail: f.scamReason + ". Scammers ask victims to install remote-control tools.", score: 85)) }
             out.append(Detection(path: f.paths.first, pid: f.pids.first, name: "Unapproved remote access: \(f.name)", category: .backdoor,
                                  severity: f.severity, confidence: min(99, ev.map(\.score).max() ?? 60), evidence: ev))
+        }
+        for l in r.unsignedListeners {
+            out.append(Detection(pid: l.pid, name: "Unsigned program accepting outside connections on port \(l.port)", category: .suspicious, severity: .low, confidence: 40,
+                                 evidence: [Evidence(source: .network, title: "\(l.process.isEmpty ? "A program" : l.process) listens on \(l.address.isEmpty ? "*" : l.address):\(l.port)",
+                                                     detail: "no Team ID signature; remote-control tools that are renamed or moved to other ports look like this", score: 40)]))
         }
         for l in r.unknownListeners {
             out.append(Detection(pid: l.pid, name: "Unknown listener on remote-access port \(l.port)", category: .suspicious, severity: .medium, confidence: 50,
@@ -419,8 +478,13 @@ public struct RemoteAccessEnforcer: Sendable {
         p.pfRules = firewall.anchorRules(blockedPorts: r.blockedPorts)
         p.commands += firewall.loadCommands()
         // Hard guard: never signal macOS system processes, whatever matched upstream.
+        // hx5: "/usr/" used to cover /usr/local (Homebrew, user-writable): a remote tool installed there was never stopped.
         let protectedPrefixes = ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"]
-        func isSystem(_ pid: Int32) -> Bool { pid <= 1 || protectedPrefixes.contains { Self.processPath(pid).hasPrefix($0) } }
+        func isSystem(_ pid: Int32) -> Bool {
+            let path = Self.processPath(pid)
+            if path.hasPrefix("/usr/local/") { return pid <= 1 }
+            return pid <= 1 || protectedPrefixes.contains { path.hasPrefix($0) }
+        }
         p.suspendPIDs.removeAll(where: isSystem); p.killPIDs.removeAll(where: isSystem)
         if !dryRun {
             for pid in p.suspendPIDs where kill(pid, SIGSTOP) { p.signalled.append(pid) }

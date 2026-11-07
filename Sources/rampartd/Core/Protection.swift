@@ -1,6 +1,7 @@
 import Foundation
 import RampartShared
 import RampartEngine
+import RampartBehaviour
 
 /// Central coordinator: owns the store and services, applies remediation policy, fans detections out to subscribers.
 final class Protection {
@@ -36,7 +37,9 @@ final class Protection {
         allowRules = AllowRuleStore(url: runtime.root.appendingPathComponent("allowrules.json"))
         applyAllowRules()
         services.onWebBlock = { [weak self] domain, list in
-            self?.activity.add(.webBlock, "Blocked \(domain)", detail: list.map { "Listed in \($0)" } ?? "", outcome: "blocked", severity: .low)
+            self?.activity.add(.webBlock, "Blocked \(domain)", detail: list.map { "Listed in \($0)" } ?? "", outcome: "blocked", severity: .low,
+                               event: .dnsBlocked, actor: .system, target: domain, rule: list,
+                               reason: list.map { "\(domain) is on the \($0) blocklist." }, action: "Answered the DNS lookup with “no such site”.")
         }
     }
 
@@ -70,6 +73,10 @@ final class Protection {
         }
         var d = store.add(triaged)
         let cfg = runtime.config
+        // Activity facts: resolved now, while the process may still be running.
+        let proc = d.confidence >= 30 ? ActivityFacts.process(pid: d.pid) : nil
+        let rr = ActivityFacts.ruleAndReason(d)
+        var remediationSummary: String?
         if remediate && d.confidence >= 90 && !d.resolved {
             var actions: [String] = []
             if cfg.killMaliciousProcesses, let pid = d.pid, pid > 1, let killer = services.processes {
@@ -87,18 +94,35 @@ final class Protection {
             }
             if !actions.isEmpty {
                 logInfo("remediation for \(d.name) at \(d.path ?? "pid \(d.pid ?? 0)"): \(actions.joined(separator: "; "))")
+                remediationSummary = actions.joined(separator: "; ")
                 if d.resolved {
-                    activity.add(.quarantine, "Quarantined \(d.name)", detail: d.path ?? "", outcome: "quarantined", severity: d.severity, detectionID: d.id)
+                    activity.add(.quarantine, "Quarantined \(d.name)", detail: d.path ?? "", outcome: "quarantined", severity: d.severity,
+                                 detectionID: d.id, event: .quarantined, actor: .system, process: proc, target: d.path,
+                                 rule: rr.rule, reason: rr.reason, score: d.confidence,
+                                 action: "Moved the file to quarantine automatically (confidence \(d.confidence)).", sha256: d.sha256,
+                                 facts: ["threat": d.name])
+                }
+                if actions.contains(where: { $0.lowercased().contains("killed") }) {
+                    activity.add(.realtime, "Stopped \(proc?.name ?? d.name)", outcome: "stopped", severity: d.severity, detectionID: d.id,
+                                 event: .processStopped, actor: .system, process: proc, target: d.path, rule: rr.rule, reason: rr.reason,
+                                 score: d.confidence, action: actions.joined(separator: "; "), sha256: d.sha256, facts: ["threat": d.name])
                 }
             }
         }
         if d.confidence >= 30 {
-            activity.add(.detection, d.name, detail: d.path ?? d.pid.map { "process \($0)" } ?? "",
+            let ev = ActivityFacts.event(for: d)
+            let tamper = ActivityFacts.tamperKind(d)
+            activity.add(ev == .tamper ? .tamper : ev == .remoteAccessAttempt ? .remoteAccess : .detection, d.name,
+                         detail: d.path ?? d.pid.map { "process \($0)" } ?? "",
                          outcome: d.resolved ? "contained" : (d.confidence >= 60 ? "needs review" : "logged"),
-                         severity: d.severity, detectionID: d.id)
+                         severity: d.severity, detectionID: d.id, event: ev, actor: .system, process: proc, target: d.path,
+                         rule: tamper ?? rr.rule, reason: rr.reason, score: d.confidence,
+                         action: remediationSummary.map { "Automatic response: \($0)." }, sha256: d.sha256,
+                         facts: ["threat": d.name, "category": d.category.rawValue])
         }
         logInfo("detection \(d.name) conf=\(d.confidence) path=\(d.path ?? "-") resolved=\(d.resolved)")
         if d.confidence >= 60 || d.category == .test { broadcast(.event(d)) }
+        Emergency.consider(d, protection: self)
         return d
     }
 
@@ -115,22 +139,37 @@ final class Protection {
 
     // MARK: operations
 
-    func scan(paths: [String], quick: Bool, progress: @escaping ScanProgress, cancelled: @escaping () -> Bool = { false }) -> ScanOutcome {
+    func scan(paths: [String], quick: Bool, actor: ActivityActor = .user, progress: @escaping ScanProgress, cancelled: @escaping () -> Bool = { false }) -> ScanOutcome {
         let targets = paths.isEmpty ? (quick ? runtime.quickScanPaths : Self.fullScanRoots) : (paths == ["/"] ? Self.fullScanRoots : paths)
         scanLock.lock(); activeScans += 1; scanLock.unlock()
         defer { scanLock.lock(); activeScans -= 1; scanLock.unlock() }
         logInfo("scan start (\(quick ? "quick" : "custom/full")) \(targets.count) roots")
         let token = scanControl.begin()
         defer { scanControl.end(token) }
-        activity.add(.scan, quick ? "Quick scan started" : "Scan started", detail: targets.prefix(5).joined(separator: ", ") + (targets.count > 5 ? " …" : ""))
+        let scanType = paths.isEmpty ? (quick ? "Quick scan" : "Full scan") : (paths == ["/"] ? "Full scan" : "Custom scan")
+        activity.add(.scan, quick ? "Quick scan started" : "Scan started", detail: targets.prefix(5).joined(separator: ", ") + (targets.count > 5 ? " …" : ""),
+                     event: .scanStarted, actor: actor, count: targets.count, facts: ["scanType": scanType])
         var out = services.scanner.scan(paths: targets, progress: progress, cancelled: { cancelled() || self.scanControl.isCancelled(token) })
         out.detections = out.detections.compactMap { handle($0) }
+        // Quick and Full scans also verify Apple's own apps (see SystemIntegrity.swift).
+        if paths.isEmpty || paths == ["/"], !(cancelled() || scanControl.isCancelled(token)) {
+            let sys = SystemIntegrity.verifyAppleApps()
+            out.detections += sys.compactMap { handle($0) }
+            if sys.isEmpty { logInfo("system integrity: \(SystemIntegrity.appleApps().count) Apple apps verified") }
+        }
         DetectionReevaluator.resolveStale(self)
         let wasCancelled = scanControl.isCancelled(token)
+        let secs = String(format: "%.1f", out.seconds)
+        let failedAll = out.scanned == 0 && out.errors > 0
         activity.add(.scan, wasCancelled ? "Scan cancelled" : (quick ? "Quick scan finished" : "Scan finished"),
-                     detail: "\(out.scanned) files in \(String(format: "%.1f", out.seconds)) s",
+                     detail: "\(out.scanned) files in \(secs) s",
                      outcome: out.detections.isEmpty ? "no threats" : "\(out.detections.count) found",
-                     severity: out.detections.isEmpty ? .info : .medium)
+                     severity: out.detections.isEmpty ? .info : .medium,
+                     event: wasCancelled ? .scanCancelled : (failedAll ? .scanFailed : .scanFinished), actor: actor,
+                     reason: failedAll ? "None of the \(out.errors) files could be read. Full Disk Access may be off." : nil,
+                     count: out.scanned, found: out.detections.count,
+                     facts: ["scanType": scanType, "seconds": secs, "threats": out.detections.prefix(5).map(\.name).joined(separator: ", "),
+                             "unreadable files": out.errors > 0 ? String(out.errors) : ""])
         state.update { s in s.lastScan = Date(); if quick || paths.isEmpty { s.lastQuickScan = Date() } }
         logInfo("scan done: \(out.scanned) files, \(out.detections.count) detections, \(String(format: "%.1f", out.seconds)) s")
         return out
@@ -148,6 +187,7 @@ final class Protection {
                                 xprotectVersion: Util.xprotectVersion, securityScore: st.securityScore,
                                 openDetections: store.openCount)
         status.definitionsUpdated = st.lastUpdate
+        status.ipcVersion = IPC.version
         return status
     }
 
@@ -173,17 +213,25 @@ final class Protection {
             let added = items.filter { !base.contains($0.id) }
             let removed = base.subtracting(ids)
             for item in added.prefix(20) {
-                activity.add(.persistence, "New \(item.kind.rawValue): \(item.label)", detail: item.target ?? item.location, outcome: "recorded")
+                activity.add(.persistence, "New \(item.kind.rawValue): \(item.label)", detail: item.target ?? item.location, outcome: "recorded",
+                             event: .persistenceAdded, actor: .system, target: item.location, facts: ["label": item.label, "kind": item.kind.rawValue, "runs": item.target ?? ""])
             }
-            if !removed.isEmpty { activity.add(.persistence, "\(removed.count) persistence item(s) removed", outcome: "recorded") }
+            if !removed.isEmpty { activity.add(.persistence, "\(removed.count) startup item(s) removed", outcome: "recorded", event: .persistenceRemoved, actor: .system, count: removed.count) }
         }
         for d in findings { handle(d) }
+        // Launch items that pretend to be Apple's (com.apple.* label or Apple-looking name, non-Apple target).
+        for item in items {
+            guard let e = AppleImpersonation.assess(item: item) else { continue }
+            let conf = min(89, e.score)
+            handle(Detection(path: item.target ?? item.location, name: "Apple impersonation: \(LogRedact.clean(item.label, max: 80))",
+                             category: .persistence, severity: conf >= 60 ? .high : .medium, confidence: conf, evidence: [e]))
+        }
         lastPersistence = items
         if updateBaseline { state.update { $0.persistenceBaseline = Array(ids).sorted() } }
         return items
     }
 
-    func updateSignatures() -> String {
+    func updateSignatures(actor: ActivityActor = .user) -> String {
         guard let u = services.updater else { return "no updatable engines in this build" }
         let summary = u.update()
         let failed: Bool = {
@@ -193,7 +241,9 @@ final class Protection {
         // Only record a successful update time, so "updated never" stays accurate after offline attempts.
         state.update { if !failed { $0.lastUpdate = Date() }; $0.lastUpdateSummary = summary }
         activity.add(.update, failed ? "Protection partly updated" : "Protection updated", detail: summary,
-                     outcome: failed ? "will retry" : "ok", severity: .info)
+                     outcome: failed ? "will retry" : "ok", severity: failed ? .low : .info,
+                     event: failed ? .definitionsFailed : .definitionsUpdated, actor: actor,
+                     facts: ["engine version": services.scanner.signatureVersion])
         logInfo("update: \(summary)")
         return summary
     }
@@ -207,7 +257,9 @@ final class Protection {
             if allow { self.allow(sha256: h) }
         }
         logInfo("restored \(id.uuidString) to \(path)\(allow ? " (trusted)" : "")")
-        activity.add(.restore, "Restored \(rec?.detectionName ?? "item")", detail: path, outcome: allow ? "restored and trusted" : "restored")
+        activity.add(.restore, "Restored \(rec?.detectionName ?? "item")", detail: path, outcome: allow ? "restored and trusted" : "restored",
+                     event: .restored, actor: .user, target: path, sha256: rec?.sha256, refID: id.uuidString,
+                     facts: ["threat": rec?.detectionName ?? ""])
         return path
     }
 

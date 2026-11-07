@@ -115,6 +115,103 @@ function pageSignalsVerdict(signals) {
   return out;
 }
 
+// MARK: X3-4 / W-X6-1 rules (harden-hx6 follow-up). These also run when the native host answers:
+// background.js merges them in, so a page the host scores low still gets flagged. Proposal for the
+// matching RampartWeb rules: docs/security/needs-web.md (X3-4, W-X6-1).
+
+const DISABLE_AV = /\b(disable|turn\s+off|switch\s+off|pause|deactivate|uninstall)\b[^\n]{0,20}?\b(protection|antivirus|anti-virus|real-?time|rampart|defender|firewall|security\s+software|xprotect|gatekeeper)/gi;
+const CALL_SUPPORT = /\b(call|contact|dial|phone|ring)\b[^\n]{0,20}?\b(support|technician|apple|microsoft|help\s*desk|helpline|toll[-\s]?free|our\s+(team|experts?|agents?))/i;
+const VIRUS_COUNT = /\b\d{1,4}\s+(viruses|threats|infections|trojans|spyware|malware\s+(items|files|threats))\b/i;
+const FAKE_UPDATE = /\b(?:your\s+)?(?:version\s+of\s+)?(google\s+chrome|chrome|safari|firefox|microsoft\s+edge|edge|flash(?:\s+player)?|browser|macos|mac\s?os)\s+(?:is\s+)?(?:out\s+of\s+date|outdated|needs?\s+(?:an?\s+)?update|requires?\s+an?\s+update|critical\s+update)/i;
+const GATEKEEPER_BYPASS = /(app\s+is\s+damaged|can.?t\s+be\s+opened|cannot\s+be\s+opened|unidentified\s+developer)[\s\S]{0,300}?(xattr\s+-c|xattr\s+-d|right.?click[\s\S]{0,40}?open|open\s+anyway|sudo\s+spctl)/i;
+const BARE_XATTR = /\bxattr\s+-(c|cr|rc|d)\b/i;
+const INSTALLER_PATH = /\.(dmg|pkg|mpkg|zip|app|iso)$/i;
+const UPDATE_BRANDS = { chrome: ["google.com"], "google chrome": ["google.com"], safari: ["apple.com"], macos: ["apple.com"], "mac os": ["apple.com"],
+  firefox: ["mozilla.org", "mozilla.net", "firefox.com"], edge: ["microsoft.com"], "microsoft edge": ["microsoft.com"], flash: ["adobe.com"], "flash player": ["adobe.com"] };
+const ALL_UPDATE_DOMAINS = ["google.com", "apple.com", "mozilla.org", "mozilla.net", "firefox.com", "microsoft.com", "adobe.com"];
+const APPS = {
+  "google chrome": ["google.com"], chrome: ["google.com"], firefox: ["mozilla.org", "mozilla.net", "firefox.com"], zoom: ["zoom.us", "zoom.com"],
+  notion: ["notion.so", "notion.com", "notion-static.com"], slack: ["slack.com", "slack-edge.com"], "microsoft teams": ["microsoft.com", "office.com"],
+  "microsoft office": ["microsoft.com", "office.com"], discord: ["discord.com", "discordapp.net", "discordapp.com"], telegram: ["telegram.org"],
+  whatsapp: ["whatsapp.com", "whatsapp.net"], spotify: ["spotify.com", "scdn.co"], vlc: ["videolan.org"], "1password": ["1password.com"],
+  "brave browser": ["brave.com"], anydesk: ["anydesk.com"], teamviewer: ["teamviewer.com"], "obs studio": ["obsproject.com"], "ledger live": ["ledger.com"],
+  metamask: ["metamask.io"], "visual studio code": ["microsoft.com", "visualstudio.com"], vscode: ["microsoft.com", "visualstudio.com"],
+  chatgpt: ["openai.com", "chatgpt.com"], "claude desktop": ["anthropic.com", "claude.ai"], tradingview: ["tradingview.com"], photoshop: ["adobe.com"],
+  "adobe acrobat": ["adobe.com"], "adobe reader": ["adobe.com"], "logi options": ["logitech.com", "logi.com"], "signal desktop": ["signal.org"],
+};
+const DOWNLOAD_MIRRORS = new Set(["github.com", "githubusercontent.com", "sourceforge.net", "apple.com"]);
+
+function registrableOf(urlOrHost) {
+  let h = urlOrHost;
+  try { if (/^[a-z][a-z0-9+.-]*:/i.test(h)) h = new URL(h).hostname; } catch { return null; }
+  const sp = splitHost(String(h || "").toLowerCase().replace(/\.$/, ""));
+  return sp ? sp.registrable : null;
+}
+function installerLinks(signals) {
+  const out = [];
+  for (const href of (signals.downloadLinks || []).slice(0, 40)) {
+    try { const u = new URL(href); if (/^https?:$/.test(u.protocol) && INSTALLER_PATH.test(u.pathname)) out.push(u); } catch {}
+  }
+  return out;
+}
+function nearAny(text, re, others, radius) {
+  re.lastIndex = 0;
+  let m, n = 0;
+  while ((m = re.exec(text)) && n++ < 50) {
+    const win = text.slice(Math.max(0, m.index - radius), m.index + m[0].length + radius);
+    if (others.some((o) => o.test(win))) return true;
+  }
+  return false;
+}
+
+/** X3-4 + W-X6-1. `url` is the page URL (used to skip the brand's own site and developer sites). */
+function extraPageSignals(signals, url) {
+  const out = [];
+  if (!signals) return out;
+  const pageReg = registrableOf(url || "");
+  const pageHost = (() => { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } })();
+  const dev = isDeveloperHost(pageHost);
+  const overlay = String(signals.overlayText || "");
+  const text = [signals.title, signals.h1, overlay, signals.visibleText].map((x) => String(x || "")).join("\n");
+
+  // X3-4: a page (often styled as RamPart or another antivirus) telling the user to switch protection off
+  // and call support, or claiming a virus count. Proximity keeps a security blog that merely mentions
+  // "disable antivirus" in prose from matching.
+  if (nearAny(text, DISABLE_AV, [CALL_SUPPORT, VIRUS_COUNT, SCAREWARE], 400))
+    out.push({ title: "Fake security alert telling you to turn off protection", detail: "No real antivirus asks you to switch it off. RamPart can't be disabled by a website.", score: 70, rule: "page.fakeav" });
+
+  // W-X6-1 (1): fake "your browser is out of date" page.
+  const fu = FAKE_UPDATE.exec(text);
+  if (fu) {
+    const brand = fu[1].toLowerCase().replace(/\s+/g, " ");
+    const own = brand === "browser" ? ALL_UPDATE_DOMAINS : (UPDATE_BRANDS[brand] || ALL_UPDATE_DOMAINS);
+    if (!own.includes(pageReg)) {
+      const offBrand = installerLinks(signals).some((u) => !own.includes(registrableOf(u.hostname)));
+      const flash = brand.startsWith("flash");
+      out.push({ title: flash ? "Fake Flash Player update" : "Fake browser or system update", detail: flash ? "Flash Player was discontinued in 2020. Any page offering a Flash update is a trap." : "Browsers and macOS update themselves from their own settings, never from a web page" + (offBrand ? ", and this download isn't from the vendor's site." : "."),
+                score: flash || offBrand ? 85 : 55, rule: "page.fakeupdate" });
+    }
+  }
+
+  // W-X6-1 (2): instructions to defeat Gatekeeper ("app is damaged ... run xattr -c").
+  if (!dev) {
+    if (GATEKEEPER_BYPASS.test(text)) out.push({ title: "Tells you to bypass macOS's malware check", detail: "\"App is damaged\" followed by xattr, spctl or Open Anyway steps is how fake downloads get past Gatekeeper.", score: 80, rule: "page.gatekeeper.bypass" });
+    else if (BARE_XATTR.test(String(signals.visibleText || "") + "\n" + overlay)) out.push({ title: "Tells you to remove macOS's download protection", detail: "The xattr command strips the quarantine flag that lets macOS check a download.", score: 50, rule: "page.gatekeeper.bypass" });
+  }
+
+  // W-X6-1 (3): page titled after a well-known app, linking an installer that isn't from the developer.
+  const named = (String(signals.title || "") + " \n " + String(signals.h1 || "")).toLowerCase();
+  for (const [app, domains] of Object.entries(APPS)) {
+    const re = new RegExp("(^|[^a-z0-9])" + app.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^a-z0-9]|$)");
+    if (!re.test(named)) continue;
+    if (domains.includes(pageReg) || DOWNLOAD_MIRRORS.has(pageReg) || dev) break;
+    const bad = installerLinks(signals).find((u) => { const r = registrableOf(u.hostname); return r && !domains.includes(r) && !DOWNLOAD_MIRRORS.has(r); });
+    if (bad) out.push({ title: "Download is not from the developer's site", detail: "This page is named after " + app + " but its installer comes from " + registrableOf(bad.hostname) + ". Get " + app + " from " + domains[0] + ".", score: 40, rule: "page.fakedownload" });
+    break;
+  }
+  return out;
+}
+
 function combine(signals) {
   let product = 1;
   const byCat = {};
@@ -130,7 +227,7 @@ function isDeveloperHost(host) { if (!host) return false; host = host.toLowerCas
 function localVerdict(req) {
   let signals = [];
   if (req.type === "checkURL" || req.type === "checkPage") signals = signals.concat(urlSignals(req.url));
-  if (req.type === "checkPage" && req.signals) signals = signals.concat(pageSignalsVerdict(req.signals));
+  if (req.type === "checkPage" && req.signals) signals = signals.concat(pageSignalsVerdict(req.signals), extraPageSignals(req.signals, req.url));
   if (req.type === "checkClipboard") {
     const host = (() => { try { return new URL(req.url).hostname; } catch { return null; } })();
     if (SHELL.test(req.text || "")) { const dev = isDeveloperHost(host), dang = DANGEROUS.test(req.text); signals.push({ title: dang ? "Copied a command that downloads and runs code" : "Copied a shell command", detail: dev ? "Developer site; read it before you run it." : "A non-developer site put a shell command on your clipboard. Don't paste it into Terminal.", score: dev ? (dang ? 25 : 5) : (dang ? 90 : 60) }); }
@@ -144,5 +241,5 @@ function localVerdict(req) {
            brand: (signals.find((s) => s.brand) || {}).brand, tips: [], fallback: true };
 }
 
-const RampartHeuristics = { localVerdict, urlSignals, pageSignalsVerdict, isDeveloperHost, looksLikeShellCommand: (t) => SHELL.test(t || ""), CLICKFIX };
+const RampartHeuristics = { localVerdict, urlSignals, pageSignalsVerdict, extraPageSignals, combine, verdictFromScore, actionFor, splitHost, registrableOf, isDeveloperHost, looksLikeShellCommand: (t) => SHELL.test(t || ""), CLICKFIX };
 if (typeof globalThis !== "undefined") globalThis.RampartHeuristics = RampartHeuristics;

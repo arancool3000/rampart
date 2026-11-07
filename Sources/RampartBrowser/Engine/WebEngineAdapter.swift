@@ -13,6 +13,8 @@ final class WebEngineAdapter: @unchecked Sendable {
     private(set) var blocklistNames: [String] = []
     private(set) var blocklistDomains = 0
     private var cache: [String: URLFacts] = [:]
+    /// hx6: hosts the user clicked "Continue anyway" for in this app session. Never written to disk.
+    private var sessionAllowed: Set<String> = []
 
     init(allowlistURL: URL? = nil) {
         allowlist = allowlistURL.map { FileWebAllowlist(url: $0) } ?? FileWebAllowlist()
@@ -53,7 +55,7 @@ final class WebEngineAdapter: @unchecked Sendable {
         var hit: String? = nil
         for bl in a.blocklists { if let h = bl.lookup(host: host) { hit = h.source; break } }
         let facts = URLFacts(blocklistHit: hit, scamScore: report.score, scamVerdict: report.verdict,
-                             brandMatch: report.brandMatch, allowlisted: allowlist.isAllowed(host: host))
+                             brandMatch: report.brandMatch, allowlisted: allowlist.isAllowed(host: host) || isSessionAllowed(host))
         lock.lock(); if cache.count > 2000 { cache.removeAll() }; cache[key] = facts; lock.unlock()
         return facts
     }
@@ -67,7 +69,18 @@ final class WebEngineAdapter: @unchecked Sendable {
         allowlist.allow(host: host)
         lock.lock(); cache.removeAll(); lock.unlock()
     }
-    func isAllowed(host: String) -> Bool { allowlist.isAllowed(host: host) }
+    func isAllowed(host: String) -> Bool { allowlist.isAllowed(host: host) || isSessionAllowed(host) }
+
+    /// Exact host only (no subdomains), memory only. Blocklist hits are never affected by it.
+    func allowForSession(host: String) {
+        let h = host.lowercased()
+        guard !h.isEmpty else { return }
+        lock.lock(); sessionAllowed.insert(h); cache.removeAll(); lock.unlock()
+    }
+    private func isSessionAllowed(_ host: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sessionAllowed.contains(host.lowercased())
+    }
 
     /// Does the page's form target look like a brand it isn't? Used by the credential-form finding.
     func brandImpersonated(byHost host: String) -> String? {

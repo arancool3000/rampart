@@ -121,14 +121,20 @@ extension Protection {
         if let why = AllowRuleStore.validate(r) { throw ServiceError.failed(why) }
         let saved = allowRules.add(r)
         applyAllowRules()
-        activity.add(.settings, "Allowed \(r.name.isEmpty ? r.value : r.name)", detail: "\(r.scope.rawValue): \(saved.value)", outcome: "allow rule added")
+        activity.add(.settings, "Allowed \(r.name.isEmpty ? r.value : r.name)", detail: "\(r.scope.rawValue): \(saved.value)", outcome: "allow rule added",
+                     event: .allowRuleAdded, actor: .user, target: r.scope == .folder ? saved.value : nil,
+                     sha256: r.scope == .fileHash ? saved.value : nil, refID: saved.id.uuidString,
+                     facts: ["name": r.name.isEmpty ? saved.value : r.name, "scope": r.scope.rawValue])
         return saved
     }
 
     func removeAllowRule(_ id: UUID) throws {
+        let old = allowRules.all().first { $0.id == id }
         guard allowRules.remove(id) else { throw ServiceError.notFound("allow rule \(id)") }
         applyAllowRules()
-        activity.add(.settings, "Removed an allow rule", outcome: "allow rule removed")
+        activity.add(.settings, old.map { "Removed rule for \($0.name.isEmpty ? $0.value : $0.name)" } ?? "Removed an allow rule", outcome: "allow rule removed",
+                     event: .allowRuleRemoved, actor: .user, refID: id.uuidString,
+                     facts: old.map { ["name": $0.name.isEmpty ? $0.value : $0.name, "scope": $0.scope.rawValue] })
     }
 
     // MARK: settings
@@ -179,7 +185,8 @@ extension Protection {
         if old.autoUpdate != cfg.autoUpdate { changes.append("automatic updates \(cfg.autoUpdate ? "on" : "off")") }
         if old.notifyThreats != cfg.notifyThreats || old.notifyInfo != cfg.notifyInfo { changes.append("notifications changed") }
         if old.blockTrackers != cfg.blockTrackers { changes.append("tracker blocking \(cfg.blockTrackers ? "on" : "off")") }
-        activity.add(.settings, "Settings changed", detail: changes.isEmpty ? "no effective change" : changes.joined(separator: "; "), outcome: "saved")
+        activity.add(.settings, "Settings changed", detail: changes.isEmpty ? "no effective change" : changes.joined(separator: "; "), outcome: "saved",
+                     event: .settingsChanged, actor: .user, facts: ["changes": changes.joined(separator: "; ")])
         return settings()
     }
 
@@ -227,7 +234,8 @@ extension Protection {
         if record { runtime.updateConfig { $0.realtime = on } }
         guard let rt = services.realtime else { return }
         if on { startRealtime() } else { rt.stop() }
-        if record { activity.add(.settings, "Real-time protection \(on ? "on" : "off")", outcome: on ? "on" : "off", severity: on ? .info : .medium) }
+        if record { activity.add(.settings, "Real-time protection \(on ? "on" : "off")", outcome: on ? "on" : "off", severity: on ? .info : .medium,
+                                event: .protectionToggled, actor: .user, facts: ["setting": "Real-time protection", "value": on ? "on" : "off"]) }
         logInfo("real-time protection \(on ? "on" : "off")")
     }
 
@@ -249,11 +257,13 @@ extension Protection {
         let item = try lookupPersistence(id)
         do {
             let summary = try r.remediate(item)
-            activity.add(.persistence, "Removed \(item.item.kind.rawValue): \(item.item.label)", detail: summary, outcome: "removed", severity: .medium)
+            activity.add(.persistence, "Removed \(item.item.kind.rawValue): \(item.item.label)", detail: summary, outcome: "removed", severity: .medium,
+                         event: .startupItemRemoved, actor: .user, target: item.item.location, action: summary, facts: ["label": item.item.label])
             _ = try? persistence()
             return summary
         } catch {
-            activity.add(.persistence, "Could not remove \(item.item.label)", detail: error.localizedDescription, outcome: "failed", severity: .medium)
+            activity.add(.persistence, "Could not remove \(item.item.label)", detail: error.localizedDescription, outcome: "failed", severity: .medium,
+                         event: .startupItemRemoveFailed, actor: .user, target: item.item.location, reason: error.localizedDescription, facts: ["label": item.item.label])
             throw error
         }
     }
@@ -272,11 +282,13 @@ extension Protection {
         }
         if cpuSample == nil || now.timeIntervalSince(cpuSample!.wall) >= 0.5 { cpuSample = (now, cpu) }
         pct = (pct * 10).rounded() / 10
-        return HealthReport(mode: runtime.userMode ? "user" : "root", version: Product.version,
+        var h = HealthReport(mode: runtime.userMode ? "user" : "root", version: Product.version,
                             uptimeSeconds: now.timeIntervalSince(started), cpuPercent: pct,
                             residentMB: (Util.residentMB * 10).rounded() / 10,
                             sources: services.realtime?.sources ?? [:], lastErrors: DLog.shared.recentProblems,
                             sourceCPUSeconds: services.sourceCPU?() ?? [:])
+        h.ipcVersion = IPC.version
+        return h
     }
 }
 
@@ -291,11 +303,11 @@ extension Protection {
     func pauseProtection(minutes: Int) {
         let m = max(1, min(minutes, 24 * 60))
         setRealtime(false, record: false)
-        activity.add(.settings, "Protection paused for \(m) min", outcome: "paused", severity: .medium)
+        activity.add(.settings, "Protection paused for \(m) min", outcome: "paused", severity: .medium, event: .protectionPaused, actor: .user, count: m)
         DispatchQueue.global().asyncAfter(deadline: .now() + .seconds(m * 60)) { [weak self] in
             guard let self, self.runtime.config.realtime else { return }
             self.setRealtime(true, record: false)
-            self.activity.add(.settings, "Protection resumed", outcome: "on")
+            self.activity.add(.settings, "Protection resumed", outcome: "on", event: .protectionResumed, actor: .system)
         }
     }
 
@@ -306,7 +318,7 @@ extension Protection {
         }
         let script = ["/Applications/Rampart.app/Contents/Resources/rampart-setup.sh"].first { FileManager.default.fileExists(atPath: $0) }
         guard let script else { throw ServiceError.notFound("rampart-setup.sh") }
-        activity.add(.system, "Uninstall requested", outcome: "uninstalling", severity: .medium)
+        activity.add(.system, "Uninstall requested", outcome: "uninstalling", severity: .medium, event: .uninstall, actor: .user)
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash"); p.arguments = [script, "uninstall"]
         p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice

@@ -377,16 +377,16 @@ struct StartupItemRow: View {
             .frame(width: 28, height: 28)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(item.label).font(.body.weight(.medium)).lineLimit(1)
+                    Text(SafeText.line(item.label, max: 100)).font(.body.weight(.medium)).lineLimit(1)
                     if unusual { Badge(text: "Worth a look", tint: .yellow) }
                 }
-                Text((item.target ?? item.location).replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                Text(SafeText.path((item.target ?? item.location).replacingOccurrences(of: NSHomeDirectory(), with: "~")))
                     .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     .textSelection(.enabled)
             }
             Spacer()
             if let sig = item.signing { SigningBadge(status: sig.status, notarized: sig.notarized) } else { Badge(text: "Not checked") }
-            if let team = item.signing?.teamID { Text(team).font(.caption.monospaced()).foregroundStyle(.tertiary) }
+            if let team = item.signing?.teamID { Text(SafeText.line(team, max: 20)).font(.caption.monospaced()).foregroundStyle(.tertiary) }
             Button("Turn Off…", action: onRemove)
                 .controlSize(.small)
                 .opacity(hover || unusual ? 1 : 0.6)
@@ -414,13 +414,13 @@ struct RemediationSheet: View {
             HStack(spacing: Spacing.m) {
                 IconBadge(symbol: "power", tint: .rampartTeal, size: 40)
                 VStack(alignment: .leading) {
-                    Text(preview?.title ?? "Turn off \(item.label)?").font(.title2.weight(.semibold))
-                    Text(item.location.replacingOccurrences(of: NSHomeDirectory(), with: "~"))
+                    Text(preview?.title ?? "Turn off \(SafeText.line(item.label, max: 60))?").font(.title2.weight(.semibold))
+                    Text(SafeText.path(item.location.replacingOccurrences(of: NSHomeDirectory(), with: "~")))
                         .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                 }
             }
             if done {
-                Label("Done. \(item.label) won't start automatically anymore.\(preview?.undoable == true ? " You can undo this from Protection Activity." : "")",
+                Label("Done. \(SafeText.line(item.label, max: 60)) won't start automatically anymore.\(preview?.undoable == true ? " You can undo this from Protection Activity." : "")",
                       systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.primary)
                 HStack { Spacer(); Button("Close") { dismiss() }.keyboardShortcut(.defaultAction) }
@@ -434,7 +434,7 @@ struct RemediationSheet: View {
                 if !p.commands.isEmpty {
                     DisclosureGroup("Show exact commands", isExpanded: $showCommands) {
                         VStack(alignment: .leading, spacing: 4) {
-                            ForEach(p.commands, id: \.self) { Text($0).font(.caption.monospaced()).textSelection(.enabled) }
+                            ForEach(p.commands, id: \.self) { Text(SafeText.path($0, max: 400)).font(.caption.monospaced()).textSelection(.enabled) }
                         }
                         .padding(8).frame(maxWidth: .infinity, alignment: .leading)
                         .background(.background.secondary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))

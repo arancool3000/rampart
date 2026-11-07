@@ -10,7 +10,7 @@ final class DetectionStore {
 
     init(url: URL, cap: Int = 5000) {
         self.url = url; self.cap = cap
-        if let data = try? Data(contentsOf: url) {
+        if let data = SecureStore.read(url) {
             if let list = try? JSONDecoder.rampart.decode([Detection].self, from: data) { items = list }
             else {
                 logWarn("detections.json corrupt; moving aside")
@@ -58,7 +58,7 @@ final class DetectionStore {
     }
 
     private func saveLocked() {
-        do { try Util.writeJSON(items, to: url) } catch { logError("detection store save failed: \(error)") }
+        do { try SecureStore.writeJSON(items, to: url) } catch { logError("detection store save failed: \(error)") }
     }
 }
 
@@ -91,11 +91,12 @@ final class StateStore {
     private var state: DaemonState
     init(url: URL) {
         self.url = url
-        state = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder.rampart.decode(DaemonState.self, from: $0) } ?? DaemonState()
+        state = SecureStore.read(url).flatMap { try? JSONDecoder.rampart.decode(DaemonState.self, from: $0) } ?? DaemonState()
     }
     var value: DaemonState { lock.lock(); defer { lock.unlock() }; return state }
     func update(_ change: (inout DaemonState) -> Void) {
         lock.lock(); change(&state); let s = state; lock.unlock()
-        try? Util.writeJSON(s, to: url)
+        try? SecureStore.writeJSON(s, to: url)
     }
 }
+

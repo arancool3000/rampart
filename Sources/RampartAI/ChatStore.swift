@@ -134,16 +134,38 @@ public final class ChatStore: @unchecked Sendable {
 
     private func ensureDirectory() throws {
         let fm = FileManager.default
+        // Never write chats through a symlinked folder (it could point anywhere).
+        if let t = try? fm.attributesOfItem(atPath: directory.path)[.type] as? FileAttributeType, t == .typeSymbolicLink {
+            throw StoreError.io("chat folder is a symbolic link")
+        }
         if !fm.fileExists(atPath: directory.path) {
             try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         }
         try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
     }
 
+    /// Largest chat file read back (a long chat is well under 1 MB); larger files are treated as damaged.
+    public static let maxFileBytes = 8 * 1024 * 1024
+    /// At most this many chat files are opened per load (resource cap against a flooded folder).
+    public static let maxFiles = 2000
+
+    /// Reads a regular file without following a symlink at the final component, capped at `limit` bytes.
+    static func readRegular(_ url: URL, limit: Int) -> Data? {
+        let fd = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        let h = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size <= off_t(limit) else { return nil }
+        guard let d = try? h.read(upToCount: limit + 1), d.count <= limit else { return nil }
+        return d
+    }
+
     private func key(create: Bool) throws -> SymmetricKey? {
         if let k = cachedKey { return k }
         let fm = FileManager.default
-        if let d = fm.contents(atPath: keyURL.path), d.count == 32 {
+        if let d = Self.readRegular(keyURL, limit: 64), d.count == 32 {
+            // Keep the key private to this user even if something loosened its mode.
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
             cachedKey = SymmetricKey(data: d); return cachedKey
         }
         guard create else { return nil }
@@ -187,7 +209,7 @@ public final class ChatStore: @unchecked Sendable {
 
     public func load(_ id: UUID) throws -> ChatRecord {
         lock.lock(); defer { lock.unlock() }
-        guard let k = try key(create: false), let d = FileManager.default.contents(atPath: fileURL(id).path) else { throw StoreError.io("missing") }
+        guard let k = try key(create: false), let d = Self.readRegular(fileURL(id), limit: Self.maxFileBytes) else { throw StoreError.io("missing") }
         return try Self.open(d, id: id, key: k)
     }
 
@@ -198,8 +220,9 @@ public final class ChatStore: @unchecked Sendable {
         guard let k = try? key(create: false),
               let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return [] }
         var out: [ChatRecord] = []
-        for n in names where n.hasSuffix(".chat") {
-            guard let id = UUID(uuidString: String(n.dropLast(5))), let d = FileManager.default.contents(atPath: fileURL(id).path) else { continue }
+        for n in names.filter({ $0.hasSuffix(".chat") }).prefix(Self.maxFiles) {
+            guard let id = UUID(uuidString: String(n.dropLast(5))), fileURL(id).lastPathComponent == n else { unreadable.append(n); continue }
+            guard let d = Self.readRegular(fileURL(id), limit: Self.maxFileBytes) else { unreadable.append(n); continue }
             if let c = try? Self.open(d, id: id, key: k) { out.append(c) } else { unreadable.append(n) }
         }
         return out.sorted { $0.updated > $1.updated }

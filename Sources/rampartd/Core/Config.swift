@@ -118,8 +118,8 @@ final class Runtime {
 
     @discardableResult
     func reloadConfig() -> Bool {
-        guard let data = try? Data(contentsOf: configURL) else {
-            try? Util.writeJSON(RampartConfig(), to: configURL, mode: 0o644)
+        guard let data = SecureStore.read(configURL, mode: 0o644) else {
+            try? SecureStore.writeJSON(RampartConfig(), to: configURL, mode: 0o644)
             return false
         }
         do {
@@ -134,7 +134,7 @@ final class Runtime {
 
     func updateConfig(_ change: (inout RampartConfig) -> Void) {
         lock.lock(); change(&_config); let c = _config; lock.unlock()
-        do { try Util.writeJSON(c, to: configURL, mode: 0o644) } catch { logError("config save failed: \(error)") }
+        do { try SecureStore.writeJSON(c, to: configURL, mode: 0o644) } catch { logError("config save failed: \(error)") }
     }
 
     /// Folder allow rules (set by Protection) — never scanned.

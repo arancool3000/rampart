@@ -13,6 +13,8 @@ public struct DetectionExplanation: Codable, Hashable, Sendable {
     public var falsePositiveChance: Risk
     public var nextSteps: [String]
     public var reassurance: String
+    /// Set locally (never by the model): the detection's text carried instructions aimed at an AI.
+    public var injectionDetected: Bool?
 }
 
 public enum ExplainDetection {
@@ -44,10 +46,23 @@ public enum ExplainDetection {
     }
 
     public static func prepare(_ d: Detection, service: AIService) -> AIPrepared<DetectionExplanation> {
-        service.prepare(tool: "ExplainDetection", system: system, blocks: [("detection", metadata(d, redactor: service.redactor))],
+        let meta = metadata(d, redactor: service.redactor)
+        let injected = PromptKit.injectionSignals([meta, d.name, d.path ?? ""])
+        return service.prepare(tool: "ExplainDetection", system: system,
+                        blocks: [("detection", meta)] + (injected ? [("rampart_note", PromptKit.injectionNote)] : []),
+                        context: ["rampart_note": "a note that RamPart found AI-directed instructions in it"],
                         instruction: "Explain this RamPart detection for the user.", schema: schema,
                         raw: DetectionExplanation.self) { r in
             var o = r
+            // Local evidence outranks the model. Text in a file name or evidence that tries to steer the AI is itself a
+            // sign of malice, and a high-confidence detection is never "probably a false alarm" on the model's word alone.
+            o.injectionDetected = injected ? true : nil
+            if injected {
+                if o.risk == .low { o.risk = .medium }
+                o.falsePositiveChance = .low
+            } else if d.confidence >= 80, o.falsePositiveChance == .high {
+                o.falsePositiveChance = .medium
+            }
             o.summary = Clean.text(r.summary, max: 400); o.whatItMeans = Clean.text(r.whatItMeans, max: 900)
             o.nextSteps = Clean.list(r.nextSteps, maxItems: 5); o.reassurance = Clean.text(r.reassurance, max: 300)
             guard !o.summary.isEmpty, !o.nextSteps.isEmpty else { throw GeminiError.validation("empty explanation") }
@@ -65,6 +80,8 @@ public struct AIScamAssessment: Codable, Hashable, Sendable {
     public var reasons: [String]
     public var summary: String
     public var advice: String
+    /// Set locally: the checked text carried instructions aimed at an AI (RamPart ignored them and raised the score).
+    public var injectionDetected: Bool?
     public var provider: String { "Gemini" }
     /// Same scale as RampartWeb's `ScamAIOpinion.confidence`.
     public var confidence: Int { score }
@@ -114,23 +131,39 @@ public enum ScamSecondOpinion {
     struct Raw: Decodable { var verdict: String?; var score: Int?; var summary: String?; var reasons: [String]?; var advice: String? }
 
     public static func prepare(text: String, localSignals: [String] = [], kindLabel: String = "message", service: AIService) -> AIPrepared<AIScamAssessment> {
+        let injected = PromptKit.injectionSignals([text])
         var blocks = [(["message", "email", "page", "link"].contains(kindLabel) ? kindLabel : "message", text)]
         if !localSignals.isEmpty { blocks.append(("local_signals", localSignals.prefix(20).map { "- " + $0 }.joined(separator: "\n"))) }
+        if injected { blocks.append(("rampart_note", PromptKit.injectionNote)) }
         return service.prepare(tool: "ScamSecondOpinion", system: system, blocks: blocks,
-                               context: ["local_signals": "RamPart's \(min(20, localSignals.count)) local warning sign\(localSignals.count == 1 ? "" : "s")"],
+                               context: ["local_signals": "RamPart's \(min(20, localSignals.count)) local warning sign\(localSignals.count == 1 ? "" : "s")",
+                                         "rampart_note": "a note that RamPart found AI-directed instructions in it"],
                                instruction: "Assess whether the \(kindLabel) in the DATA block is a scam.", schema: schema,
-                               maxOutputTokens: 700, raw: Raw.self) { validate($0) }
+                               maxOutputTokens: 700, raw: Raw.self) { validate($0, injected: injected, localSignals: localSignals.count) }
     }
 
-    static func validate(_ r: Raw) -> AIScamAssessment {
+    static let injectionReason = "The text contains instructions aimed at an AI or security checker, a common scam trick."
+
+    static func validate(_ r: Raw, injected: Bool = false, localSignals: Int = 0) -> AIScamAssessment {
         var v: AIScamAssessment.Verdict = Clean.pick(r.verdict, .unclear)
         let score = Clean.clamp(r.score, 0, 100, default: 50)
         // Keep verdict and score consistent; never let a "safe" verdict carry a high score.
         if v == .safe && score >= 50 { v = .suspicious }
         if v == .scam && score < 40 { v = .suspicious }
         var reasons = Clean.list(r.reasons, maxItems: 6, maxLen: 240)
+        var score2 = score
+        // The model can't talk its way past local evidence: injected text is a scam signal, and RamPart's own warning
+        // signs keep a "safe" verdict from standing.
+        if injected {
+            v = .scam; score2 = max(score2, 75)
+            reasons.insert(injectionReason, at: 0)
+        } else if localSignals > 0 && v == .safe {
+            v = .suspicious; score2 = max(score2, 50)
+        }
         if reasons.isEmpty { reasons = ["The AI gave no specific reasons."] }
-        return AIScamAssessment(verdict: v, score: score, reasons: reasons, summary: Clean.text(r.summary, max: 300), advice: Clean.text(r.advice, max: 400))
+        var out = AIScamAssessment(verdict: v, score: score2, reasons: Array(reasons.prefix(6)), summary: Clean.text(r.summary, max: 300), advice: Clean.text(r.advice, max: 400))
+        out.injectionDetected = injected ? true : nil
+        return out
     }
 
     public static func makeAssessor(service: AIService) -> Assessor {
@@ -148,6 +181,8 @@ public struct AssistantReply: Codable, Hashable, Sendable {
     public var refused: Bool
     /// Allow-listed, validated proposals. Never executed without the user's click (see AIActionGate).
     public var actions: [AIProposedAction]?
+    /// Set locally: the question or Security Score data carried AI-directed instructions, so no proposals were made.
+    public var injectionDetected: Bool?
     public init(answer: String, steps: [String], relatedCheckIDs: [String], onTopic: Bool, refused: Bool, actions: [AIProposedAction]? = nil) {
         self.answer = answer; self.steps = steps; self.relatedCheckIDs = relatedCheckIDs; self.onTopic = onTopic; self.refused = refused
         self.actions = actions
@@ -212,15 +247,27 @@ public enum SecurityAssistant {
             GeminiContent(role: t.role == .user ? "user" : "model", text: PromptKit.neutralize(service.redactor.redact(String(t.text.prefix(2000))).text))
         }
         let ids = Set(posture.map(\.id))
-        return service.prepare(tool: "SecurityAssistant", system: system + (actionContext == nil ? "" : "\n" + actionRules), history: hist,
-                               blocks: [("security_score_checks", postureSummary(posture)), ("question", question)],
-                               context: ["security_score_checks": posture.isEmpty ? "a note that no Security Score checks are available" : "your \(min(40, posture.count)) Security Score check results"],
-                               instruction: "Answer the question in the DATA block named question.", schema: schema(withActions: actionContext != nil),
+        let summary = postureSummary(posture)
+        // Pasted page text, or anything in the Security Score data, that tries to instruct the AI means this turn can
+        // never yield proposals, whatever the model returns.
+        let injected = PromptKit.injectionSignals([question], thirdParty: false) || PromptKit.injectionSignals([summary])
+        // Only the user's own words count as intent to lower protection (never posture details or model text).
+        let actionContext: AIActionValidator.Context? = actionContext.map { c in
+            var c = c
+            if c.userIntent == nil { c.userIntent = ([question] + history.filter { $0.role == .user }.suffix(2).map(\.text)).joined(separator: "\n") }
+            return c
+        }
+        return service.prepare(tool: "SecurityAssistant", system: system + (actionContext == nil || injected ? "" : "\n" + actionRules), history: hist,
+                               blocks: [("security_score_checks", summary), ("question", question)] + (injected ? [("rampart_note", PromptKit.injectionNote)] : []),
+                               context: ["security_score_checks": posture.isEmpty ? "a note that no Security Score checks are available" : "your \(min(40, posture.count)) Security Score check results",
+                                         "rampart_note": "a note that RamPart found AI-directed instructions in it"],
+                               instruction: "Answer the question in the DATA block named question.", schema: schema(withActions: actionContext != nil && !injected),
                                raw: Raw.self) { r in
             var o = AssistantReply(answer: Clean.text(r.answer, max: 2500), steps: Clean.list(r.steps, maxItems: 8),
                                    relatedCheckIDs: r.relatedCheckIDs.filter { ids.contains($0) }, onTopic: r.onTopic, refused: r.refused)
             guard !o.answer.isEmpty else { throw GeminiError.validation("empty answer") }
-            if let ctx = actionContext, !r.refused, r.onTopic {
+            o.injectionDetected = injected ? true : nil
+            if let ctx = actionContext, !r.refused, r.onTopic, !injected {
                 let a = AIActionValidator.validate(r.proposedActions ?? [], context: ctx)
                 o.actions = a.isEmpty ? nil : a
             }
@@ -290,6 +337,8 @@ public struct URLExplanation: Codable, Hashable, Sendable {
     public var summary: String
     public var reasons: [Reason]
     public var advice: String
+    /// Set locally: the link carried instructions aimed at an AI.
+    public var injectionDetected: Bool?
 }
 
 public enum URLReputationExplainer {
@@ -322,9 +371,12 @@ public enum URLReputationExplainer {
     }
 
     public static func prepare(url: String, localSignals: [String], service: AIService) -> AIPrepared<URLExplanation> {
-        service.prepare(tool: "URLReputationExplainer", system: system,
-                        blocks: [("url", sanitizeURL(url)), ("local_signals", localSignals.isEmpty ? "(none)" : localSignals.prefix(20).map { "- " + $0 }.joined(separator: "\n"))],
-                        context: ["local_signals": localSignals.isEmpty ? "a note that RamPart found no local warning signs" : "RamPart's \(min(20, localSignals.count)) local warning sign\(localSignals.count == 1 ? "" : "s")"],
+        let injected = PromptKit.injectionSignals([url, url.removingPercentEncoding ?? url])
+        return service.prepare(tool: "URLReputationExplainer", system: system,
+                        blocks: [("url", sanitizeURL(url)), ("local_signals", localSignals.isEmpty ? "(none)" : localSignals.prefix(20).map { "- " + $0 }.joined(separator: "\n"))]
+                            + (injected ? [("rampart_note", PromptKit.injectionNote)] : []),
+                        context: ["local_signals": localSignals.isEmpty ? "a note that RamPart found no local warning signs" : "RamPart's \(min(20, localSignals.count)) local warning sign\(localSignals.count == 1 ? "" : "s")",
+                                  "rampart_note": "a note that RamPart found AI-directed instructions in it"],
                         instruction: "Explain why this link may be suspicious.", schema: schema, maxOutputTokens: 900,
                         raw: URLExplanation.self) { r in
             var o = r
@@ -332,6 +384,15 @@ public enum URLReputationExplainer {
             o.reasons = r.reasons.prefix(8).map { .init(signal: Clean.text($0.signal, max: 120), explanation: Clean.text($0.explanation, max: 400)) }
             // Local blocklist evidence outranks the model: a blocklisted URL is never "probably safe".
             if localSignals.contains(where: { $0.lowercased().contains("blocklist") }) && (o.verdict == .probably_safe || o.verdict == .unclear) { o.verdict = .suspicious }
+            // A link carrying instructions for an AI is hostile; local warning signs keep "probably safe" from standing.
+            o.injectionDetected = injected ? true : nil
+            if injected {
+                o.verdict = .dangerous
+                o.reasons.insert(.init(signal: "Instructions for an AI", explanation: "The link contains text aimed at manipulating an AI or security checker, which legitimate links don't do."), at: 0)
+                o.reasons = Array(o.reasons.prefix(8))
+            } else if !localSignals.isEmpty && o.verdict == .probably_safe {
+                o.verdict = .suspicious
+            }
             return o
         }
     }

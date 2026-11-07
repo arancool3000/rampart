@@ -163,6 +163,7 @@ public enum PostureChecks {
     public static let all: [PostureCheckSpec] = [
         spec("fileVault", "FileVault disk encryption", 12) { c in parse(c.output("/usr/bin/fdesetup", ["status"]), PostureParsers.fileVault) },
         spec("sip", "System Integrity Protection", 12) { c in parse(c.output("/usr/bin/csrutil", ["status"]), PostureParsers.sip) },
+        spec("ssv", "Sealed system volume", 10) { c in parse(c.output("/usr/bin/csrutil", ["authenticated-root", "status"]), PostureParsers.ssv) },
         spec("gatekeeper", "Gatekeeper", 8) { c in parse(c.output("/usr/sbin/spctl", ["--status"]), PostureParsers.gatekeeper) },
         spec("firewall", "Firewall", 8) { c in parse(c.output(fw, ["--getglobalstate"]), PostureParsers.firewall) },
         spec("stealthMode", "Firewall stealth mode", 3) { c in parse(c.output(fw, ["--getstealthmode"]), PostureParsers.stealthMode) },
@@ -264,6 +265,7 @@ public enum PostureChecks {
         switch id {
         case "fileVault": return "Turn on FileVault in System Settings > Privacy & Security."
         case "sip": return "Turn SIP back on from macOS Recovery (csrutil enable)."
+        case "ssv": return "Turn the sealed system volume back on from macOS Recovery (csrutil authenticated-root enable)."
         case "gatekeeper": return "Allow apps from the App Store and identified developers in Privacy & Security."
         case "firewall": return "Turn on the firewall in System Settings > Network > Firewall."
         case "stealthMode": return "Turn on stealth mode in Firewall options."

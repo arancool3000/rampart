@@ -167,7 +167,8 @@ public final class NetworkScanner: @unchecked Sendable {
         progress(NetScanProgress(phase: .checkingRouter, fraction: 0.88, message: "Checking the router", devicesSoFar: found.count))
         var router: RouterReport?
         var findings: [NetFinding] = []
-        if options.checkRouter, let g = gatewayIP, Date() < deadline {
+        // Scope (hx4): only probe a gateway that is a dotted-quad on the scanned subnet.
+        if options.checkRouter, let g = gatewayIP, IPv4.parse(g) != nil, subnet.contains(g), Date() < deadline {
             var r = RouterReport(ip: g, mac: found[g]?.mac, vendor: found[g]?.vendor)
             await limiter.acquire(); r.httpOpen = await TCPProbe.connect(ip: g, port: 80, timeout: options.tcpTimeout) == .open
             await limiter.acquire(); r.httpsOpen = await TCPProbe.connect(ip: g, port: 443, timeout: options.tcpTimeout) == .open

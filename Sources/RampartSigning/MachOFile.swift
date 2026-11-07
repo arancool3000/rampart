@@ -255,9 +255,11 @@ public struct MachOFile: Sendable {
                 }
             case 0xfade0b01: blob.hasCMSSignature = len > 8
             case 0xfade7171:
-                if let bytes = r.bytes(b + 8, Int(len) - 8),
+                // Cap the blob before handing it to PropertyListSerialization: a crafted Mach-O can embed a
+                // huge or deeply nested entitlements plist to exhaust memory/CPU. Real entitlements are tiny.
+                if len <= 8 + 256 * 1024, let bytes = r.bytes(b + 8, Int(len) - 8),
                    let plist = try? PropertyListSerialization.propertyList(from: Data(bytes), format: nil) as? [String: Any] {
-                    blob.entitlementKeys = plist.keys.sorted()
+                    blob.entitlementKeys = Array(plist.keys.sorted().prefix(2048))
                 }
             default: break
             }

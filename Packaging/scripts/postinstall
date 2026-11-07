@@ -1,7 +1,17 @@
 #!/bin/bash
-# Runs as root by Installer after Rampart.app is in /Applications ($2 = install target volume).
+# Runs as root by Installer after Rampart.app is in /Applications ($3 = install target volume).
+# /Applications is admin-writable, so the bundle could be swapped between the payload and this script:
+# open rampart-setup.sh ONCE, check through the descriptor that it is a root-owned file nobody else can
+# write, and run exactly that file. rampart-setup.sh then takes rampartd the same way and writes the
+# launchd plists from its own text (never from the bundle).
 TARGET="${3:-/}"
-APP="${TARGET%/}/Applications/Rampart.app"
-[ "$TARGET" = "/" ] && APP="/Applications/Rampart.app"
-RAMPART_APP="$APP" /bin/bash "$APP/Contents/Resources/rampart-setup.sh" install
+[ "$TARGET" = "/" ] || { echo "Rampart: protection service can only be installed on the startup disk" >&2; exit 0; }
+APP="/Applications/Rampart.app"
+SETUP="$APP/Contents/Resources/rampart-setup.sh"
+[ -f "$SETUP" ] && [ ! -L "$SETUP" ] || { echo "Rampart: $SETUP missing" >&2; exit 0; }
+exec 3<"$SETUP" || exit 0
+if [ "$(stat -f '%u:%i' /dev/fd/3)" != "0:$(stat -f %i "$SETUP")" ] || [ $(( 0$(stat -f %Lp "$SETUP") & 022 )) != 0 ]; then
+  echo "Rampart: $SETUP is not a root-owned, root-only-writable file; not installing the service" >&2; exit 0
+fi
+RAMPART_APP="$APP" /bin/bash /dev/fd/3 install
 exit 0

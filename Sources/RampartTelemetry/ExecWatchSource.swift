@@ -223,6 +223,7 @@ public final class ExecWatchSource: EventSource, CPUReporting {
             detail["responsible_pid"] = String(rp)
             if let rpath = ProcInspector.path(rp) { detail["responsible_path"] = rpath }
         }
+        TelemetrySanitize.clean(detail: &detail)   // paths can carry control chars / bidi overrides
         execsReported += 1
         handler?(SecurityEvent(date: Date(timeIntervalSince1970: Double(info.startSec) + Double(info.startUsec) / 1e6),
                                kind: .exec, process: proc, path: exe, detail: detail, source: name))

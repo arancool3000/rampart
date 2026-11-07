@@ -174,6 +174,10 @@ public final class EsloggerParser {
             path = Self.filePath(ev["target"]) ?? Self.filePath(ev["source"])
         }
 
+        // eslogger JSON fields are attacker-influenced (filenames, xattr/profile names, process args,
+        // argv[0]). Neutralise control characters, bidi overrides and over-long values before they reach
+        // logs or UI, so a crafted filename can't forge a log line or spoof RamPart's voice.
+        TelemetrySanitize.clean(detail: &detail)
         stats.parsed += 1
         return SecurityEvent(date: date, kind: kind, process: process, path: path, destPath: dest,
                              detail: detail, source: "eslogger")

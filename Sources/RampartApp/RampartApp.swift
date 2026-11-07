@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Security
 import RampartShared
 
 @MainActor
@@ -25,17 +26,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Nothing has started yet (no daemon child, no menu bar item), so quitting here is clean.
             exit(0)
         }
+        // hx8: any process can post a distributed notification, so this only ever brings our own window
+        // forward (it can't change state) and is rate-limited so it can't be used to keep stealing focus.
         DistributedNotificationCenter.default().addObserver(forName: Self.revealNotification, object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated { AppDelegate.revealMainWindow() }
+            MainActor.assumeIsolated {
+                guard RevealLimiter.shared.allow() else { return }
+                AppDelegate.revealMainWindow()
+            }
         }
     }
 
-    /// Another running app with our bundle ID (any copy, wherever it was launched from).
+    /// Another running copy of RamPart (any copy, wherever it was launched from).
+    /// hx8: a bundle ID is just a string any app can claim, so a look-alike could otherwise make RamPart quit
+    /// on every launch. The other process must be signed like us (our designated requirement, i.e. the same
+    /// certificate, or for ad-hoc builds the same binary) or run from this very bundle path.
     static func otherRunningInstance() -> NSRunningApplication? {
         guard let id = Bundle.main.bundleIdentifier else { return nil }   // `swift run` builds have no bundle
         let me = ProcessInfo.processInfo.processIdentifier
         return NSRunningApplication.runningApplications(withBundleIdentifier: id)
-            .first { $0.processIdentifier != me && !$0.isTerminated }
+            .first { $0.processIdentifier != me && !$0.isTerminated && isGenuineSibling($0) }
+    }
+
+    static func isGenuineSibling(_ app: NSRunningApplication) -> Bool {
+        if let u = app.bundleURL?.resolvingSymlinksInPath().path,
+           u == Bundle.main.bundleURL.resolvingSymlinksInPath().path { return true }
+        var me: SecCode?, req: SecRequirement?, other: SecCode?
+        guard SecCodeCopySelf([], &me) == errSecSuccess, let me,
+              SecCodeCopyDesignatedRequirement(unsafeBitCast(me, to: SecStaticCode.self), [], &req) == errSecSuccess, let req else { return false }
+        let attrs = [kSecGuestAttributePid: app.processIdentifier] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attrs, [], &other) == errSecSuccess, let other else { return false }
+        return SecCodeCheckValidity(other, [], req) == errSecSuccess
     }
 
     /// A second launch asked us to come forward: show the main window if it exists.
@@ -80,11 +100,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) { if !isDuplicate { DaemonLauncher.shared.appWillTerminate() } }
 
     /// Dropping files or folders on the Dock icon starts a Custom Scan.
+    /// hx8: other apps can send this too (`open -a`). Only existing local files, at most 64, and never while a
+    /// scan runs: it can't be used to restart scans in a loop or smuggle non-file URLs in.
     func application(_ application: NSApplication, open urls: [URL]) {
-        let paths = urls.filter(\.isFileURL).map(\.path)
-        guard !paths.isEmpty else { return }
+        let paths = Self.droppedScanPaths(urls)
+        guard !paths.isEmpty, !AppModel.shared.isScanning else { return }
         AppModel.shared.selection = .scan
         AppModel.shared.startScan(.custom, paths: paths)
+    }
+}
+
+extension AppDelegate {
+    static let maxDroppedPaths = 64
+    static func droppedScanPaths(_ urls: [URL]) -> [String] {
+        var seen = Set<String>(), out: [String] = []
+        for u in urls where u.isFileURL {
+            let p = u.standardizedFileURL.path
+            guard !p.isEmpty, p.utf8.count < Int(PATH_MAX), !p.contains("\0"),
+                  FileManager.default.fileExists(atPath: p), seen.insert(p).inserted else { continue }
+            out.append(p)
+            if out.count == maxDroppedPaths { break }
+        }
+        return out
+    }
+}
+
+/// hx8: at most one reveal per 2 seconds from distributed notifications.
+@MainActor
+final class RevealLimiter {
+    static let shared = RevealLimiter()
+    private var last: Date = .distantPast
+    func allow(now: Date = Date()) -> Bool {
+        guard now.timeIntervalSince(last) >= 2 else { return false }
+        last = now; return true
     }
 }
 
@@ -146,14 +194,15 @@ struct RampartCommands: Commands {
             }
         }
         CommandGroup(after: .sidebar) {
-            Button("Overview") { AppModel.shared.selection = .dashboard }.keyboardShortcut("1", modifiers: .command)
-            Button("Scan") { AppModel.shared.selection = .scan }.keyboardShortcut("2", modifiers: .command)
-            Button("Threats & Quarantine") { AppModel.shared.selection = .threats }.keyboardShortcut("3", modifiers: .command)
-            Button("Protection Activity") { AppModel.shared.selection = .activity }.keyboardShortcut("4", modifiers: .command)
-            Button("Network") { AppModel.shared.selection = .network }.keyboardShortcut("5", modifiers: .command)
-            Button("Privacy & Posture") { AppModel.shared.selection = .posture }.keyboardShortcut("6", modifiers: .command)
-            Button("Rules") { AppModel.shared.selection = .rules }.keyboardShortcut("7", modifiers: .command)
-            Button("Settings") { AppModel.shared.selection = .settings }.keyboardShortcut("8", modifiers: .command)
+            // ⌘1–⌘9 apply within the current sidebar mode (Protection or Refresh).
+            let items = AppModel.shared.sidebarMode.shortcutItems
+            ForEach(Array(items.prefix(9).enumerated()), id: \.offset) { i, item in
+                Button(item.title) { AppModel.shared.selectShortcut(i) }
+                    .keyboardShortcut(KeyEquivalent(Character(String(i + 1))), modifiers: .command)
+            }
+            Divider()
+            Button("Protection") { AppModel.shared.switchMode(.protection) }.keyboardShortcut("1", modifiers: [.command, .option])
+            Button("Refresh") { AppModel.shared.switchMode(.refresh) }.keyboardShortcut("2", modifiers: [.command, .option])
         }
         CommandMenu("Scan") {
             Button("Quick Scan") { AppModel.shared.selection = .scan; AppModel.shared.startScan(.quick) }

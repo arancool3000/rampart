@@ -13,6 +13,7 @@ public enum TamperKind: String, Codable, Sendable, CaseIterable {
     case configTamper         // sealed config / allow rules edited outside the daemon
     case exclusionOfSelf      // someone tried to exclude our own paths from scanning
     case launchItemRemoved    // BTM reported our launch item removed
+    case clockTamper          // hx5/X4.9: system clock set (expires allowances, stretches/defeats time-boxed trust)
 }
 
 /// Turns SecurityEvents into Detections when they aim at RamPart itself.
@@ -38,7 +39,23 @@ public final class TamperDetector: @unchecked Sendable {
     public var plistValidator: @Sendable (String) -> Bool
     /// Is the RamPart service still running? The detector lives in the service, so true by default.
     public var serviceAlive: @Sendable () -> Bool = { true }
-    private struct Pending { var detection: Detection; let path: String; let isPlist: Bool; var due: Date }
+    /// hx5: a held change can be extended by new activity, but never beyond `maxHold` after it was first seen, so an
+    /// attacker who keeps touching the bundle cannot keep a swap pending forever.
+    public var maxHold: TimeInterval = 120
+    /// hx5: the sealed install manifest. When set, the default bundle validator also requires the bundle's helpers to
+    /// match it (or a trusted Team ID), so an ad-hoc look-alike signed as `app.rampart.daemon` no longer passes, and
+    /// processes running from inside the user-writable app bundle count as RamPart only if they match it.
+    public var manifestProvider: (@Sendable () -> InstallManifest?)? {
+        didSet {
+            guard let mp = manifestProvider else { return }
+            let teams = trustedTeamIDs
+            bundleValidator = { RamPartIdentity.isGenuineBundle($0, trustedTeamIDs: teams, manifest: mp()) }
+        }
+    }
+    /// hx5: signing identifiers without a trusted Team ID are attacker-chosen (`codesign -s - --identifier app.rampart.x`).
+    /// They no longer exempt a process. Leave false in production.
+    public var trustUnverifiedSigningIDs = false
+    private struct Pending { var detection: Detection; let path: String; let isPlist: Bool; var due: Date; let firstSeen: Date }
     private var pending: [String: Pending] = [:]
 
     public init(paths: GuardPaths = .standard, ownPIDs: @escaping @Sendable () -> Set<Int32> = { [getpid()] },
@@ -54,18 +71,29 @@ public final class TamperDetector: @unchecked Sendable {
 
     private func hold(_ d: Detection, key: String, path: String, isPlist: Bool, at date: Date) {
         lock.lock(); defer { lock.unlock() }
-        let due = max(date, Date()).addingTimeInterval(updateGrace)
-        if var p = pending[key] { p.due = max(p.due, due); pending[key] = p }   // keep the first detection, extend the window
-        else if pending.count < 256 { pending[key] = Pending(detection: d, path: path, isPlist: isPlist, due: due) }
+        let now = Date()
+        let due = max(date, now).addingTimeInterval(updateGrace)
+        if var p = pending[key] {   // keep the first detection, extend the window, but never past firstSeen + maxHold
+            p.due = min(max(p.due, due), p.firstSeen.addingTimeInterval(max(maxHold, updateGrace))); pending[key] = p
+        } else if pending.count < 256 {
+            pending[key] = Pending(detection: d, path: path, isPlist: isPlist, due: due, firstSeen: now)
+        } else {
+            overflow.append(d)   // hx5: a flood of distinct held keys must not drop a real tamper silently
+        }
     }
+    private var overflow: [Detection] = []
 
     /// Decides held changes whose grace period is over (all of them with `force`). Returns the ones that are tampering.
     public func flushPending(now: Date = Date(), force: Bool = false) -> [Detection] {
         lock.lock()
-        let ready = pending.filter { force || $0.value.due <= now }
+        // hx5: a clock moved backwards would leave `due` far in the future; anything due later than the longest
+        // possible hold is treated as due now.
+        let horizon = now.addingTimeInterval(max(maxHold, updateGrace) + 1)
+        let ready = pending.filter { force || $0.value.due <= now || $0.value.due > horizon }
         for k in ready.keys { pending[k] = nil }
+        let spilled = overflow; overflow = []
         lock.unlock()
-        return ready.values.sorted { $0.detection.date < $1.detection.date }.compactMap { p in
+        return spilled + ready.values.sorted { $0.detection.date < $1.detection.date }.compactMap { p in
             if p.isPlist {
                 return FileManager.default.fileExists(atPath: p.path) && plistValidator(p.path) ? nil : p.detection
             }
@@ -73,19 +101,43 @@ public final class TamperDetector: @unchecked Sendable {
         }
     }
 
-    public static let launchctlUnloadVerbs: Set<String> = ["bootout", "unload", "disable", "remove", "kill", "stop"]
+    public static let launchctlUnloadVerbs: Set<String> = ["bootout", "unload", "disable", "remove", "kill", "stop", "bsexec", "asuser", "submit", "attach", "debug"]
     public static let killers: Set<String> = ["kill", "pkill", "killall"]
+    /// hx5: Apple signing identifiers of the tools, so a renamed copy (`cp /bin/launchctl /tmp/lc`) is still recognised.
+    public static let signingIDToTool: [String: String] = ["com.apple.xpc.launchctl": "launchctl", "com.apple.kill": "kill", "com.apple.pkill": "pkill",
+                                                           "com.apple.killall": "killall", "com.apple.rm": "rm", "com.apple.mv": "mv", "com.apple.cp": "cp",
+                                                           "com.apple.chflags": "chflags", "com.apple.plutil": "plutil", "com.apple.defaults": "defaults",
+                                                           "com.apple.tccutil": "tccutil", "com.apple.profiles": "profiles",
+                                                           "com.apple.systemsetup": "systemsetup", "com.apple.sntp": "sntp", "com.apple.date": "date"]
     public static let fileMutators: Set<String> = ["rm", "mv", "cp", "chflags", "chmod", "chown", "plutil", "defaults", "truncate", "tee", "install", "ln"]
     /// Tools that reset system state we depend on (TCC grants such as Full Disk Access, configuration profiles).
     public static let resetters: Set<String> = ["tccutil", "profiles"]
+    public static let clockTools: Set<String> = ["systemsetup", "sntp", "date", "ntpdate"]
 
     private func isSelf(_ p: ProcessInfoLite?) -> Bool {
         guard let p else { return false }
-        if ownPIDs().contains(p.pid) { return true }
-        if let s = p.signingID, s.hasPrefix(Product.bundlePrefix) { return true }
-        if let t = p.teamID, trustedTeamIDs.contains(t) { return true }
+        let own = ownPIDs()
+        if own.contains(p.pid) { return true }
+        // hx5: a child the daemon spawned itself (ditto/mv during an update, the CLI) is ours too.
+        if p.ppid > 1, own.contains(p.ppid) { return true }
+        if let t = p.teamID, !t.isEmpty, trustedTeamIDs.contains(t) { return true }
+        if trustUnverifiedSigningIDs, let s = p.signingID, s.hasPrefix(Product.bundlePrefix) { return true }
+        // hx5: the path rule only covers root-owned install locations. /Applications/RamPart.app is usually writable by
+        // the admin user, so a binary dropped into it is ours only when it matches the sealed manifest.
+        if paths.isInAppBundle(p.path) {
+            guard let m = manifestProvider?(), let expected = m.entries[p.path] else { return false }
+            return InstallManifest.sha256(ofFile: p.path) == expected
+        }
         if paths.isProtected(p.path) { return true }
         return false
+    }
+
+    /// Resolves symlinks in a path-like argument so `launchctl unload /tmp/link.plist` (link -> our plist) counts.
+    private func isProtectedArg(_ a: String) -> Bool {
+        if paths.isProtected(a) { return true }
+        guard a.hasPrefix("/"), a.count < 4096 else { return false }
+        let r = (a as NSString).resolvingSymlinksInPath
+        return r != a && paths.isProtected(r)
     }
 
     private func dedupe(_ key: String, at date: Date) -> Bool {
@@ -156,7 +208,12 @@ public final class TamperDetector: @unchecked Sendable {
     private func inspectExec(_ ev: SecurityEvent) -> [Detection] {
         guard let p = ev.process else { return [] }
         let args = p.args.isEmpty ? [p.path] : p.args
-        let tool = ((args.first ?? p.path) as NSString).lastPathComponent
+        var tool = ((args.first ?? p.path) as NSString).lastPathComponent
+        if let sid = p.signingID, let t = Self.signingIDToTool[sid] { tool = t }   // renamed copy of an Apple tool
+        else if !Self.killers.contains(tool), !Self.fileMutators.contains(tool), tool != "launchctl" {
+            let real = (p.path as NSString).lastPathComponent
+            if Self.killers.contains(real) || real == "launchctl" || Self.fileMutators.contains(real) { tool = real }
+        }
         let joined = args.joined(separator: " ")
         let lower = joined.lowercased()
         if Self.killers.contains(tool) {
@@ -164,14 +221,47 @@ public final class TamperDetector: @unchecked Sendable {
             return [detection(.killAttempt, severity: .critical, score: 90, title: "\(tool) aimed at \(Product.name)", detail: joined, ev: ev, path: nil)]
         }
         let mentionsUs = paths.isOurLabel(joined) || lower.contains("rampartd") || lower.contains("rampart")
-            || args.contains(where: { paths.isProtected($0) })
+            || args.contains(where: { isProtectedArg($0) })
+        // hx5/X4.8: `tccutil reset SystemPolicyAllFiles` with no bundle id strips every app's Full Disk Access, ours included.
+        if tool == "tccutil", args.dropFirst().first?.lowercased() == "reset" {
+            let service = args.dropFirst(2).first ?? ""
+            let global = ["SystemPolicyAllFiles", "All", "Accessibility", "ScreenCapture", "kTCCServiceSystemPolicyAllFiles"].contains(service)
+            let bundleOperand = args.dropFirst(3).first
+            if global, bundleOperand == nil || paths.isOurLabel(bundleOperand ?? "") {
+                guard dedupe("tccreset:\(p.pid)", at: ev.date) else { return [] }
+                return [detection(.fileTamper, severity: bundleOperand == nil ? .high : .critical, score: bundleOperand == nil ? 80 : 90,
+                                  title: "tccutil reset would strip \(Product.name)'s Full Disk Access",
+                                  detail: joined + (bundleOperand == nil ? " (resets every app, \(Product.name) included)" : ""), ev: ev, path: nil)]
+            }
+        }
+        // hx5/X4.9: clock changes. macOS lets admins set the clock, so this is detect-and-explain.
+        if Self.clockTools.contains(tool) {
+            let flags = args.dropFirst().filter { $0.hasPrefix("-") }
+            let sets: Bool
+            switch tool {
+            case "systemsetup": sets = lower.contains("-setdate") || lower.contains("-settime") || lower.contains("-setusingnetworktime")
+                || lower.contains("-setnetworktimeserver") || lower.contains("-settimezone")
+            case "date": sets = args.dropFirst().contains { !$0.hasPrefix("-") && !$0.hasPrefix("+") && $0.rangeOfCharacter(from: .decimalDigits) != nil }
+            case "sntp": sets = flags.contains { !$0.hasPrefix("--") && ($0.contains("s") || $0.contains("S")) }
+            default: sets = true   // ntpdate, timed control tools
+            }
+            if sets, dedupe("clock:\(p.pid)", at: ev.date) {
+                return [detection(.clockTamper, severity: .medium, score: 55, title: "System clock is being changed",
+                                  detail: joined + ": this can expire \(Product.name) allowances and definition freshness", ev: ev, path: nil)]
+            }
+        }
+        // A tool we don't recognise whose arguments still read like "launchctl bootout system/app.rampart.daemon"
+        // (a renamed launchctl copy without signing info) is treated as launchctl.
+        if tool != "launchctl", !Self.killers.contains(tool), !Self.fileMutators.contains(tool),
+           args.dropFirst().contains(where: { Self.launchctlUnloadVerbs.contains($0) }),
+           args.dropFirst().contains(where: { a in paths.labels.contains { a.hasSuffix("/" + $0) || a == $0 } }) { tool = "launchctl" }
         guard mentionsUs else { return [] }
 
-        if tool == "launchctl", args.dropFirst().contains(where: { Self.launchctlUnloadVerbs.contains($0) }), paths.isOurLabel(joined) || args.contains(where: paths.isProtected) {
+        if tool == "launchctl", args.dropFirst().contains(where: { Self.launchctlUnloadVerbs.contains($0) }), paths.isOurLabel(joined) || args.contains(where: isProtectedArg) {
             guard dedupe("unload:\(joined)", at: ev.date) else { return [] }
             return [detection(.unloadAttempt, severity: .critical, score: 95, title: "launchctl used against \(Product.name)", detail: joined, ev: ev, path: nil)]
         }
-        if Self.fileMutators.contains(tool), let target = args.first(where: paths.isProtected) {
+        if Self.fileMutators.contains(tool), let target = args.first(where: isProtectedArg) {
             guard dedupe("mutate:\(p.pid):\(target)", at: ev.date) else { return [] }
             let isPlist = paths.isPlist(target)
             let unlocking = tool == "chflags" && args.contains(where: { $0.contains("noschg") || $0.contains("nouchg") })
@@ -193,7 +283,7 @@ public final class TamperDetector: @unchecked Sendable {
             guard dedupe("reset:\(p.pid)", at: ev.date) else { return [] }
             return [detection(.fileTamper, severity: .critical, score: 90, title: "\(tool) aimed at \(Product.name) (TCC/profile reset)", detail: joined, ev: ev, path: nil)]
         }
-        if (lower.contains("exclu") || lower.contains("allow")) && args.contains(where: paths.isProtected) {
+        if (lower.contains("exclu") || lower.contains("allow")) && args.contains(where: isProtectedArg) {
             guard dedupe("excl:\(p.pid)", at: ev.date) else { return [] }
             return [detection(.exclusionOfSelf, severity: .high, score: 85, title: "Attempt to exclude \(Product.name) from scanning", detail: joined, ev: ev, path: nil)]
         }
@@ -208,7 +298,36 @@ public final class TamperDetector: @unchecked Sendable {
         let operands = args.filter { !$0.hasPrefix("-") }
         if tool == "kill" {
             let own = ownPIDs()
-            return operands.compactMap { Int32($0) }.contains { own.contains($0) }
+            // hx5: `kill -9 -1` (every process the caller may signal) and `kill -- -PGID` used to be read as flags.
+            var pids: [Int32] = []
+            var i = 0, endOfOptions = false, sawSignal = false
+            while i < args.count {
+                let a = args[i]
+                if endOfOptions || !a.hasPrefix("-") { if let n = Int32(a) { pids.append(n) } }
+                else if a == "--" { endOfOptions = true }
+                else if a == "-s" || a == "-n" { i += 1; sawSignal = true }
+                else if a == "-l" || a == "-L" { return false }
+                else if let n = Int32(a), sawSignal { pids.append(n) }   // negative pid / process group after the signal
+                else { sawSignal = true }
+                i += 1
+            }
+            if pids.contains(-1) { return true }
+            if pids.contains(where: { $0 < -1 }) {
+                let groups = Set(own.map { getpgid($0) }.filter { $0 > 0 })
+                if pids.contains(where: { $0 < -1 && groups.contains(-$0) }) { return true }
+            }
+            return pids.contains { own.contains($0) }
+        }
+        // hx5: user/group-wide kills with no pattern (`killall -u root`, `pkill -U 0`) hit the root service too.
+        if let ui = args.firstIndex(where: { $0 == "-u" || $0 == "-U" || $0 == "-G" }), args.indices.contains(ui + 1) {
+            let who = args[ui + 1]
+            if who == "0" || who == "root" || who == "wheel" { return true }
+        }
+        if tool == "killall", flags.contains("-m") {   // regex mode
+            return operands.contains { pat in
+                guard pat.count < 512, let re = try? NSRegularExpression(pattern: pat, options: flags.contains("-I") ? [.caseInsensitive] : []) else { return false }
+                return paths.serviceNames.contains { re.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil }
+            }
         }
         let ci = flags.contains { $0 == "-i" || $0 == "-I" } || tool == "killall" && flags.contains("-I")
         let full = tool == "pkill" && flags.contains { $0.hasPrefix("-") && !$0.hasPrefix("--") && $0.dropFirst().contains("f") }
@@ -218,9 +337,13 @@ public final class TamperDetector: @unchecked Sendable {
             return operands.contains { names.contains(norm($0)) }
         }
         let haystacks = (full ? paths.serviceCommandLines + paths.serviceNames : paths.serviceNames).map(norm)
+        let exact = tool == "pkill" && flags.contains { $0.hasPrefix("-") && !$0.hasPrefix("--") && $0.dropFirst().contains("x") }
         return operands.contains { pat in
             let p = norm(pat).replacingOccurrences(of: "^", with: "").replacingOccurrences(of: "$", with: "")
-            return !p.isEmpty && haystacks.contains { $0.contains(p) }
+            if !p.isEmpty && haystacks.contains(where: { exact ? $0 == p : $0.contains(p) }) { return true }
+            // hx5: pkill patterns are extended regexes (`pkill 'r.mpartd'`, `pkill '[r]ampartd'`).
+            guard pat.count < 512, let re = try? NSRegularExpression(pattern: exact ? "^(?:" + pat + ")$" : pat, options: ci ? [.caseInsensitive] : []) else { return false }
+            return haystacks.contains { re.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil }
         }
     }
 
@@ -258,7 +381,9 @@ public struct SelfDefencePolicy: Sendable {
     public static let launchctl = "/bin/launchctl"
     public let paths: GuardPaths
     public let store: SealedStore?
-    public init(paths: GuardPaths = .standard, store: SealedStore?) { self.paths = paths; self.store = store }
+    /// Sealed install manifest, used to check a restored plist/binary is the installed one.
+    public var manifest: InstallManifest?
+    public init(paths: GuardPaths = .standard, store: SealedStore?, manifest: InstallManifest? = nil) { self.paths = paths; self.store = store; self.manifest = manifest }
 
     public func rebootstrapCommands(label: String, plist: String) -> [GuardCommand] {
         [GuardCommand(Self.launchctl, ["enable", "system/\(label)"], acceptableExitCodes: [0], note: "undo `launchctl disable`"),
@@ -276,8 +401,15 @@ public struct SelfDefencePolicy: Sendable {
         case .plistTamper, .configTamper, .fileTamper:
             for p in [path].compactMap({ $0 }) + (path == nil ? paths.plists + [paths.configFile, paths.allowRulesFile] : []) {
                 if let store, store.hasBackup(for: p) {
-                    let (verdict, restored) = store.restoreIfNeeded(p, dryRun: dryRun)
-                    if restored { r.restoredFiles.append(p); r.notes.append("\(p): \(String(describing: verdict)) -> restored from sealed backup") }
+                    if paths.isPlist(p) || paths.binaries.contains(p) {
+                        // hx5: plists are raw files on disk; restore the payload (or legacy envelope), never the JSON wrapper.
+                        if store.restoreRawIfNeeded(p, expectedSHA: manifest?.entries[p], mode: 0o644, dryRun: dryRun) {
+                            r.restoredFiles.append(p); r.notes.append("\(p): restored from sealed backup")
+                        }
+                    } else {
+                        let (verdict, restored) = store.restoreIfNeeded(p, dryRun: dryRun)
+                        if restored { r.restoredFiles.append(p); r.notes.append("\(p): \(String(describing: verdict)) -> restored from sealed backup") }
+                    }
                 } else { r.notes.append("\(p): no sealed backup; reinstall needed") }
                 if paths.isPlist(p) {
                     let label = (p as NSString).lastPathComponent.replacingOccurrences(of: ".plist", with: "")
@@ -290,6 +422,8 @@ public struct SelfDefencePolicy: Sendable {
                                            note: "do not keep running a replaced binary as root"))
         case .exclusionOfSelf:
             r.notes.append("exclusion refused; nothing to restore")
+        case .clockTamper:
+            r.notes.append("clock changed: time-limited allowances and sessions are also bounded by a monotonic clock, so a rollback cannot extend them")
         }
         r.alert = Detection(path: path, name: "Self-defence: \(kind.rawValue)", category: .suspicious, severity: .high, confidence: 85,
                             evidence: [Evidence(source: .behaviour, title: "Automatic response", detail: r.notes.joined(separator: "; "), score: 85)])
@@ -334,9 +468,13 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
     public let clock: GuardClock
     public var tokenTTL: TimeInterval = 120
     private let lock = NSLock()
-    private var issued: [String: (uid: uid_t, expires: Date)] = [:]
+    private var issued: [String: (uid: uid_t, expires: Date, monoExpires: TimeInterval)] = [:]
     /// Active authenticated sessions (pause or uninstall) by uid; tamper responses exempt these actors.
-    private var sessions: [uid_t: (purpose: Purpose, until: Date)] = [:]
+    /// hx5: expiry is checked against both the wall clock and a monotonic clock, so setting the date back does not
+    /// stretch a session or a token.
+    private var sessions: [uid_t: (purpose: Purpose, until: Date, monoUntil: TimeInterval)] = [:]
+    /// Longest pause/uninstall session the daemon will open, whatever the caller asks for.
+    public var maxSessionSeconds: TimeInterval = 4 * 3600
 
     public enum Purpose: String, Codable, Sendable { case pause, uninstall, settings }
 
@@ -388,8 +526,13 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
         _ = SecRandomCopyBytes(kSecRandomDefault, nonce.count, &nonce)
         let expires = clock.now().addingTimeInterval(tokenTTL)
         let body = "\(nonce.map { String(format: "%02x", $0) }.joined()).\(peerUID).\(Int(expires.timeIntervalSince1970))"
-        let token = body + "." + key.mac(Data(body.utf8))
-        lock.lock(); issued[token] = (peerUID, expires); lock.unlock()
+        let token = body + "." + key.mac(domain: "disable-token", Data(body.utf8))
+        let mono = clock.monotonic()
+        lock.lock()
+        issued = issued.filter { clock.now() <= $0.value.expires && mono <= $0.value.monoExpires }   // bounded
+        if issued.count >= 64 { issued.removeAll() }
+        issued[token] = (peerUID, expires, mono + tokenTTL)
+        lock.unlock()
         return .success(token)
     }
 
@@ -398,19 +541,22 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
     /// which that uid's actions on our files are not treated as attacks.
     public func redeem(_ token: String, peerUID: uid_t, purpose: Purpose = .pause, sessionSeconds: TimeInterval = 600) -> Result<Void, Failure> {
         let parts = token.split(separator: ".").map(String.init)
-        guard parts.count == 4, key.mac(Data(parts[0...2].joined(separator: ".").utf8)) == parts[3] else { return .failure(.tokenInvalid) }
+        guard parts.count == 4, token.utf8.count < 512,
+              IntegrityKey.constantTimeEqual(key.mac(domain: "disable-token", Data(parts[0...2].joined(separator: ".").utf8)), parts[3]) else { return .failure(.tokenInvalid) }
         lock.lock(); defer { lock.unlock() }
         guard let rec = issued[token] else { return .failure(.tokenInvalid) }
         guard rec.uid == peerUID else { return .failure(.tokenForOtherUser) }   // not consumed: the right user may still redeem
         issued[token] = nil
-        guard clock.now() <= rec.expires else { return .failure(.tokenExpired) }
-        sessions[peerUID] = (purpose, clock.now().addingTimeInterval(sessionSeconds))
+        let mono = clock.monotonic()
+        guard clock.now() <= rec.expires, mono <= rec.monoExpires else { return .failure(.tokenExpired) }
+        let secs = max(0, min(sessionSeconds.isFinite ? sessionSeconds : 0, maxSessionSeconds))
+        sessions[peerUID] = (purpose, clock.now().addingTimeInterval(secs), mono + secs)
         return .success(())
     }
 
     public func hasActiveSession(uid: uid_t, purpose: Purpose? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard let s = sessions[uid], clock.now() <= s.until else { return false }
+        guard let s = sessions[uid], clock.now() <= s.until, clock.monotonic() <= s.monoUntil else { return false }
         return purpose == nil || s.purpose == purpose
     }
     public func endSession(uid: uid_t) { lock.lock(); sessions[uid] = nil; lock.unlock() }
@@ -420,7 +566,7 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
     public func uninstallCommands(paths: GuardPaths) -> [GuardCommand] {
         let ring = GuardianRing(paths: paths)
         var c = ImmutableFlagsPlan.unlockCommands(paths)
-        c += ring.plists.map { GuardCommand(ImmutableFlagsPlan.chflags, ["noschg", $0]) }
+        c += ring.plists.filter { p in !c.contains { $0.arguments == ["noschg", p] } }.map { GuardCommand(ImmutableFlagsPlan.chflags, ["noschg", $0]) }
         for j in ring.jobs.reversed() {   // sentinel and watchdog first so they do not restore the daemon mid-uninstall
             c.append(GuardCommand("/bin/launchctl", ["bootout", "system/\(j.label)"], acceptableExitCodes: [3, 113]))
             c.append(GuardCommand("/bin/rm", ["-f", j.plist, j.binary]))
@@ -434,5 +580,6 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
     /// Copy for the UI; true in every build. Keep it next to the toggle.
     public static let honestLimitCopy =
         "Turning protection off needs an administrator password. A script cannot do it through \(Product.name). " +
-        "macOS still lets a root process stop any background service, so \(Product.name) watches for that, alerts you, and restarts itself."
+        "macOS still lets a root process stop any background service, so \(Product.name) watches for what it can see, alerts you, and restarts itself. " +
+        "A root process that acts quickly enough (unloading all three guardians at once, or freezing them together) can still stop it."
 }

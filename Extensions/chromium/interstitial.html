@@ -1,14 +1,14 @@
 <!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>RamPart blocked this page</title><link rel="stylesheet" href="interstitial.css"></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>RamPart blocked this page</title><link rel="stylesheet" href="interstitial.css"></head>
 <body>
-<main class="card">
+<main class="card" id="card">
   <div class="badge">RamPart</div>
   <h1>This page looks like a scam</h1>
   <p id="headline">RamPart found strong signs that this page is trying to trick you.</p>
   <p class="host">Address: <code id="host"></code></p>
   <ul id="reasons"></ul>
   <div class="actions"><button id="back" class="primary">Go back</button><button id="continue" class="secondary">Continue anyway</button></div>
-  <p class="foot">Checked by RamPart on your Mac. Nothing about this page was sent to the cloud.</p>
+  <p class="foot" id="foot">Checked by RamPart on your Mac. Nothing about this page was sent to the cloud.</p>
 </main>
 <script src="interstitial.js"></script>
 </body></html>

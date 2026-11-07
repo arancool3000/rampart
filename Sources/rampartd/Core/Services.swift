@@ -1,5 +1,6 @@
 import Foundation
 import RampartShared
+import RampartGuard
 
 // The plug-in layer. Each protocol is implemented either by a module adapter (Integrations.swift)
 // or by a built-in fallback (Builtin.swift) so the daemon always runs.
@@ -11,7 +12,9 @@ struct ScanOutcome {
     var errors: Int = 0
 }
 
-typealias ScanProgress = (_ scanned: Int, _ total: Int, _ current: String) -> Void
+/// Extra scan state for the app: walk finished (total is final), files abandoned at the deadline, stall time.
+struct ScanTick { var walkFinished = false; var timedOut = 0; var secondsSinceLastCompletion: Double = 0 }
+typealias ScanProgress = (_ scanned: Int, _ total: Int, _ current: String, _ tick: ScanTick) -> Void
 
 protocol ScanService: AnyObject {
     var engineNames: [String] { get }
@@ -121,6 +124,10 @@ final class Services {
     var network: NetworkInfoService?
     var guardian: GuardService?
     var webCheck: WebCheckService?
+    /// Deep content inspection, Apple impersonation and link-chain checks (DeepWiring.swift).
+    var deep: DeepProtectionService?
+    /// Cat & Mouse decoys, maze and tarpit (RampartGuard Deception*), user-session daemon only.
+    var deception: DeceptionService?
     /// EventHub.cpuBySource (daemon only).
     var sourceCPU: (() -> [String: Double])?
     /// DNS query-log events (.dnsQuery, detail["name"]) for the behaviour engine; set by the daemon wiring.

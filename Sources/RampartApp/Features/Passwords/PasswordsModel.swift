@@ -50,6 +50,13 @@ final class PasswordsModel {
     @ObservationIgnored private var unlockedWithMaster = false
     /// Touch ID passed but the security-chip key failed: switch to compatibility mode after the next master unlock.
     @ObservationIgnored private var touchIDNeedsRepair = false
+    /// A fresh security-chip key also failed: offer compatibility mode, but only as the user's explicit choice
+    /// (switching automatically would let anyone who can corrupt touchid.json downgrade Touch ID).
+    var touchIDCompatSuggested = false
+    static let touchIDRepairKey = "rampart.vault.touchIDRepairAttempts"
+    /// The vault file is older than the anti-rollback mark; the user may tick "Open anyway".
+    var rollbackPending = false
+    var acceptRollback = false
     var offerTouchID: Bool { phase == .unlocked && unlockedWithMaster && !touchIDEnabled && availability.biometryAvailable && !touchIDOfferDismissed && !Headless.active }
     var audit: VaultAudit?
     var auditRunning = false
@@ -100,11 +107,16 @@ final class PasswordsModel {
     func unlock(master: String) async {
         busy = true; error = nil
         let store = store
+        let accept = rollbackPending && acceptRollback
         let result: Error? = await Task.detached { () -> Error? in
-            do { try store.unlock(masterPassword: master); return nil } catch { return error }
+            do { try store.unlock(masterPassword: master, acceptRollback: accept); return nil } catch { return error }
         }.value
         busy = false
-        if let result { error = result.localizedDescription; return }
+        if let result {
+            if case VaultError.rolledBack = result { rollbackPending = true }
+            error = result.localizedDescription; return
+        }
+        rollbackPending = false; acceptRollback = false
         unlockedWithMaster = true
         didUnlock()
         repairTouchIDIfNeeded()
@@ -114,24 +126,52 @@ final class PasswordsModel {
     private func repairTouchIDIfNeeded() {
         guard touchIDNeedsRepair, !Headless.active else { return }
         touchIDNeedsRepair = false
+        let defaults = UserDefaults.standard
+        if defaults.integer(forKey: Self.touchIDRepairKey) == 0 {
+            // First failure: re-enrol with a FRESH security-chip key (a corrupted or swapped touchid.json is fixed
+            // this way without weakening anything).
+            defaults.set(1, forKey: Self.touchIDRepairKey)
+            do {
+                let mode = try touchID.enable(forceMode: .secureEnclave)
+                flash(mode == .secureEnclave ? "Touch ID was set up again with a new security-chip key." : "Touch ID is on (compatibility mode).")
+            } catch { self.error = "Touch ID couldn't be set up: \(error.localizedDescription)" }
+        } else {
+            touchIDCompatSuggested = true
+            self.error = "Touch ID still can't use this Mac's security chip. You can choose compatibility mode in Passwords › Settings; it is weaker, see the note there."
+        }
+        refreshPhase()
+    }
+
+    /// The user's explicit choice after the security chip kept failing.
+    func useTouchIDCompatibilityMode() {
+        guard !Headless.active else { return }
         do {
             _ = try touchID.enable(forceMode: .keychainGated)
-            flash("Touch ID was switched to compatibility mode, so it works on this Mac.")
-        } catch { self.error = "Touch ID couldn't be set up: \(error.localizedDescription)" }
+            touchIDCompatSuggested = false
+            UserDefaults.standard.removeObject(forKey: Self.touchIDRepairKey)
+            flash("Touch ID is on (compatibility mode).")
+        } catch { self.error = error.localizedDescription }
         refreshPhase()
     }
 
     func unlockWithTouchID() async {
         guard !Headless.active else { return }
         error = nil
-        do { try await touchID.unlock(); unlockedWithMaster = false; didUnlock() }
+        do {
+            try await touchID.unlock(); unlockedWithMaster = false
+            UserDefaults.standard.removeObject(forKey: Self.touchIDRepairKey)
+            didUnlock()
+        }
         catch VaultError.cancelled { }
         catch VaultError.secureEnclaveFailed(let why) {
             touchIDNeedsRepair = true
             self.error = "Touch ID recognised you, but this Mac's security chip couldn't open the vault key (\(why)). Unlock with your master password once and \(Product.name) will fix Touch ID automatically."
             refreshPhase()
         }
-        catch { self.error = error.localizedDescription; refreshPhase() }
+        catch {
+            if case VaultError.rolledBack = error { rollbackPending = true }
+            self.error = error.localizedDescription; refreshPhase()
+        }
     }
 
     private func didUnlock() {
@@ -306,7 +346,7 @@ final class PasswordsModel {
 
     func copy(_ secret: String, label: String) {
         guard !Headless.active else { return }
-        let secs = meta.settings.clipboardClearSeconds
+        let secs = min(ClipboardGuard.clearRange.upperBound, max(ClipboardGuard.clearRange.lowerBound, meta.settings.clipboardClearSeconds))
         ClipboardGuard.shared.copy(secret, clearAfter: secs)
         let deadline: Date? = secs > 0 ? Date().addingTimeInterval(Double(secs)) : nil
         clipboardDeadline = deadline
@@ -330,6 +370,7 @@ final class PasswordsModel {
 
     func setTouchID(_ on: Bool) {
         if on {
+            UserDefaults.standard.removeObject(forKey: Self.touchIDRepairKey); touchIDCompatSuggested = false
             do {
                 let mode = try touchID.enable()
                 flash(mode == .secureEnclave ? "Touch ID is on, protected by your Mac's security chip." : "Touch ID is on (compatibility mode).")
@@ -450,7 +491,7 @@ final class PasswordsModel {
         busy = false
         switch result {
         case .success(let d):
-            do { try d.write(to: url, options: .atomic); flash("Exported \(auth.count) accounts, encrypted.") } catch { self.error = error.localizedDescription }
+            do { try Self.writePrivate(d, to: url); flash("Exported \(auth.count) accounts, encrypted.") } catch { self.error = error.localizedDescription }
         case .failure(let e): error = e.localizedDescription
         }
     }
@@ -462,6 +503,9 @@ final class PasswordsModel {
         panel.allowedContentTypes = [.commaSeparatedText, .plainText]
         panel.message = "Choose a CSV exported from Chrome, Firefox, Safari, Bitwarden or 1Password."
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        if let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > CSVImporter.maxBytes {
+            error = "That file is too large to be a password export."; return
+        }
         guard let data = try? Data(contentsOf: url) else { error = "Couldn't read that file."; return }
         let result = CSVImporter.parse(String(decoding: data, as: UTF8.self))
         var newMeta = meta
@@ -487,7 +531,7 @@ final class PasswordsModel {
         busy = false
         switch result {
         case .success(let d):
-            do { try d.write(to: url, options: .atomic); flash("Exported \(items.count) items, encrypted.") } catch { self.error = error.localizedDescription }
+            do { try Self.writePrivate(d, to: url); flash("Exported \(items.count) items, encrypted.") } catch { self.error = error.localizedDescription }
         case .failure(let e): error = e.localizedDescription
         }
     }
@@ -495,7 +539,11 @@ final class PasswordsModel {
     func importEncrypted(password: String) async {
         let panel = NSOpenPanel()
         panel.message = "Choose a RamPart export (.rpexport)."
-        guard panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url) else { return }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 512 * 1_048_576 {
+            error = "That file is too large to be a RamPart export."; return
+        }
+        guard let data = try? Data(contentsOf: url) else { return }
         busy = true
         let result: Result<(items: [VaultItem], folders: [VaultFolder]), Error> = await Task.detached { Result { try EncryptedExport.import(data, password: password) } }.value
         busy = false
@@ -508,6 +556,12 @@ final class PasswordsModel {
             flash("Imported \(r.items.count) items.")
         case .failure(let e): error = e.localizedDescription
         }
+    }
+
+    /// Writes a file only the user can read (0600), atomically. Used for exports and saved attachments.
+    nonisolated static func writePrivate(_ data: Data, to url: URL) throws {
+        try data.write(to: url, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     func saveToKeychain(_ item: VaultItem) {

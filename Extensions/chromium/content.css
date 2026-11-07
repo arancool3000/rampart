@@ -1,40 +1,4 @@
-/* RamPart Web Protection: injected UI. Namespaced, high specificity, inert to page styles. */
-.rampart-root, .rampart-root * { all: revert; box-sizing: border-box; font-family: -apple-system, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif !important; }
-.rampart-root { color: #0d1b2a; }
+/* RamPart Web Protection: page-level styles. All RamPart UI is drawn inside a closed shadow root
+   (content.js, harden-hx6 N1) with its own stylesheet; the only thing left here is the scroll lock
+   while the full-page warning is up. */
 html.rampart-locked { overflow: hidden !important; }
-.rampart-interstitial { position: fixed !important; inset: 0 !important; z-index: 2147483647 !important; display: flex !important; align-items: center; justify-content: center; padding: 24px;
-  background: radial-gradient(1200px 800px at 70% 20%, #0a2a3a 0%, #071320 60%, #050b14 100%) !important; }
-.rampart-card { width: min(560px, 100%); background: rgba(255,255,255,0.96) !important; border-radius: 18px !important; padding: 28px 30px !important; box-shadow: 0 30px 80px rgba(0,0,0,0.45); border: 1px solid rgba(255,255,255,0.4); }
-.rampart-card-small { width: min(440px, 100%); }
-.rampart-badge { display: inline-block; font-size: 11px !important; font-weight: 700 !important; letter-spacing: 0.08em; text-transform: uppercase; color: #0a84a0 !important; background: rgba(10,132,160,0.12) !important; padding: 3px 9px !important; border-radius: 999px !important; margin-bottom: 14px !important; }
-.rampart-card h1 { font-size: 24px !important; font-weight: 700 !important; margin: 0 0 8px !important; line-height: 1.2; color: #0d1b2a !important; }
-.rampart-card h2 { font-size: 18px !important; font-weight: 700 !important; margin: 0 0 6px !important; color: #0d1b2a !important; }
-.rampart-card p { font-size: 15px !important; line-height: 1.45; margin: 0 0 10px !important; color: #2c3e50 !important; }
-.rampart-host code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important; font-size: 13px !important; background: #eef3f6 !important; padding: 2px 6px !important; border-radius: 6px !important; color: #a33 !important; }
-.rampart-reasons { margin: 12px 0 18px !important; padding: 0 0 0 18px !important; }
-.rampart-reasons li { font-size: 14px !important; line-height: 1.4; margin: 0 0 8px !important; color: #2c3e50 !important; }
-.rampart-reasons strong { color: #0d1b2a !important; font-weight: 600 !important; }
-.rampart-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
-.rampart-primary, .rampart-secondary, .rampart-link, .rampart-close { cursor: pointer !important; font-size: 14px !important; font-weight: 600 !important; border-radius: 999px !important; padding: 9px 18px !important; border: 0 !important; }
-.rampart-primary { background: linear-gradient(180deg, #17b8cc, #0a84a0) !important; color: #fff !important; box-shadow: 0 6px 18px rgba(10,132,160,0.35); }
-.rampart-secondary { background: #eef3f6 !important; color: #2c3e50 !important; }
-.rampart-primary:focus, .rampart-secondary:focus { outline: 3px solid rgba(23,184,204,0.5) !important; }
-.rampart-foot { font-size: 12px !important; color: #6c7a89 !important; margin-top: 14px !important; }
-.rampart-banner { position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important; z-index: 2147483646 !important; display: flex !important; align-items: center; gap: 12px; flex-wrap: wrap;
-  padding: 10px 16px !important; background: #fff6df !important; color: #4a3b00 !important; border-bottom: 1px solid #f0d890 !important; box-shadow: 0 4px 16px rgba(0,0,0,0.12); font-size: 14px !important; }
-.rampart-banner-danger { background: #ffe9e6 !important; border-bottom-color: #f3b8b0 !important; color: #5a1a12 !important; }
-.rampart-banner .rampart-badge { margin: 0 !important; }
-.rampart-banner-text { flex: 1 1 320px; line-height: 1.35; }
-.rampart-link { background: transparent !important; color: #0a84a0 !important; padding: 4px 8px !important; text-decoration: underline; }
-.rampart-close { background: transparent !important; font-size: 20px !important; line-height: 1; padding: 0 6px !important; color: inherit !important; }
-.rampart-banner-reasons { flex-basis: 100%; }
-.rampart-clip { position: fixed !important; inset: 0 !important; z-index: 2147483647 !important; display: flex !important; align-items: center; justify-content: center; background: rgba(5,11,20,0.55) !important; padding: 24px; }
-.rampart-cmd { font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important; font-size: 12px !important; background: #0d1b2a !important; color: #ffd166 !important; padding: 10px 12px !important; border-radius: 10px !important; white-space: pre-wrap !important; word-break: break-all; max-height: 140px; overflow: auto; margin: 8px 0 14px !important; }
-@media (prefers-color-scheme: dark) {
-  .rampart-card { background: rgba(18,28,40,0.98) !important; border-color: rgba(255,255,255,0.12); }
-  .rampart-card h1, .rampart-card h2, .rampart-reasons strong { color: #f2f6f9 !important; }
-  .rampart-card p, .rampart-reasons li { color: #c7d1db !important; }
-  .rampart-host code { background: #1e2b3a !important; color: #ff8a80 !important; }
-  .rampart-secondary { background: #243447 !important; color: #e6edf3 !important; }
-}
-@media (prefers-reduced-motion: no-preference) { .rampart-card { animation: rampart-in 240ms ease-out; } @keyframes rampart-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } } }

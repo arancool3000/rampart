@@ -162,11 +162,18 @@ public struct GuardPaths: Codable, Hashable, Sendable {
         return p
     }
 
-    public var labels: [String] { [daemonLabel, watchdogLabel, agentLabel] }
-    public var plists: [String] { [daemonPlist, watchdogPlist, agentPlist] }
-    public var binaries: [String] { [daemonBinary, watchdogBinary] }
+    /// Third guardian (see GuardianRing). Derived from the watchdog paths so the Codable layout is unchanged.
+    /// hx5: the sentinel used to be missing from labels/plists/binaries, so `killall app.rampart.sentinel`, `rm` of its
+    /// binary or an edit of its plist was never reported and its plist never validated as ours.
+    public var sentinelLabel: String { Product.bundlePrefix + ".sentinel" }
+    public var sentinelBinary: String { (watchdogBinary as NSString).deletingLastPathComponent + "/" + Product.bundlePrefix + ".sentinel" }
+    public var sentinelPlist: String { (watchdogPlist as NSString).deletingLastPathComponent + "/" + Product.bundlePrefix + ".sentinel.plist" }
+
+    public var labels: [String] { [daemonLabel, watchdogLabel, sentinelLabel, agentLabel] }
+    public var plists: [String] { [daemonPlist, watchdogPlist, sentinelPlist, agentPlist] }
+    public var binaries: [String] { [daemonBinary, watchdogBinary, sentinelBinary] }
     /// Prefixes under which any write/delete/rename by a foreign process is tampering.
-    public var protectedPrefixes: [String] { [daemonBinary, watchdogBinary, daemonPlist, watchdogPlist, agentPlist, appBundle, supportRoot] }
+    public var protectedPrefixes: [String] { [daemonBinary, watchdogBinary, sentinelBinary, daemonPlist, watchdogPlist, sentinelPlist, agentPlist, appBundle, supportRoot] }
     /// Files whose edit is treated as critical (they decide whether we run at all).
     public var criticalFiles: [String] { plists + binaries + [configFile, allowRulesFile, keyFile, manifestFile] }
 
@@ -243,6 +250,11 @@ public typealias KillHook = @Sendable (Int32, Int32) -> Bool
 /// Rough-and-ready clock injection for back-off and token expiry tests.
 public struct GuardClock: Sendable {
     public var now: @Sendable () -> Date
-    public init(now: @escaping @Sendable () -> Date = { Date() }) { self.now = now }
+    /// Monotonic seconds (not affected by `date`/`systemsetup -setdate`/NTP jumps). hx5: expiry and back-off checks
+    /// also consult this so a clock moved backwards cannot stretch a token, a session or a back-off window.
+    public var monotonic: @Sendable () -> TimeInterval
+    public init(now: @escaping @Sendable () -> Date = { Date() },
+                monotonic: @escaping @Sendable () -> TimeInterval = { GuardClock.uptime() }) { self.now = now; self.monotonic = monotonic }
+    public static func uptime() -> TimeInterval { Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1e9 }
     public static let live = GuardClock()
 }

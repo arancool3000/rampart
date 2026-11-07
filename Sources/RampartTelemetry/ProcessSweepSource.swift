@@ -264,6 +264,7 @@ public final class ProcessSweepSource: EventSource, CPUReporting {
             if let rpath = ProcInspector.path(rp) { detail["responsible_path"] = rpath }
         }
         if argv == nil { detail["argv"] = "unavailable" }
+        TelemetrySanitize.clean(detail: &detail)   // paths can carry control chars / bidi overrides
         let date = Date(timeIntervalSince1970: Double(info.startSec) + Double(info.startUsec) / 1e6)
         emitted += 1
         handler?(SecurityEvent(date: date, kind: .exec, process: proc, path: exe, detail: detail, source: name))

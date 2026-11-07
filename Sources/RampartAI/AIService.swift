@@ -86,7 +86,13 @@ public final class AIService: @unchecked Sendable {
         return AIPrepared(tool: tool, model: model ?? settings.modelID, request: req, disclosure: disclosure,
                           redaction: Redactor.Result(text: userText, counts: counts),
                           estimatedTokens: GeminiClient.estimateTokens(req), timeout: timeout,
-                          decode: { text in try validate(try GeminiClient.decodeJSON(Raw.self, from: text)) })
+                          decode: { text in
+                              // Model output is untrusted: refuse answers that echo our markers, nonce or instructions.
+                              if PromptKit.leaksPrompt(text, nonce: nonce, prompts: [PromptKit.baseRules, system]) {
+                                  throw GeminiError.validation("the answer repeated RamPart's internal instructions")
+                              }
+                              return try validate(try GeminiClient.decodeJSON(Raw.self, from: text))
+                          })
     }
 
     static func list(_ a: [String]) -> String {
@@ -115,6 +121,9 @@ enum Clean {
         guard var t = s else { return "" }
         t = String(t.unicodeScalars.filter { $0 == "\n" || !CharacterSet.controlCharacters.contains($0) }.map(Character.init))
         t = t.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "```", with: "")
+        t = PromptKit.neutralize(t)
+        // Bidi overrides, zero-width and other invisible format characters (Cf) can disguise text; drop them.
+        t = String(t.unicodeScalars.filter { $0.properties.generalCategory != .format }.map(Character.init))
         t = t.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.count > max ? String(t.prefix(max - 1)) + "…" : t
     }

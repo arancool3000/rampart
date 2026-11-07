@@ -155,6 +155,10 @@ public struct PageSignals: Codable, Hashable, Sendable {
     public var hasWalletConnect: Bool = false
     public var isTopFrame: Bool = true
     public var isHTTPS: Bool = true
+    /// First `<h1>` (≤200 chars), sent by newer extensions. Optional so older senders still decode.
+    public var h1: String? = nil
+    /// Absolute hrefs ending in .dmg/.pkg/.mpkg/.zip/.app/.iso (≤30), sent by newer extensions.
+    public var downloadLinks: [String]? = nil
     public init() {}
 }
 

@@ -75,7 +75,7 @@ struct SafariSetupCard: View {
 
     private var advanced: some View {
         VStack(alignment: .leading, spacing: Spacing.m) {
-            Text("If the Safari extension can't be loaded, RamPart can still scan Safari pages by sending its scanner script to Safari through “Develop › Allow JavaScript from Apple Events”.")
+            Text("If the Safari extension can't be loaded, RamPart can still scan Safari pages by sending its scanner script to Safari through “Develop › Allow JavaScript from Apple Events”. The scanner runs inside the page, so a hostile page can see it and hide from it: it catches fewer scams than the extension.")
                 .font(.callout).fixedSize(horizontal: false, vertical: true)
             HStack(alignment: .top, spacing: Spacing.s) {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Color.statusAttention)

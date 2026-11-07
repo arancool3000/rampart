@@ -1,6 +1,11 @@
-// Injected after a non-safe verdict in JavaScript-control mode. Placeholders are filled by the app:
-// __LEVEL__ ("block"|"warn"), __HEADLINE__, __REASONS__ (JSON array of {title, detail}).
+// Injected after a non-safe verdict in JavaScript-control mode. Placeholders (double-underscore names
+// below) are filled by the app: LEVEL ("block"|"warn"), HEADLINE, REASONS (JSON array of {title, detail}),
+// EXPECTED_URL (the URL Safari reported for the scanned tab). Filled in one pass by
+// SafariJSControlScript.fillBanner. hx6: draws nothing unless this tab is still on the judged page.
 (function () {
+  const expected = __EXPECTED_URL__;
+  const strip = (u) => String(u).split("#")[0];
+  if (strip(location.href) !== strip(expected)) return;
   if (document.getElementById("rampart-jsc")) return;
   const level = "__LEVEL__", headline = __HEADLINE__, reasons = __REASONS__;
   const root = document.createElement("div"); root.id = "rampart-jsc";

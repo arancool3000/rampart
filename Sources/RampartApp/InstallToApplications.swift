@@ -2,6 +2,7 @@ import RampartShared
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+import Security
 
 /// Copies the running bundle into /Applications (temporary name, then swap). Never deletes the running copy.
 @MainActor
@@ -18,7 +19,51 @@ final class ApplicationsMover {
 
     func requestMove() {
         guard phase != .copying else { return }
-        if FileManager.default.fileExists(atPath: destination.path) { phase = .confirmReplace } else { copy(replacing: false) }
+        if FileManager.default.fileExists(atPath: destination.path) {
+            if let why = Self.replaceRefusal(source: source, destination: destination) { phase = .failed(why); return }
+            phase = .confirmReplace
+        } else { copy(replacing: false) }
+    }
+
+    /// Never replace something that isn't RamPart, or a newer RamPart, with this copy.
+    nonisolated static func replaceRefusal(source: URL, destination: URL) -> String? {
+        func info(_ u: URL) -> [String: Any]? {
+            guard let d = FileManager.default.contents(atPath: u.appendingPathComponent("Contents/Info.plist").path) else { return nil }
+            return (try? PropertyListSerialization.propertyList(from: d, format: nil)) as? [String: Any]
+        }
+        guard let old = info(destination), (old["CFBundleIdentifier"] as? String) == Bundle.main.bundleIdentifier ?? "app.rampart.app" else {
+            return "Something else named \(destination.lastPathComponent) is already in Applications. Rename or remove it in Finder first."
+        }
+        let new = info(source) ?? [:]
+        var c = compareVersions(new["CFBundleShortVersionString"] as? String ?? "", old["CFBundleShortVersionString"] as? String ?? "")
+        if c == 0 { c = compareVersions(new["CFBundleVersion"] as? String ?? "", old["CFBundleVersion"] as? String ?? "") }
+        if c == -1 { return "Applications already has a newer \(Product.name). Open that one instead." }
+        return nil
+    }
+
+    /// Dot-separated numeric compare; nil when either side isn't a plain version.
+    nonisolated static func compareVersions(_ a: String, _ b: String) -> Int? {
+        func parts(_ s: String) -> [Int]? {
+            let c = s.split(separator: ".", omittingEmptySubsequences: false)
+            guard !c.isEmpty, c.count <= 6 else { return nil }
+            var out: [Int] = []
+            for x in c { guard !x.isEmpty, x.count <= 15, x.allSatisfy({ $0.isASCII && $0.isNumber }), let v = Int(x) else { return nil }; out.append(v) }
+            return out
+        }
+        guard let x = parts(a), let y = parts(b) else { return nil }
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p < q ? -1 : 1 }
+        }
+        return 0
+    }
+
+    /// Strict static signature check of the copy before it replaces anything (catches a torn or altered copy).
+    nonisolated static func copyIsValid(_ url: URL) -> Bool {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, let code else { return false }
+        let flags = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckAllArchitectures | kSecCSCheckNestedCode)
+        return SecStaticCodeCheckValidity(code, flags, nil) == errSecSuccess
     }
 
     func cancelReplace() { phase = .idle }
@@ -32,6 +77,12 @@ final class ApplicationsMover {
             let tmp = dst.deletingLastPathComponent().appendingPathComponent(".\(dst.lastPathComponent).\(UUID().uuidString).tmp")
             do {
                 try fm.copyItem(at: src, to: tmp)
+                guard ApplicationsMover.copyIsValid(tmp) else {
+                    throw NSError(domain: "Rampart", code: 1, userInfo: [NSLocalizedDescriptionKey: "The copy didn't pass the code signature check, so nothing was replaced. Drag \(Product.name) to Applications in Finder instead."])
+                }
+                if replacing, let why = ApplicationsMover.replaceRefusal(source: src, destination: dst) {
+                    throw NSError(domain: "Rampart", code: 2, userInfo: [NSLocalizedDescriptionKey: why])
+                }
                 if replacing, fm.fileExists(atPath: dst.path) {
                     _ = try fm.replaceItemAt(dst, withItemAt: tmp, backupItemName: nil, options: [])
                 } else {
@@ -54,7 +105,7 @@ final class ApplicationsMover {
         NSWorkspace.shared.openApplication(at: destination, configuration: cfg) { app, error in
             Task { @MainActor in
                 if let error { ApplicationsMover.shared.phase = .failed(error.localizedDescription) }
-                else if app != nil { NSApp.terminate(nil) }
+                else if app != nil { DaemonLauncher.shared.stopChild(); NSApp.terminate(nil) }   // hx8: the new copy starts its own helper
             }
         }
     }

@@ -94,7 +94,7 @@ final class BuiltinScanner: ScanService {
                 if cancelled() { return }
                 let d = evaluate(p)
                 lock.lock(); done += 1; if let d { found.append(d) }; let n = done; lock.unlock()
-                if n % 200 == 0 { progress(n, files.count, p) }
+                if n % 200 == 0 { progress(n, files.count, p, ScanTick(walkFinished: true)) }
             }
         }
         return ScanOutcome(scanned: done, detections: found, seconds: Date().timeIntervalSince(start))

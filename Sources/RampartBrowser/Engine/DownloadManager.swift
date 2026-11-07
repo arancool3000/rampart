@@ -34,7 +34,7 @@ final class DownloadManager: NSObject {
     private(set) var items: [Item] = []
     var daemonAvailable: Bool? = nil
     let vault: URL = Paths.userRoot.appendingPathComponent("BrowserDownloads")
-    @ObservationIgnored private var active: [ObjectIdentifier: (download: WKDownload, id: UUID, url: URL, risky: Bool)] = [:]
+    @ObservationIgnored private var active: [ObjectIdentifier: (download: WKDownload, id: UUID, url: URL, risky: Bool, banking: Bool, redirects: Int)] = [:]
 
     override init() {
         super.init()
@@ -49,7 +49,7 @@ final class DownloadManager: NSObject {
         dest = dest.appendingPathComponent(name)
         let item = Item(filename: name, sourceHost: sourceHost, cls: cls, state: .downloading(-1))
         items.insert(item, at: 0)
-        active[ObjectIdentifier(download)] = (download, item.id, dest, risky)
+        active[ObjectIdentifier(download)] = (download, item.id, dest, risky, bankingMode, 0)
         download.delegate = self
         return dest
     }
@@ -61,7 +61,12 @@ final class DownloadManager: NSObject {
     /// Quarantine + strip exec bits, then scan via the daemon and apply the policy.
     private func finish(id: UUID, url: URL, risky: Bool, bankingMode: Bool) async {
         update(id) { $0.state = .scanning }
-        Self.applyQuarantine(url)
+        // hx6: a file that couldn't be quarantined (xattr refused, file swapped for a symlink) never
+        // leaves the vault: without the flag Gatekeeper would not check it when opened.
+        guard Self.applyQuarantine(url) else {
+            update(id) { $0.state = .held(reason: "RamPart couldn't mark this file as downloaded from the internet, so it stays in the vault. Delete it unless you expected it.", url: url) }
+            return
+        }
         let cls = items.first(where: { $0.id == id })?.cls ?? .other
         let outcome: ScanOutcome
         do {
@@ -76,7 +81,10 @@ final class DownloadManager: NSObject {
         let action = DownloadPolicy(bankingMode: bankingMode).decide(class: cls, outcome: outcome, fromRiskySite: risky)
         switch action {
         case .release:
-            let final = Self.release(url)
+            guard let final = Self.release(url) else {
+                update(id) { $0.state = .held(reason: "RamPart couldn't move this file to Downloads. It stays quarantined in the vault.", url: url) }
+                return
+            }
             update(id) { $0.state = .released(final) }
         case .holdForConfirmation(let reason):
             update(id) { $0.state = .held(reason: reason, url: url) }
@@ -88,7 +96,8 @@ final class DownloadManager: NSObject {
     /// User confirmed a held item: move to ~/Downloads (quarantine flag stays, Gatekeeper still runs).
     func releaseHeld(_ id: UUID) {
         guard let item = items.first(where: { $0.id == id }), case .held(_, let url) = item.state else { return }
-        let final = Self.release(url)
+        // hx6: re-apply (and re-check) the quarantine flag right before release.
+        guard Self.applyQuarantine(url), let final = Self.release(url) else { return }
         update(id) { $0.state = .released(final) }
     }
     func delete(_ id: UUID) {
@@ -104,23 +113,42 @@ final class DownloadManager: NSObject {
         NSWorkspace.shared.activateFileViewerSelecting([u])
     }
 
-    static func applyQuarantine(_ url: URL) {
-        let value = DownloadPolicy.quarantineAttribute()
-        _ = value.withCString { setxattr(url.path, "com.apple.quarantine", $0, strlen($0), 0, 0) }
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    /// Sets `com.apple.quarantine` and 0600 on a regular file, through one descriptor opened with
+    /// O_NOFOLLOW so a symlink planted in the vault can't redirect either change. Returns false unless
+    /// the flag reads back. (hx6)
+    @discardableResult
+    nonisolated static func applyQuarantine(_ url: URL, date: Date = Date()) -> Bool {
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return false }
+        let value = DownloadPolicy.quarantineAttribute(date: date)
+        let set = value.withCString { fsetxattr(fd, "com.apple.quarantine", $0, strlen($0), 0, 0) }
+        guard set == 0 else { return false }
+        guard fchmod(fd, 0o600) == 0 else { return false }
+        let n = fgetxattr(fd, "com.apple.quarantine", nil, 0, 0, 0)
+        return n > 0
     }
 
-    static func release(_ url: URL) -> URL {
-        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
-        var dest = downloads.appendingPathComponent(url.lastPathComponent)
-        var n = 2
-        let base = url.deletingPathExtension().lastPathComponent, ext = url.pathExtension
-        while FileManager.default.fileExists(atPath: dest.path) {
-            dest = downloads.appendingPathComponent(ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)"); n += 1
+    /// Moves a vault file into ~/Downloads under a name that doesn't exist yet. Uses renamex_np with
+    /// RENAME_EXCL so an existing file or a symlink planted under that name is never replaced, and
+    /// returns nil (file stays in the vault) if the move can't be done safely. (hx6)
+    nonisolated static func release(_ url: URL, downloads explicitDir: URL? = nil) -> URL? {
+        let downloads = explicitDir ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
+        let name = DownloadPolicy.safeFilename(url.lastPathComponent)
+        let base = (name as NSString).deletingPathExtension, ext = (name as NSString).pathExtension
+        for n in 1...200 {
+            let candidate = n == 1 ? name : (ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)")
+            let dest = downloads.appendingPathComponent(candidate)
+            let r = url.path.withCString { src in dest.path.withCString { dst in renamex_np(src, dst, UInt32(RENAME_EXCL)) } }
+            if r == 0 {
+                try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+                return dest
+            }
+            if errno != EEXIST { return nil }
         }
-        do { try FileManager.default.moveItem(at: url, to: dest) } catch { return url }
-        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
-        return dest
+        return nil
     }
 }
 
@@ -133,7 +161,8 @@ extension DownloadManager: WKDownloadDelegate {
     }
     func downloadDidFinish(_ download: WKDownload) {
         guard let a = active.removeValue(forKey: ObjectIdentifier(download)) else { return }
-        let banking = BrowserModel.shared.bankingMode
+        // hx6: Banking mode applies if it was on when the download started OR is on now.
+        let banking = a.banking || BrowserModel.shared.bankingMode
         Task { await finish(id: a.id, url: a.url, risky: a.risky, bankingMode: banking) }
     }
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
@@ -142,8 +171,16 @@ extension DownloadManager: WKDownloadDelegate {
         try? FileManager.default.removeItem(at: a.url.deletingLastPathComponent())
     }
     func download(_ download: WKDownload, decidePolicyForHTTPRedirect response: HTTPURLResponse, newRequest request: URLRequest) async -> WKDownload.RedirectPolicy {
-        // Redirects to plain HTTP or to a blocked host cancel the download.
+        // Redirects to plain HTTP or to a blocked host cancel the download. hx6: so do more than
+        // DownloadPolicy.maxRedirects hops; any look-alike / scam hop, or a long chain, marks the source risky.
         guard let u = request.url, u.scheme?.lowercased() == "https" else { return .cancel }
-        return WebEngineAdapter.shared.facts(for: u).blocklistHit == nil ? .allow : .cancel
+        let key = ObjectIdentifier(download)
+        guard var a = active[key] else { return .cancel }
+        a.redirects += 1
+        let f = WebEngineAdapter.shared.facts(for: u)
+        if f.blocklistHit != nil || f.scamVerdict == .likelyScam || a.redirects > DownloadPolicy.maxRedirects { return .cancel }
+        if DownloadPolicy.isRiskySource(hops: [f], redirectCount: a.redirects) { a.risky = true }
+        active[key] = a
+        return .allow
     }
 }

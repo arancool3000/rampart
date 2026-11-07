@@ -90,17 +90,20 @@ enum Util {
         return users.filter { !$0.hasPrefix(".") && $0 != "Shared" && $0 != "Guest" }.map { "/Users/" + $0 }
     }
 
-    static func ensureDir(_ url: URL, mode: Int = 0o700) {
+    static func ensureDir(_ url: URL, mode: Int = 0o700, tighten: Bool = false) {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: mode])
+        // An existing folder we own is tightened to `mode` (hx8: the user socket folder must be 0700).
+        var st = stat()
+        if tighten, lstat(url.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR, st.st_uid == getuid(), Int(st.st_mode & 0o777) & ~mode != 0 {
+            chmod(url.path, mode_t(mode))
+        }
     }
 
     /// Atomic JSON write with restricted permissions.
+    /// hx10: goes through SecureStore (O_EXCL|O_NOFOLLOW temp, fchmod, fsync, rename): no world-readable window.
     static func writeJSON<T: Encodable>(_ value: T, to url: URL, mode: Int = 0o600) throws {
-        let enc = JSONEncoder.rampart; enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try enc.encode(value)
-        try data.write(to: url, options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: url.path)
+        try SecureStore.writeJSON(value, to: url, mode: mode_t(mode))
     }
 
     /// Combined confidence per ARCHITECTURE.md: 100·(1 − Π(1 − s/100)).
@@ -135,8 +138,12 @@ final class DLog {
     func openFile(_ url: URL) {
         Util.ensureDir(url.deletingLastPathComponent(), mode: 0o755)
         if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o640])
+            FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
+        // Never follow a planted symlink to the log file; tighten loose permissions from older versions.
+        var lst = stat()
+        if lstat(url.path, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFLNK { unlink(url.path); FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600]) }
+        chmod(url.path, 0o600)
         // Simple rotation at 10 MB.
         if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? UInt64, size > 10 << 20 {
             let old = url.appendingPathExtension("1")
@@ -148,7 +155,9 @@ final class DLog {
         _ = try? fileHandle?.seekToEnd()
     }
 
-    func log(_ level: String, _ msg: String) {
+    func log(_ level: String, _ raw: String) {
+        // hx10: no forged lines, bidi tricks or secrets in the log file / unified log.
+        let msg = LogRedact.clean(raw, max: 4000)
         let line = "\(ISO8601DateFormatter().string(from: Date())) [\(level)] \(msg)\n"
         switch level {
         case "error": oslog.error("\(msg, privacy: .public)")

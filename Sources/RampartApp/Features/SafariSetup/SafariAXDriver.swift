@@ -66,6 +66,10 @@ final class SafariAXDriver {
             if let v = attr(el, kAXValueAttribute) {
                 if let n = v as? NSNumber { value = n.stringValue } else if let s = v as? String { value = s }
             }
+            // hx6: a menu item's checked state is its mark character, not AXValue. Without this the planner
+            // read every Develop toggle as "off": it re-pressed "Allow Unsigned Extensions" (turning it OFF),
+            // and the guard's turnOffJSFromAppleEvents() never pressed "Allow JavaScript from Apple Events".
+            if role == "AXMenuItem" { value = Self.menuItemState(markChar: attr(el, kAXMenuItemMarkCharAttribute) as? String) }
             var children: [AXNode] = []
             if depth < maxDepth, count < maxNodes, role != "AXWebArea", role != "AXScrollArea" || title != nil {
                 if let kids = attr(el, kAXChildrenAttribute) as? [AXUIElement] {
@@ -81,6 +85,27 @@ final class SafariAXDriver {
             root = AXNode(role: root.role, title: root.title, value: root.value, children: root.children + [mbNode], ref: root.ref)
         }
         return root
+    }
+
+    /// "1" when the menu item shows a check mark, "0" otherwise. Pure, so it is testable.
+    nonisolated static func menuItemState(markChar: String?) -> String {
+        guard let m = markChar?.trimmingCharacters(in: .whitespaces), !m.isEmpty else { return "0" }
+        return "1"
+    }
+
+    /// hx6: the RamPart row in Settings › Extensions, matched exactly. The planner's substring match
+    /// would also accept another extension whose name merely contains "RamPart" (e.g. "RamPart Free VPN"),
+    /// and the setup would then switch that one on. Returns nil when the match is missing or ambiguous.
+    nonisolated static func exactExtensionCheckbox(in tree: AXNode, names: Set<String>) -> AXNode? {
+        func norm(_ s: String?) -> String {
+            (s ?? "").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                .unicodeScalars.filter { !$0.properties.isWhitespace || $0 == " " }.map(String.init).joined()
+                .trimmingCharacters(in: .whitespaces)
+        }
+        let wanted = Set(names.map { norm($0) })
+        guard let win = tree.descendants().first(where: { $0.role == "AXWindow" && norm($0.title) == "extensions" }) else { return nil }
+        let exact = win.descendants().filter { $0.role == "AXCheckBox" && wanted.contains(norm($0.title)) }
+        return exact.count == 1 ? exact[0] : nil
     }
 
     static func press(_ node: AXNode, name: String) throws {

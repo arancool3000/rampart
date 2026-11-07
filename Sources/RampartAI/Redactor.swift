@@ -61,7 +61,7 @@ public struct Redactor: Sendable {
     private static func re(_ p: String, _ o: NSRegularExpression.Options = []) -> NSRegularExpression {
         try! NSRegularExpression(pattern: p, options: o)
     }
-    private static let privateKeyRE = re(#"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)"#)
+    private static let privateKeyRE = re(#"-----BEGIN [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----[\s\S]*?(-----END [A-Z0-9 ]*PRIVATE KEY[A-Z ]*-----|$)"#)
     private static let knownKeyREs: [NSRegularExpression] = [
         re(#"AIza[0-9A-Za-z_\-]{30,}"#),                    // Google API key
         re(#"\bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}"#),     // OpenAI / Anthropic style
@@ -72,11 +72,25 @@ public struct Redactor: Sendable {
         re(#"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"#), // JWT
         re(#"\b(?:sk|pk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"#), // Stripe
         re(#"(?i)\bBearer\s+[A-Za-z0-9._\-~+/]{12,}=*"#),     // HTTP bearer tokens
+        re(#"(?i)\bBasic\s+(?=[A-Za-z0-9+/]*[0-9+/])[A-Za-z0-9+/]{12,}={0,2}"#),       // HTTP basic auth (base64 user:password)
+        re(#"\bya29\.[0-9A-Za-z_\-]{20,}"#),                 // Google OAuth access token
+        re(#"\b1//[0-9A-Za-z_\-]{20,}"#),                     // Google OAuth refresh token
+        re(#"\bglpat-[0-9A-Za-z_\-]{20,}"#),                  // GitLab
+        re(#"\bnpm_[A-Za-z0-9]{30,}"#),                       // npm
+        re(#"\b(?:SG|xkeysib)[.\-][A-Za-z0-9_\-.]{20,}"#),     // SendGrid / Brevo
+        re(#"\bhf_[A-Za-z0-9]{30,}"#),                        // Hugging Face
+        re(#"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@"#), // credentials inside a URL (scheme://user:pass@)
     ]
     /// `password=...`, `token: ...`, `api_key "..."`, URL params like `?sig=...`
-    private static let secretValueRE = re(#"(?i)\b(pass(?:word|wd)?|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|auth|session|sig|signature|otp|pin|code)(\s*[:=]\s*|=)("[^"]*"|'[^']*'|[^\s&"',;]+)"#)
+    private static let secretValueRE = re(#"(?i)(?<![A-Za-z])(pass(?:word|wd|code|phrase)?|pwd|secret|client[_-]?secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|auth|session|sid|sig|signature|otp|pin|code|cookie|credential|credentials)(["']?\s*[:=]\s*|=)("[^"]*"|'[^']*'|[^\s&"',;]+)"#)
     /// Long opaque tokens with mixed letters and digits (not pure hex hashes, which are kept).
     private static let opaqueTokenRE = re(#"(?<![A-Za-z0-9_\-/.])[A-Za-z0-9_\-]{32,}(?![A-Za-z0-9_\-])"#)
+    /// Prose like "my password is hunter2" or "the code was 482913".
+    private static let proseSecretRE = re(#"(?i)(?<![A-Za-z])((?:pass(?:word|code|phrase)|pin|otp|one[- ]time code|verification code|security code|login code|2fa code)\s+(?:is|was)\s+)("[^"]*"|'[^']*'|[^\s"',;]+)"#)
+    /// Base64-style secrets (AWS secret keys, signing keys) that contain `+` or `/`, judged by character entropy.
+    private static let base64SecretRE = re(#"(?<![A-Za-z0-9+/=_\-.~])[A-Za-z0-9+/]{30,}={0,2}(?![A-Za-z0-9+/=])"#)
+    private static let wordLikeRE = re("^(?:[A-Za-z]+[0-9]*|[0-9]+)$")
+    private static let encodedHomeRE = re(#"(?i)%2F(?:Users|home)%2F(?!Shared\b)[^%/\s"'`]+"#)
     private static let emailRE = re(#"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#)
     private static let cardRE = re(#"(?<!\d)(?:\d[ \-]?){12,18}\d(?!\d)"#)
     private static let ibanRE = re(#"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b"#)
@@ -110,9 +124,25 @@ public struct Redactor: Sendable {
             if value.hasPrefix("[") || value.count < 3 { return nil }
             return ns.substring(with: m.range(at: 1)) + ns.substring(with: m.range(at: 2)) + Kind.secretValue.placeholder
         }
+        apply(Self.proseSecretRE, .secretValue) { match, m, full in
+            let ns = full as NSString
+            let value = ns.substring(with: m.range(at: 2))
+            if value.hasPrefix("[") || value.count < 3 { return nil }
+            return ns.substring(with: m.range(at: 1)) + Kind.secretValue.placeholder
+        }
         apply(Self.emailRE, .email)
         // Home paths before opaque tokens so "/Users/name" collapses to "~".
         apply(Self.homeRE, .homePath)
+        apply(Self.encodedHomeRE, .homePath)
+        apply(Self.base64SecretRE, .apiKey) { match, _, _ in
+            guard match.contains(where: { $0 == "+" || $0 == "/" }) || match.hasSuffix("=") else { return nil }
+            let hasUpper = match.contains { $0.isUppercase }, hasLower = match.contains { $0.isLowercase }, hasDigit = match.contains { $0.isNumber }
+            // A relative folder path ("Projects2024/MyApp/Build") has word-like segments; random base64 doesn't.
+            let looksLikePath = !match.contains("+") && !match.hasSuffix("=") && match.split(separator: "/").allSatisfy { seg in
+                Self.wordLikeRE.firstMatch(in: String(seg), range: NSRange(location: 0, length: (seg as Substring).utf16.count)) != nil
+            }
+            return hasUpper && hasLower && hasDigit && !looksLikePath && Self.entropy(match) >= 3.5 ? Kind.apiKey.placeholder : nil
+        }
         apply(Self.opaqueTokenRE, .apiKey) { match, _, _ in
             let isHex = match.allSatisfy { $0.isHexDigit }
             let hasLetter = match.contains { $0.isLetter }, hasDigit = match.contains { $0.isNumber }
@@ -137,6 +167,14 @@ public struct Redactor: Sendable {
             apply(r, .userName)
         }
         return Result(text: text, counts: counts)
+    }
+
+    /// Shannon entropy in bits per character.
+    static func entropy(_ s: String) -> Double {
+        var freq: [Character: Int] = [:]
+        for c in s { freq[c, default: 0] += 1 }
+        let n = Double(s.count)
+        return freq.values.reduce(0) { $0 - (Double($1) / n) * log2(Double($1) / n) }
     }
 
     static func luhn(_ digits: String) -> Bool {

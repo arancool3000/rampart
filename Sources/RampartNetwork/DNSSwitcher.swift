@@ -83,12 +83,32 @@ public final class DNSSwitcher: @unchecked Sendable {
     }
 
     /// Commands that restore `snapshot` (services with no saved servers go back to DHCP via `empty`).
+    /// Hardening (hx4): the snapshot is a file on disk, so its contents are re-validated before use. Servers
+    /// must be IP literals and never our own resolver (any loopback address while we own loopback DNS would
+    /// leave the Mac without DNS once we stop), at most 8 per service; service names must be plain text that
+    /// cannot be read as a networksetup flag. Anything invalid falls back to DHCP (`empty`), which always works.
     public func restoreCommands(for snapshot: [ServiceDNS]) -> [NetCommand] {
-        snapshot.filter(\.enabled).map { svc in
+        snapshot.filter { $0.enabled && Self.isSafeServiceName($0.service) }.map { svc in
             // Never "restore" to ourselves (e.g. snapshot taken while already switched).
-            let servers = svc.servers.filter { !resolverAddresses.contains($0) }
+            let servers = Array(svc.servers.filter { s in
+                guard let b = DNSWire.addressBytes(s), !resolverAddresses.contains(s) else { return false }
+                if b.count == 4 { return b[0] != 127 && b != [0, 0, 0, 0] }
+                return b != [UInt8](repeating: 0, count: 15) + [1] && b != [UInt8](repeating: 0, count: 16)
+            }.prefix(8))
             return NetCommand(Self.networksetup, ["-setdnsservers", svc.service] + (servers.isEmpty ? ["empty"] : servers))
         } + Self.flushCommands
+    }
+
+    /// Network service names come from networksetup itself; reject anything that could be parsed as a flag
+    /// or that carries control characters (a tampered snapshot).
+    public static func isSafeServiceName(_ s: String) -> Bool {
+        !s.isEmpty && s.count <= 128 && !s.hasPrefix("-") && !s.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F }
+    }
+
+    /// Crash recovery: a snapshot on disk while the filter is not running means a previous run switched DNS
+    /// and died before restoring. The daemon should call `restore()` at launch when this is true.
+    public func needsRecovery(filterRunning: Bool) -> Bool {
+        !filterRunning && FileManager.default.fileExists(atPath: snapshotURL.path)
     }
 
     // MARK: Snapshot persistence

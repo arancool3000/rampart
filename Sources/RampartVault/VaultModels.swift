@@ -173,10 +173,11 @@ public struct VaultSettings: Codable, Hashable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = VaultSettings()
-        autoLockMinutes = try c.decodeIfPresent(Int.self, forKey: .autoLockMinutes) ?? d.autoLockMinutes
+        // Clamped: 0 or negative would silently turn idle locking or clipboard clearing off.
+        autoLockMinutes = try min(1440, max(1, c.decodeIfPresent(Int.self, forKey: .autoLockMinutes) ?? d.autoLockMinutes))
         lockOnSleep = try c.decodeIfPresent(Bool.self, forKey: .lockOnSleep) ?? d.lockOnSleep
         lockOnScreenLock = try c.decodeIfPresent(Bool.self, forKey: .lockOnScreenLock) ?? d.lockOnScreenLock
-        clipboardClearSeconds = try c.decodeIfPresent(Int.self, forKey: .clipboardClearSeconds) ?? d.clipboardClearSeconds
+        clipboardClearSeconds = try min(600, max(5, c.decodeIfPresent(Int.self, forKey: .clipboardClearSeconds) ?? d.clipboardClearSeconds))
         generator = try c.decodeIfPresent(PasswordGenerator.Options.self, forKey: .generator) ?? d.generator
         passphrase = try c.decodeIfPresent(PasswordGenerator.PassphraseOptions.self, forKey: .passphrase) ?? d.passphrase
         let version = try c.decodeIfPresent(Int.self, forKey: .breachDefaultsVersion) ?? 0
@@ -219,6 +220,10 @@ public struct VaultMeta: Codable, Hashable, Sendable {
 public enum VaultError: Error, LocalizedError, Equatable {
     case noVault, alreadyExists, locked, wrongPassword, tampered, unsupportedVersion(Int), badFormat(String)
     case attachmentTooLarge, io(String), weakMasterPassword, biometry(String), biometryChanged, keychain(Int32), cancelled, secureEnclaveFailed(String)
+    /// Too many wrong master passwords in a row: wait this many seconds before the next try.
+    case throttled(Int)
+    /// The vault file is older than the newest one this Mac has seen (an old copy was put back).
+    case rolledBack(found: Int, expected: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -237,6 +242,8 @@ public enum VaultError: Error, LocalizedError, Equatable {
         case .keychain(let s): return "Keychain error \(s): " + ((SecCopyErrorMessageString(s, nil) as String?) ?? "unknown")
         case .cancelled: return "Cancelled."
         case .secureEnclaveFailed(let s): return "This Mac's security chip couldn't open the vault key (\(s)). Unlock with your master password."
+        case .throttled(let s): return "Too many wrong master passwords. Wait \(s) second\(s == 1 ? "" : "s") before trying again."
+        case .rolledBack: return "This vault file is older than the newest version this Mac has saved. Someone or something may have put an old copy back, which could undo password changes. If you restored a backup yourself, choose Open Anyway."
         }
     }
 }

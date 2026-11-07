@@ -51,19 +51,22 @@ public enum ClipboardClassifier {
 }
 
 /// Byte-for-byte mirror of `RampartBehaviour.ClipboardFingerprint` (telemetry can't import the behaviour
-/// module). Produces `detail["clip_tokens"]`: comma-separated first 8 lowercase hex chars of
-/// SHA-256(bootSalt + token). The self-test cross-checks both implementations; change them together.
+/// module). Produces `detail["clip_tokens"]`: comma-separated first 16 lowercase hex chars of
+/// HMAC-SHA256(key: bootSalt, token). `bootSalt` is a private random 256-bit key shared in-process through
+/// `RAMPART_CLIPFP_KEY` (not the world-readable boot UUID). The self-test cross-checks both implementations;
+/// change them together.
 public enum ClipFingerprint {
-    /// Per-boot salt: `sysctl kern.bootsessionuuid` (falls back to kern.boottime seconds).
+    public static let keyEnv = "RAMPART_CLIPFP_KEY"
     public static let bootSalt: String = {
-        var size = 0
-        if sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 1 {
-            var buf = [CChar](repeating: 0, count: size)
-            if sysctlbyname("kern.bootsessionuuid", &buf, &size, nil, 0) == 0 { return String(cString: buf) }
+        if let v = getenv(keyEnv).map({ String(cString: $0) }), v.count == 64, v.allSatisfy(\.isHexDigit) { return v }
+        var bytes = [UInt8](repeating: 0, count: 32)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+            bytes = (0..<32).map { _ in UInt8.random(in: 0...255) }
         }
-        var tv = timeval(); var sz = MemoryLayout<timeval>.size
-        if sysctlbyname("kern.boottime", &tv, &sz, nil, 0) == 0 { return "boot-\(tv.tv_sec)" }
-        return "rampart-unsalted"
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        setenv(keyEnv, hex, 0)
+        if let v = getenv(keyEnv).map({ String(cString: $0) }), v.count == 64 { return v }
+        return hex
     }()
 
     static let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "|;&<>()`\"'{}$"))
@@ -82,7 +85,8 @@ public enum ClipFingerprint {
     }
 
     public static func hash(_ token: String, salt: String = bootSalt) -> String {
-        String(SHA256.hash(data: Data((salt + token).utf8)).map { String(format: "%02x", $0) }.joined().prefix(8))
+        HMAC<SHA256>.authenticationCode(for: Data(token.utf8), using: SymmetricKey(data: Data(salt.utf8)))
+            .prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     public static func fingerprint(_ text: String, salt: String = bootSalt) -> String {

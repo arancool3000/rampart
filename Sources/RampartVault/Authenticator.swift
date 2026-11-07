@@ -7,11 +7,27 @@ public enum Authenticator {
     public struct ParseResult: Sendable {
         public var accounts: [TOTP] = []
         public var errors: [String] = []
+        public init(accounts: [TOTP] = [], errors: [String] = []) { self.accounts = accounts; self.errors = errors }
     }
 
     /// Parses pasted text: otpauth://totp|hotp links and otpauth-migration:// links, one per line (Keyring's
     /// "Copy all", Google Authenticator export), or an Aegis / 2FAS / Bitwarden JSON export.
+    /// Input caps: a pasted export or QR payload is never anywhere near these.
+    public static let maxInputBytes = 2 * 1_048_576
+    public static let maxAccounts = 2000
+
     public static func parse(_ text: String) -> ParseResult {
+        guard text.utf8.count <= maxInputBytes else { return ParseResult(errors: ["That's too much text to be an authenticator export."]) }
+        var r = parseUnchecked(text)
+        // Drop anything a code can't be computed from safely (zero/huge digits or period, empty secret).
+        let before = r.accounts.count
+        r.accounts = r.accounts.filter(\.isWellFormed)
+        if r.accounts.count < before { r.errors.append("Skipped \(before - r.accounts.count) account\(before - r.accounts.count == 1 ? "" : "s") with invalid settings.") }
+        if r.accounts.count > maxAccounts { r.accounts = Array(r.accounts.prefix(maxAccounts)); r.errors.append("Only the first \(maxAccounts) accounts were read.") }
+        return r
+    }
+
+    static func parseUnchecked(_ text: String) -> ParseResult {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("{") || trimmed.hasPrefix("[") { return parseJSON(trimmed) }
         var r = ParseResult()
@@ -80,6 +96,8 @@ public enum Authenticator {
         }
         func alg(_ s: Any?) -> TOTP.Algorithm { TOTP.Algorithm(rawValue: ((s as? String) ?? "SHA1").uppercased()) ?? .sha1 }
         func int(_ v: Any?, _ d: Int) -> Int { (v as? Int) ?? Int((v as? String) ?? "") ?? d }
+        // Counters from a file: negative or non-numeric values become 0 instead of trapping in UInt64(_:).
+        func counter(_ v: Any?) -> UInt64 { (v as? UInt64) ?? UInt64(exactly: int(v, 0)) ?? UInt64((v as? String) ?? "") ?? 0 }
         if let db = obj["db"] {
             // Aegis (plain). An encrypted Aegis vault has "db" as a string.
             guard let db = db as? [String: Any], let entries = db["entries"] as? [[String: Any]] else {
@@ -91,7 +109,7 @@ public enum Authenticator {
                       let sec = (info["secret"] as? String).flatMap(validSecret) else { r.errors.append("Skipped an unsupported Aegis entry."); continue }
                 var t = TOTP(secret: sec, digits: int(info["digits"], 6), period: int(info["period"], 30), algorithm: alg(info["algo"]),
                              issuer: (e["issuer"] as? String).flatMap { $0.isEmpty ? nil : $0 }, account: e["name"] as? String)
-                if type == "hotp" { t.kind = .hotp; t.counter = UInt64(int(info["counter"], 0)) }
+                if type == "hotp" { t.kind = .hotp; t.counter = counter(info["counter"]) }
                 r.accounts.append(t)
             }
         } else if let services = obj["services"] as? [[String: Any]] {
@@ -101,7 +119,7 @@ public enum Authenticator {
                 let otp = s["otp"] as? [String: Any] ?? [:]
                 var t = TOTP(secret: sec, digits: int(otp["digits"], 6), period: int(otp["period"], 30), algorithm: alg(otp["algorithm"]),
                              issuer: (otp["issuer"] as? String) ?? (s["name"] as? String), account: otp["account"] as? String)
-                if ((otp["tokenType"] as? String) ?? "").uppercased() == "HOTP" { t.kind = .hotp; t.counter = UInt64(int(otp["counter"], 0)) }
+                if ((otp["tokenType"] as? String) ?? "").uppercased() == "HOTP" { t.kind = .hotp; t.counter = counter(otp["counter"]) }
                 r.accounts.append(t)
             }
         } else if let items = obj["items"] as? [[String: Any]] {

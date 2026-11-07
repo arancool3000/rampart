@@ -48,12 +48,12 @@ struct NetworkScanView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Home network").font(.title2.weight(.semibold)).fontDesign(.rounded)
                 if let r = model.report {
-                    Text("\(r.subnet.cidr) via \(r.subnet.interface)\(r.wifiSecurity.map { " · \($0)" } ?? "") · scanned \(Fmt.ago(r.date))")
+                    Text("\(r.subnet.cidr) via \(SafeText.line(r.subnet.interface, max: 32))\(r.wifiSecurity.map { " · \(SafeText.line($0, max: 40))" } ?? "") · scanned \(Fmt.ago(r.date))")
                         .font(.callout).foregroundStyle(.secondary)
                 } else if let s = model.eligibleSubnet {
-                    Text("Ready to scan \(s.cidr) on \(s.interface). Only your directly connected network is ever scanned.").font(.callout).foregroundStyle(.secondary)
+                    Text("Ready to scan \(s.cidr) on \(SafeText.line(s.interface, max: 32)). Only your directly connected network is ever scanned.").font(.callout).foregroundStyle(.secondary)
                 } else if let p = model.scopeProblem {
-                    Text(p).font(.callout).foregroundStyle(.secondary)
+                    Text(SafeText.line(p, max: 240)).font(.callout).foregroundStyle(.secondary)
                 }
             }
             Spacer()
@@ -115,13 +115,13 @@ struct NetworkScanView: View {
                     }
                     Text("\(r.probesSent) probes · \(Fmt.duration(r.duration))").font(.caption).foregroundStyle(.secondary)
                 } else if let p = model.progress, model.isScanning {
-                    Text(p.message).font(.body.weight(.medium))
+                    Text(SafeText.line(p.message)).font(.body.weight(.medium))
                     ProgressView(value: p.fraction).progressViewStyle(.linear).tint(.rampartTeal)
                     Text("\(p.devicesSoFar) devices so far").font(.callout).foregroundStyle(.secondary)
                     Text("Gentle: at most 50 probes per second, only on your own network.").font(.caption).foregroundStyle(.secondary)
                 } else if case .failed(let why) = model.state {
                     StatusLabel(text: "Couldn't scan", symbol: "exclamationmark.triangle.fill", tint: .statusAttention)
-                    Text(why).font(.callout).foregroundStyle(.secondary)
+                    Text(SafeText.line(why, max: 240)).font(.callout).foregroundStyle(.secondary)
                 } else {
                     Text("No scan yet").font(.body.weight(.medium))
                     Text("Press Scan to map your network. The router sits in the middle; every device found is placed around it, coloured by risk.")
@@ -165,7 +165,7 @@ struct NetworkScanView: View {
         HStack(spacing: Spacing.m) {
             Image(systemName: symbol).frame(width: 22).foregroundStyle(.secondary)
             Text(title).frame(width: 150, alignment: .leading)
-            Text(value).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
+            Text(SafeText.line(value, max: 240)).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
             Spacer()
             Image(systemName: ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill").foregroundStyle(ok ? Color.statusProtected : Color.statusAttention)
                 .accessibilityLabel(ok ? "OK" : "Needs attention")
@@ -217,7 +217,7 @@ struct NetworkScanView: View {
     private func limitations(_ r: NetScanReport) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(r.limitations, id: \.self) { l in
-                Label(l, systemImage: "info.circle").font(.callout).foregroundStyle(.secondary)
+                Label(SafeText.line(l, max: 240), systemImage: "info.circle").font(.callout).foregroundStyle(.secondary)
             }
         }
     }
@@ -249,11 +249,11 @@ struct DeviceRow: View {
             IconBadge(symbol: device.type.symbol, tint: device.worstSeverity >= .medium ? .statusAttention : (device.isGateway ? .rampartTeal : .gray), size: 32)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(device.displayName).font(.body.weight(.medium)).lineLimit(1)
+                    Text(SafeText.line(device.displayName, max: 64)).font(.body.weight(.medium)).lineLimit(1)
                     if device.isNew && !device.trusted { Badge(text: "New", tint: .statusAttention) }
                     if device.trusted && !device.isThisMac { Badge(text: "Trusted", tint: .statusProtected) }
                 }
-                Text([device.ip, device.vendor, device.type.label].compactMap { $0 }.joined(separator: " · ")).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                Text(SafeText.line([device.ip, device.vendor, device.type.label].compactMap { $0 }.joined(separator: " · "))).font(.callout).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
             if !device.openPorts.isEmpty {
@@ -278,10 +278,10 @@ struct FindingRow: View {
             HStack(alignment: .top, spacing: Spacing.m) {
                 Image(systemName: finding.severity.symbol).foregroundStyle(finding.severity.tint).symbolRenderingMode(.hierarchical).frame(width: 22)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(finding.title).font(.body.weight(.medium))
-                    Text(finding.detail).font(.callout).foregroundStyle(.secondary).lineLimit(expanded ? nil : 2)
+                    Text(SafeText.line(finding.title)).font(.body.weight(.medium))
+                    Text(SafeText.line(finding.detail, max: 400)).font(.callout).foregroundStyle(.secondary).lineLimit(expanded ? nil : 2)
                     if expanded {
-                        Label(finding.fix, systemImage: "wrench.and.screwdriver").font(.callout).padding(.top, 2)
+                        Label(SafeText.line(finding.fix, max: 400), systemImage: "wrench.and.screwdriver").font(.callout).padding(.top, 2)
                     }
                 }
                 Spacer()
@@ -300,8 +300,8 @@ struct ListenerRow: View {
         HStack(spacing: Spacing.m) {
             Text("\(listener.proto.uppercased()) \(listener.port)").font(.callout.monospaced()).frame(width: 90, alignment: .leading)
             VStack(alignment: .leading, spacing: 1) {
-                Text(listener.service ?? listener.processName).font(.callout.weight(.medium))
-                Text("\(listener.processName) · \(signingLabel)").font(.caption).foregroundStyle(.secondary)
+                Text(SafeText.line(listener.service ?? listener.processName, max: 64)).font(.callout.weight(.medium))
+                Text("\(SafeText.line(listener.processName, max: 64)) · \(signingLabel)").font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             Badge(text: firewallLabel, tint: firewallTint)
@@ -353,7 +353,7 @@ struct DeviceDetail: View {
                 HStack(spacing: Spacing.m) {
                     IconBadge(symbol: device.type.symbol, tint: device.worstSeverity >= .medium ? .statusAttention : .rampartTeal, size: 48)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(device.displayName).font(.title3.weight(.semibold)).fontDesign(.rounded).lineLimit(2)
+                        Text(SafeText.line(device.displayName, max: 80)).font(.title3.weight(.semibold)).fontDesign(.rounded).lineLimit(2)
                         Text(device.type.label).foregroundStyle(.secondary)
                     }
                 }
@@ -375,7 +375,7 @@ struct DeviceDetail: View {
                 if !device.services.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Services announced").font(.callout.weight(.medium)).foregroundStyle(.secondary)
-                        Text(device.services.map(friendlyService).joined(separator: ", ")).font(.callout)
+                        Text(SafeText.line(device.services.map(friendlyService).joined(separator: ", "), max: 400)).font(.callout)
                     }
                 }
                 Divider()
@@ -387,12 +387,12 @@ struct DeviceDetail: View {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {
                                 Image(systemName: p.severity.symbol).foregroundStyle(p.severity.tint)
-                                Text("\(p.service) · \(p.proto)/\(p.port)").font(.body.weight(.medium))
+                                Text("\(SafeText.line(p.service, max: 48)) · \(p.proto)/\(p.port)").font(.body.weight(.medium))
                                 Spacer()
                                 Badge(text: p.severity.label, tint: p.severity.tint)
                             }
-                            Text(p.explanation).font(.callout).foregroundStyle(.secondary)
-                            Label(p.fix, systemImage: "wrench.and.screwdriver").font(.callout)
+                            Text(SafeText.line(p.explanation, max: 400)).font(.callout).foregroundStyle(.secondary)
+                            Label(SafeText.line(p.fix, max: 400), systemImage: "wrench.and.screwdriver").font(.callout)
                         }
                         .padding(Spacing.m)
                         .background(p.severity.tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -413,7 +413,7 @@ struct DeviceDetail: View {
     private func fact(_ k: String, _ v: String) -> some View {
         HStack(alignment: .top) {
             Text(k).foregroundStyle(.secondary).frame(width: 80, alignment: .leading)
-            Text(v).textSelection(.enabled)
+            Text(SafeText.line(v, max: 240)).textSelection(.enabled)
         }
         .font(.callout)
     }
@@ -491,7 +491,7 @@ struct NetworkRadar: View {
                     }
                     .position(c)
                     .onTapGesture { selected = hub.id }
-                    .accessibilityLabel("Router \(hub.displayName)")
+                    .accessibilityLabel("Router \(SafeText.line(hub.displayName, max: 64))")
                 } else if devices.isEmpty {
                     Image(systemName: "wifi.router").font(.system(size: 26)).foregroundStyle(.secondary).position(c)
                 }
@@ -561,7 +561,7 @@ struct RadarDot: View {
     let selected: Bool
     /// About 12 characters, so labels never run into their neighbours; the full name is the tooltip.
     private var shortName: String {
-        let n = device.displayName
+        let n = SafeText.line(device.displayName, max: 64)
         return n.count > 12 ? String(n.prefix(11)) + "…" : n
     }
     private var tint: Color {
@@ -582,10 +582,10 @@ struct RadarDot: View {
             Text(shortName).font(.system(size: 9)).lineLimit(1).fixedSize().foregroundStyle(.secondary)
         }
         .frame(width: NetworkRadar.slot.width)
-        .help(device.displayName)
+        .help(SafeText.line(device.displayName, max: 64))
         .animation(.spring(response: 0.3, dampingFraction: 0.8), value: selected)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(device.displayName), \(device.type.label)\(device.openPorts.isEmpty ? "" : ", \(device.openPorts.count) open services")")
+        .accessibilityLabel("\(SafeText.line(device.displayName, max: 64)), \(device.type.label)\(device.openPorts.isEmpty ? "" : ", \(device.openPorts.count) open services")")
         .accessibilityAddTraits(.isButton)
     }
 }

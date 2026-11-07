@@ -460,13 +460,42 @@ enum SSDPDiscovery {
 
     /// Fetches a device description XML with a short timeout (LAN only, http only).
     static func fetchDescription(_ location: String, timeout: TimeInterval = 3, subnet: NetSubnet) async -> UPnPDescription? {
-        guard let url = URL(string: location), url.scheme == "http", let host = url.host, subnet.contains(host) else { return nil }
+        guard let url = NetScanSSRF.safeDescriptionURL(location, subnet: subnet) else { return nil }
         var req = URLRequest(url: url); req.timeoutInterval = timeout
         req.setValue("RamPart/\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1")", forHTTPHeaderField: "User-Agent")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req), (resp as? HTTPURLResponse)?.statusCode == 200,
-              data.count < 512_000 else { return nil }
+        // SSRF guard (hx4): a hostile device's LOCATION may redirect off the LAN (cloud metadata, the internet,
+        // localhost services). No redirects, no cookies/credentials, no proxy, and the body is capped while
+        // streaming rather than after buffering it.
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.httpCookieStorage = nil; cfg.urlCredentialStorage = nil; cfg.connectionProxyDictionary = [:]
+        cfg.timeoutIntervalForResource = timeout * 2
+        let session = URLSession(configuration: cfg, delegate: NoRedirectDelegate(), delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        guard let (bytes, resp) = try? await session.bytes(for: req), (resp as? HTTPURLResponse)?.statusCode == 200,
+              resp.expectedContentLength < 512_000 else { return nil }
+        var data = [UInt8]()
+        do { for try await b in bytes { data.append(b); if data.count >= 512_000 { return nil } } } catch { return nil }
         return UPnPDescription.parse(String(decoding: data, as: UTF8.self))
     }
+
+    final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
+    }
+}
+
+/// SSRF scope rules for URLs taken from LAN devices (hx4).
+public enum NetScanSSRF {
+    /// LOCATION must be plain http to a dotted-quad host on the scanned subnet, not this Mac's loopback,
+    /// with no user-info. (A hostname would be resolved by DNS and could point anywhere.)
+    public static func safeDescriptionURL(_ location: String, subnet: NetSubnet) -> URL? {
+        guard location.count <= 2048, let url = URL(string: location), url.scheme?.lowercased() == "http",
+              url.user == nil, url.password == nil, let host = url.host, IPv4.parse(host) != nil,
+              IPv4.string(IPv4.parse(host)!) == host, subnet.contains(host), host != subnet.address else { return nil }
+        if let p = url.port, !(1...65535).contains(p) { return nil }
+        return url
+    }
+
 }
 
 // MARK: - Reverse DNS

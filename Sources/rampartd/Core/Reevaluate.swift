@@ -44,6 +44,9 @@ enum DetectionReevaluator {
         Set(d.evidence.compactMap { $0.title.split(separator: " ").first.map(String.init) })
     }
 
+    /// cdhashes of our own binaries (set by `run` before re-evaluating).
+    nonisolated(unsafe) static var ownCDHashes: Set<String> = []
+
     /// Decides whether a stored, unresolved detection is no longer flagged by the current rules.
     /// `stillFlagged` re-assesses a launchd plist and returns the strong rule IDs that still apply.
     static func shouldResolve(_ d: Detection, upgraded: Bool, canariesOn: Bool,
@@ -56,9 +59,13 @@ enum DetectionReevaluator {
         if let triage, case .notAFinding = triage(d) { return true }
         let ids = ruleIDs(d)
         if let p = d.path {
-            // RamPart's own launch items and binaries.
-            if (p as NSString).lastPathComponent.hasPrefix("app.rampart.") || p.hasPrefix("/Library/PrivilegedHelperTools/app.rampart.")
-                || p.hasPrefix("/Applications/Rampart.app/") { return true }
+            // Leftover self-test fixtures (EICAR files named com.rampart.test.* in temp folders): resolved as test files.
+            if d.category == .test, (p as NSString).lastPathComponent.hasPrefix("com.rampart.test."),
+               ["/private/tmp/", "/tmp/", "/private/var/folders/", "/var/folders/"].contains(where: { p.hasPrefix($0) }) { return true }
+            // RamPart's own launch items and binaries: only when the plist's program (or the file) is our verified binary.
+            if p.hasSuffix(".plist"), p.contains("/LaunchAgents/") || p.contains("/LaunchDaemons/"),
+               LaunchItemPolicy.isGenuineOwnPlist(p, trustedCDHashes: ownCDHashes, ownTeamID: nil) { return true }
+            if LaunchItemPolicy.isVerifiedOwnBinary(p, trustedCDHashes: ownCDHashes, ownTeamID: nil) { return true }
             // Canary detections while canaries are off (the files are removed).
             if !canariesOn, !ids.isDisjoint(with: ["R01", "R39"]) || d.name.lowercased().contains("honeytoken") || d.name.lowercased().contains("canary"),
                ["000 Budget Notes.rtf", "zzz Archive Notes.rtf"].contains((p as NSString).lastPathComponent) { return true }
@@ -83,6 +90,26 @@ enum DetectionReevaluator {
             _ = p.store.update(d.id) { $0.resolved = true }; n += 1
         }
         let ctx = p.triageContext()
+        ownCDHashes = LaunchItemPolicy.trustedCDHashes(root: p.runtime.root)
+        // User's own LaunchAgents with no malicious signal: stored threats become notes.
+        if upgraded {
+            // Every user LaunchAgent, by plist path and by program path (a finding may point at either).
+            var agents: [String: (PersistenceRecord, String)] = [:]
+            for home in Util.homeDirectories() {
+                let dir = home + "/Library/LaunchAgents"
+                for f in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] where f.hasSuffix(".plist") {
+                    guard let r = PersistenceScanner.parseLaunchdPlist(path: dir + "/" + f, kind: .launchAgent) else { continue }
+                    agents[r.item.location] = (r, home)
+                    if let t = r.item.target, agents[t] == nil { agents[t] = (r, home) }
+                }
+            }
+            for d in p.store.all() where !d.resolved && d.confidence > 25 && (d.category == .persistence || d.evidence.contains { $0.source == .persistence }) {
+                guard let path = d.path, let (r, home) = agents[path],
+                      LaunchItemPolicy.isBenignUserAgent(plist: r.item.location, target: r.item.target, arguments: r.arguments, home: home) else { continue }
+                let n = LaunchItemPolicy.asNote(d)
+                _ = p.store.update(d.id) { $0.confidence = n.confidence; $0.severity = n.severity; $0.name = n.name }
+            }
+        }
         // Notes: downgrade stored copies in place (kept for the "Review notes" list, no longer a decision).
         if upgraded {
             for d in p.store.all() where !d.resolved {
@@ -108,7 +135,8 @@ enum DetectionReevaluator {
         }
         if n > 0 {
             logInfo("re-evaluated stored detections: resolved \(n) no longer flagged by the current rules")
-            p.activity.add(.system, "Resolved \(n) earlier alert(s)", detail: "No longer flagged after the protection update", outcome: "resolved")
+            p.activity.add(.system, "Resolved \(n) earlier alert(s)", detail: "No longer flagged after the protection update", outcome: "resolved",
+                           event: .alertsResolved, actor: .system, count: n)
         }
         return n
     }

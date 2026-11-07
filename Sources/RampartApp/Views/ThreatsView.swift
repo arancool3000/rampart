@@ -202,8 +202,8 @@ struct ThreatsView: View {
         HStack(spacing: Spacing.s) {
             FileIcon(path: d.path)
             VStack(alignment: .leading, spacing: 1) {
-                Text(d.path.map { ($0 as NSString).lastPathComponent } ?? d.name).lineLimit(1)
-                Text(d.path.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "—")
+                Text(SafeText.line(d.path.map { ($0 as NSString).lastPathComponent } ?? d.name)).lineLimit(1)
+                Text(d.path.map { SafeText.path(($0 as NSString).abbreviatingWithTildeInPath) } ?? "—")
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
         }
@@ -297,7 +297,7 @@ struct ThreatsView: View {
                 Table(filteredNotes, selection: $selectedDetections) {
                     TableColumn("Item") { d in itemCell(d) }.width(min: 220, ideal: 300)
                     TableColumn("Observation") { d in
-                        Text(d.evidence.max(by: { $0.score < $1.score })?.title ?? d.name).foregroundStyle(.secondary).lineLimit(1)
+                        Text(SafeText.line(d.evidence.max(by: { $0.score < $1.score })?.title ?? d.name)).foregroundStyle(.secondary).lineLimit(1)
                     }
                     .width(min: 140, ideal: 200)
                     TableColumn("Type") { d in Badge(text: Self.tag(for: d, note: true)) }.width(min: 60, ideal: 70)
@@ -405,7 +405,7 @@ struct DetectionInspector: View {
                 FileIcon(path: detection?.path).frame(width: 40, height: 40).scaleEffect(1.5)
             }
             VStack(alignment: .leading, spacing: 4) {
-                Text(displayName).font(.title3.weight(.semibold)).lineLimit(2)
+                Text(SafeText.line(displayName, max: 160)).font(.title3.weight(.semibold)).lineLimit(2)
                 HStack(spacing: 6) {
                     if let d = detection { Badge(text: ThreatsView.tag(for: d, note: d.confidence < 60 && record == nil)) }
                     if record != nil { Badge(text: "Quarantined", tint: .gray) }
@@ -418,14 +418,14 @@ struct DetectionInspector: View {
         let primary = d.evidence.max { $0.score < $1.score }
         return DisclosureGroup(isExpanded: $whyExpanded) {
             VStack(alignment: .leading, spacing: Spacing.m) {
-                (Text("Detected as ") + Text(d.name).bold() + Text(" by ") + Text(primary?.source.label ?? "\(Product.name)").bold() + Text("."))
+                (Text("Detected as ") + Text(SafeText.line(d.name)).bold() + Text(" by ") + Text(primary?.source.label ?? "\(Product.name)").bold() + Text("."))
                     .fixedSize(horizontal: false, vertical: true)
                 ForEach(Array(d.evidence.sorted { $0.score > $1.score }.enumerated()), id: \.element) { idx, e in
                     HStack(alignment: .top, spacing: Spacing.s) {
                         Image(systemName: e.source.symbol).foregroundStyle(Color.rampartTeal).frame(width: 20)
                         VStack(alignment: .leading, spacing: 3) {
                             HStack(alignment: .firstTextBaseline, spacing: Spacing.s) {
-                                Text(e.title).font(.body.weight(.medium))
+                                Text(SafeText.line(e.title)).font(.body.weight(.medium))
                                 Spacer(minLength: 0)
                                 SignalStrength(score: e.score)
                             }
@@ -504,7 +504,7 @@ struct DetectionInspector: View {
     private func row(_ k: String, _ v: String, mono: Bool = false) -> some View {
         GridRow {
             Text(k).foregroundStyle(.secondary).font(.callout)
-            Text(v).font(mono ? .callout.monospaced() : .callout).textSelection(.enabled).lineLimit(k == "Location" ? 1 : 3).truncationMode(.middle).help(k == "Location" ? v : "")
+            Text(k == "Location" ? SafeText.path(v) : SafeText.line(v, max: 400)).font(mono ? .callout.monospaced() : .callout).textSelection(.enabled).lineLimit(k == "Location" ? 1 : 3).truncationMode(.middle).help(k == "Location" ? v : "")
         }
     }
 
@@ -596,7 +596,7 @@ struct RestoreSheet: View {
         let name = (record.originalPath as NSString).lastPathComponent
         let conf = (detection?.confidence ?? 0) >= 90 ? "high" : "medium"
         VStack(alignment: .leading, spacing: Spacing.l) {
-            Text("Restore \"\(name)\"?").font(.title2.weight(.semibold))
+            Text("Restore \"\(SafeText.line(name))\"?").font(.title2.weight(.semibold))
             Text("\(Product.name) flagged this as \(detection?.category.label ?? record.detectionName) (\(conf) confidence). Restore it only if you trust where it came from.")
                 .fixedSize(horizontal: false, vertical: true)
             Picker("", selection: $choice) {
@@ -700,7 +700,7 @@ struct TeachSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
-            Text(title).font(.title2.weight(.semibold)).lineLimit(2)
+            Text(SafeText.line(title, max: 160)).font(.title2.weight(.semibold)).lineLimit(2)
             Text("\(Product.name) will remember this on this Mac and stop flagging matching items. You can remove the rule anytime in Rules. Nothing is sent anywhere.")
                 .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Picker("", selection: $choice) {
@@ -782,8 +782,8 @@ struct NotesTriageSheet: View {
                 List(groups) { g in
                     HStack(spacing: Spacing.s) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("\(g.items.count) · \(g.label)").lineLimit(2)
-                            Text(Set(g.items.compactMap { $0.evidence.max(by: { $0.score < $1.score })?.title }).sorted().joined(separator: ", "))
+                            Text("\(g.items.count) · \(SafeText.line(g.label))").lineLimit(2)
+                            Text(SafeText.line(Set(g.items.compactMap { $0.evidence.max(by: { $0.score < $1.score })?.title }).sorted().joined(separator: ", "), max: 300))
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer()
@@ -873,7 +873,7 @@ struct UndoBanner: View {
     var body: some View {
         HStack(spacing: Spacing.m) {
             Image(systemName: "arrow.uturn.backward.circle").foregroundStyle(.secondary)
-            Text(text).lineLimit(1).truncationMode(.middle)
+            Text(SafeText.line(text, max: 300)).lineLimit(1).truncationMode(.middle)
             Button("Undo", action: undo).keyboardShortcut("z", modifiers: .command)
             Button(action: dismiss) { Image(systemName: "xmark") }
                 .buttonStyle(.borderless).foregroundStyle(.secondary).accessibilityLabel("Dismiss")
@@ -919,6 +919,7 @@ struct EvidenceDetail: View {
     }
 
     private func line(_ t: String) -> some View {
+        let t = SafeText.line(t, max: 1000)   // hx8: evidence text is attacker-influenced
         let pathy = t.count > 60 && t.contains("/") && !t.contains(" ")
         return Text(t).font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
             .lineLimit(pathy ? 1 : nil).truncationMode(.middle)

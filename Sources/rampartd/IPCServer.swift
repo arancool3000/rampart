@@ -59,7 +59,7 @@ final class IPCServer {
 
     func start() throws {
         let dir = (path as NSString).deletingLastPathComponent
-        if userMode { Util.ensureDir(URL(fileURLWithPath: dir), mode: 0o700) }
+        if userMode { Util.ensureDir(URL(fileURLWithPath: dir), mode: 0o700, tighten: true) }   // hx8: folder 0700, socket 0600
         if FileManager.default.fileExists(atPath: path) {
             if Self.isLive(path) { throw Err.alreadyRunning(path) }
             unlink(path)
@@ -127,8 +127,26 @@ final class IPCServer {
         guard getpeereid(fd, &uid, &gid) == 0 else { return nil }
         var pid: pid_t = 0; var len = socklen_t(MemoryLayout<pid_t>.size)
         getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &len)
-        return Peer(uid: uid, gid: gid, pid: pid)
+        var peer = Peer(uid: uid, gid: gid, pid: pid)
+        // Audit token (pid + pidversion) taken by the kernel at connect time; the code identity is looked up through
+        // it, so a process that exits and has its pid reused, or exec's another binary, is not mistaken for us.
+        var token = audit_token_t(); var tlen = socklen_t(MemoryLayout<audit_token_t>.size)
+        if getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &tlen) == 0, tlen == socklen_t(MemoryLayout<audit_token_t>.size) {
+            peer.auditToken = token
+            peer.pid = pid_t(bitPattern: token.val.5)
+            if !userMode, let id = ClientIdentity.of(auditToken: token) {
+                peer.client = id.trustedKind(daemonTeamID: Self.daemonTeamID,
+                                             pinnedCDHashes: ClientIdentity.loadPins(router.p.runtime.root.appendingPathComponent("trusted-clients.json").path))
+                if peer.client == nil, DLog.shared.verbose {
+                    logInfo("IPC: untrusted client \(LogRedact.clean(id.identifier, max: 80)) cdhash \(id.cdhash.prefix(16)) uid \(uid)")
+                }
+            }
+        }
+        return peer
     }
+
+    /// The daemon's own Team ID (nil when ad-hoc signed); a client must carry the same one when it is set.
+    static let daemonTeamID: String? = ClientIdentity.ofSelf()?.teamID
 
     private func serve(_ fd: Int32, cid: Int) {
         var subscription: UUID?

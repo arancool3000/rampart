@@ -167,12 +167,33 @@ public final class WebVerdictService: @unchecked Sendable {
             return NMResponse(id: req.id, report: report, daemon: daemon)
         case .allowHost:
             guard let host = req.host, !host.isEmpty else { return NMResponse(id: req.id, ok: false, error: "host required") }
-            allowlist.allow(host: host)
+            // N7: a strict hostname that is more than a bare public suffix (never "com", "co.uk", "github.io").
+            guard let clean = WebVerdictService.allowableHost(host) else { return NMResponse(id: req.id, ok: false, error: "not a valid site name") }
+            allowlist.allow(host: clean)
             cacheLock.lock(); cache.removeAll(); cacheLock.unlock()
             return NMResponse(id: req.id)
         case .reportDecision:
             return NMResponse(id: req.id)
         }
+    }
+
+    /// N7: the host the user chose to allow, validated: ASCII letters/digits/hyphens in dot-separated labels (1-63
+    /// characters, no leading or trailing hyphen), at most 253 characters, no newlines/spaces/ports/paths/IP
+    /// literals, and more than a bare public suffix. Returns the lowercased host, or nil.
+    public static func allowableHost(_ raw: String) -> String? {
+        var h = raw.lowercased()
+        if h.hasSuffix(".") { h.removeLast() }
+        guard !h.isEmpty, h.utf8.count <= 253 else { return nil }
+        let labels = h.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 2 else { return nil }
+        for l in labels {
+            guard (1...63).contains(l.utf8.count), l.first != "-", l.last != "-",
+                  l.utf8.allSatisfy({ ($0 >= 0x61 && $0 <= 0x7a) || ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x2d }) else { return nil }
+        }
+        guard labels.last.map({ !$0.allSatisfy(\.isNumber) }) ?? false else { return nil }   // no IPv4 literal
+        guard let p = URLAnalyzer.parse("https://" + h), !p.isIPLiteral, let reg = p.registrable, !reg.isEmpty,
+              p.suffix != h else { return nil }
+        return h
     }
 
     /// Copy-to-clipboard interception: is this text a shell command, and is the page a developer site?

@@ -45,7 +45,7 @@ struct NetworkView: View {
                 IconBadge(symbol: w.encrypted && !w.gatewayChanged ? "wifi" : "wifi.exclamationmark",
                           tint: w.encrypted && !w.gatewayChanged ? .statusProtected : .statusAttention, size: 44)
                 VStack(alignment: .leading, spacing: 2) {
-                    (Text("Connected to ") + Text(w.ssid ?? "your Wi-Fi network").bold() + Text(" · \(w.security)"))
+                    (Text("Connected to ") + Text(w.ssid.map { SafeText.line($0, max: 40) } ?? "your Wi-Fi network").bold() + Text(" · \(w.security)"))
                     if !w.encrypted {
                         Text("This network doesn't use encryption. Avoid entering passwords until you're on a trusted network.").foregroundStyle(.secondary)
                     } else if w.gatewayChanged {
@@ -73,7 +73,7 @@ struct NetworkView: View {
         let host = PublicWiFiHost.shared
         VStack(alignment: .trailing, spacing: Spacing.xs) {
             if let p = host.pendingDisconnect {
-                Text("Disconnecting from \(p.name)…").font(.callout).foregroundStyle(Color.statusAttention)
+                Text("Disconnecting from \(SafeText.line(p.name, max: 40))…").font(.callout).foregroundStyle(Color.statusAttention)
                 Button("Stay Connected") { host.stayConnected() }.buttonStyle(GlowButtonStyle())
             }
             if host.currentNetworkKey != nil {
@@ -145,7 +145,7 @@ struct NetworkView: View {
                         ForEach(model.recentBlocks.prefix(6), id: \.self) { host in
                             HStack(spacing: Spacing.s) {
                                 Image(systemName: "hand.raised.fill").foregroundStyle(.orange).font(.caption)
-                                Text(host).font(.callout.monospaced()).textSelection(.enabled)
+                                Text(SafeText.line(host, max: 253)).font(.callout.monospaced()).textSelection(.enabled)
                             }
                         }
                     }
@@ -200,7 +200,7 @@ struct ConnectionGroup: View {
                     HStack(spacing: Spacing.m) {
                         Image(systemName: d.blocked ? "hand.raised.fill" : "arrow.up.right.circle")
                             .foregroundStyle(d.blocked ? Color.orange : .secondary).frame(width: 20)
-                        Text(d.host).font(.callout.monospaced()).textSelection(.enabled)
+                        Text(SafeText.line(d.host, max: 253)).font(.callout.monospaced()).textSelection(.enabled)
                         Spacer()
                         Text("\(d.proto) \(d.port)").font(.callout).foregroundStyle(.secondary).monospacedDigit()
                         if !d.country.isEmpty { Text(d.country).font(.callout).foregroundStyle(.secondary).frame(width: 30) }
@@ -221,7 +221,7 @@ struct ConnectionGroup: View {
                     }
                 }
                 .frame(width: 24, height: 24)
-                Text(conn.app).font(.body.weight(.medium))
+                Text(SafeText.line(conn.app, max: 80)).font(.body.weight(.medium))
                 if let sig = conn.signing { SigningBadge(status: sig) }
                 Text("\(conn.destinations.count) connection\(conn.destinations.count == 1 ? "" : "s")").foregroundStyle(.secondary)
                 Spacer()

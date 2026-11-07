@@ -177,8 +177,8 @@ extension SelfTest {
               && SecurityScore.label(for: 49) == .needsAttention, "label bands")
         let labels = [0, 10, 49, 50, 74, 75, 89, 90, 100].map { SecurityScore.label(for: $0).rawValue }
         check(!labels.contains { $0.lowercased().contains("risk") }, "never At risk")
-        check(PostureChecks.all.count == 25 && Set(PostureChecks.all.map(\.id)).count == 25, "25 unique checks")
-        check(PostureChecks.all.filter { $0.id != "lockdownMode" }.reduce(0) { $0 + $1.weight } == 112, "weights match doc 07 table (112; score renormalises)")
+        check(PostureChecks.all.count == 26 && Set(PostureChecks.all.map(\.id)).count == 26, "26 unique checks (25 + sealed system volume)")
+        check(PostureChecks.all.filter { $0.id != "lockdownMode" }.reduce(0) { $0 + $1.weight } == 122, "weights match doc 07 table (112) plus sealed system volume (10); score renormalises")
 
         let fw = PostureFixer.fix(for: "firewall")
         check(fw?.commands == [["/usr/libexec/ApplicationFirewall/socketfilterfw", "--setglobalstate", "on"]] && fw?.dryRun == true, "fix firewall")
@@ -321,7 +321,7 @@ extension SelfTest {
         s.hasFullDiskAccess = false
         let r = s.scan()
         let byID = Dictionary(uniqueKeysWithValues: r.checks.map { ($0.id, $0) })
-        check(r.checks.count == 25, "fake scan 25 checks")
+        check(r.checks.count == 26, "fake scan 26 checks")
         check(byID["firewall"]?.state == .fail && byID["firewall"]?.fixable == true, "fake firewall fail+fixable")
         check(byID["fileVault"]?.state == .pass && byID["fileVault"]?.fixable == false, "fake filevault pass")
         check(byID["secureBoot"]?.state == .unknown && r.needsPermission.contains("secureBoot"), "fake secure boot needs admin")
@@ -343,7 +343,7 @@ extension SelfTest {
             print("    [\(c.state.rawValue)] \(c.id) (w\(c.weight))\(c.fixable ? " [fix]" : ""): \(c.detail)")
         }
         check(secs < 10, "live scan under 10 s")
-        check(report.checks.count == 25, "live 25 checks")
+        check(report.checks.count == 26, "live 26 checks")
         check((0...100).contains(report.score.value), "live score in range")
         // Expected on this Mac (doc 07): firewall and stealth mode are off.
         let byID = Dictionary(uniqueKeysWithValues: report.checks.map { ($0.id, $0) })

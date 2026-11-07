@@ -70,7 +70,7 @@ struct RulesView: View {
         .confirmationDialog("Remove this rule?", isPresented: Binding(get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } }), presenting: pendingRemoval) { r in
             Button("Remove Rule", role: .destructive) { Task { await model.removeAllowRule(r) } }
         } message: { r in
-            Text("\(Product.name) will check \(r.name) normally again.")
+            Text("\(Product.name) will check \(SafeText.line(r.name, max: 80)) normally again.")
         }
     }
 

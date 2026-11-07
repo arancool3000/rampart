@@ -1,4 +1,5 @@
 import Foundation
+import Security
 import RampartShared
 
 // MARK: - Wire types (generateContent REST)
@@ -101,21 +102,70 @@ public protocol GeminiTransport: Sendable {
 }
 
 public struct URLSessionTransport: GeminiTransport {
+    /// Largest response body accepted (a generateContent answer is a few KB; 2 MB leaves ample headroom).
+    public static let maxResponseBytes = 2 * 1024 * 1024
     let session: URLSession
-    public init(timeout: TimeInterval = 45) {
+    /// `protocolClasses` exists for self-tests (mock URLProtocol); production passes nil.
+    public init(timeout: TimeInterval = 45, protocolClasses: [AnyClass]? = nil) {
         let c = URLSessionConfiguration.ephemeral          // no cookies, no disk cache
         c.timeoutIntervalForRequest = timeout
         c.timeoutIntervalForResource = timeout * 2
         c.urlCache = nil
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.httpCookieStorage = nil
+        c.urlCredentialStorage = nil
+        c.httpShouldSetCookies = false
         c.waitsForConnectivity = false
-        session = URLSession(configuration: c)
+        c.tlsMinimumSupportedProtocolVersion = .TLSv12
+        if let protocolClasses { c.protocolClasses = protocolClasses }
+        session = URLSession(configuration: c, delegate: PinnedHostDelegate(), delegateQueue: nil)
     }
     public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let (d, r) = try await session.data(for: request)
+        try Self.checkPinned(request.url)
+        let (bytes, r) = try await session.bytes(for: request)
         guard let h = r as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        return (d, h)
+        // The final URL must still be the pinned https host (redirects are refused by the delegate as well).
+        try Self.checkPinned(h.url)
+        if h.expectedContentLength > Int64(Self.maxResponseBytes) { bytes.task.cancel(); throw GeminiError.network("the response was too large") }
+        var data = Data()
+        data.reserveCapacity(min(Self.maxResponseBytes, max(0, Int(h.expectedContentLength))))
+        for try await b in bytes {
+            data.append(b)
+            if data.count > Self.maxResponseBytes { bytes.task.cancel(); throw GeminiError.network("the response was too large") }
+        }
+        return (data, h)
+    }
+
+    /// Only https to the Gemini host on the default port.
+    static func checkPinned(_ url: URL?) throws {
+        guard let url, url.scheme?.lowercased() == "https", url.host?.lowercased() == GeminiClient.host,
+              url.port == nil || url.port == 443, url.user == nil, url.password == nil else {
+            throw GeminiError.network("refused a connection that wasn't to \(GeminiClient.host) over HTTPS")
+        }
+    }
+}
+
+/// Refuses every redirect (the API never redirects; a redirect would carry the key header to another URL) and
+/// accepts server trust only for the pinned host, evaluated by the system with hostname checking.
+final class PinnedHostDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let space = challenge.protectionSpace
+        guard space.authenticationMethod == NSURLAuthenticationMethodServerTrust else {
+            // No client certificates, no HTTP auth prompts: the key header is the only credential.
+            completionHandler(.cancelAuthenticationChallenge, nil); return
+        }
+        guard space.host.lowercased() == GeminiClient.host, let trust = space.serverTrust else {
+            completionHandler(.cancelAuthenticationChallenge, nil); return
+        }
+        SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, GeminiClient.host as CFString))
+        var err: CFError?
+        if SecTrustEvaluateWithError(trust, &err) { completionHandler(.useCredential, URLCredential(trust: trust)) }
+        else { completionHandler(.cancelAuthenticationChallenge, nil) }
     }
 }
 
@@ -199,6 +249,7 @@ public final class GeminiClient: @unchecked Sendable {
             let failure: GeminiError
             do {
                 let (data, http) = try await transport.send(req)
+                guard data.count <= URLSessionTransport.maxResponseBytes else { throw GeminiError.network("the response was too large") }
                 if (200..<300).contains(http.statusCode) {
                     let resp: GeminiResponse
                     do { resp = try JSONDecoder().decode(GeminiResponse.self, from: data) } catch { throw GeminiError.badJSON("envelope") }
@@ -212,7 +263,9 @@ public final class GeminiClient: @unchecked Sendable {
                                         latency: Date().timeIntervalSince(start), attempts: attempt)
                 }
                 let env = try? JSONDecoder().decode(GeminiErrorEnvelope.self, from: data)
-                let msg = Redactor.default.redact(String((env?.error.message ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)).prefix(300))).text
+                // Server text is untrusted: never echo the key, strip controls/markup, redact, cap length.
+                let rawMsg = String((env?.error.message ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)).prefix(300))
+                let msg = Clean.text(Redactor.default.redact(rawMsg.replacingOccurrences(of: key, with: "[KEY]")).text, max: 300)
                 retryAfter = Self.retryDelay(header: http.value(forHTTPHeaderField: "Retry-After"), details: env?.error.details?.compactMap(\.retryDelay).first)
                 switch http.statusCode {
                 case 429: failure = .rateLimited
@@ -226,10 +279,10 @@ public final class GeminiClient: @unchecked Sendable {
             } catch let e as URLError {
                 if e.code == .cancelled { throw GeminiError.cancelled }
                 let transient: [URLError.Code] = [.timedOut, .networkConnectionLost, .cannotConnectToHost, .dnsLookupFailed, .notConnectedToInternet]
-                failure = .network(e.localizedDescription)
+                failure = .network(Self.describe(e))
                 if !transient.contains(e.code) || e.code == .notConnectedToInternet { throw failure }
             } catch {
-                throw GeminiError.network(error.localizedDescription)
+                throw GeminiError.network(Clean.text(error.localizedDescription.replacingOccurrences(of: key, with: "[KEY]"), max: 200))
             }
             guard attempt <= maxRetries else { throw failure }
             let backoff = min(maxBackoff, retryAfter ?? baseBackoff * pow(2, Double(attempt - 1)) * Double.random(in: 0.8...1.25))
@@ -238,10 +291,24 @@ public final class GeminiClient: @unchecked Sendable {
         }
     }
 
+    /// URLError text without the failing URL or any userInfo (keeps errors short and free of request details).
+    static func describe(_ e: URLError) -> String {
+        switch e.code {
+        case .timedOut: return "the request timed out"
+        case .notConnectedToInternet: return "this Mac is offline"
+        case .networkConnectionLost: return "the connection dropped"
+        case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed: return "couldn't connect to Google"
+        case .serverCertificateUntrusted, .serverCertificateHasBadDate, .serverCertificateNotYetValid, .serverCertificateHasUnknownRoot,
+             .clientCertificateRejected, .secureConnectionFailed, .cancelled:
+            return "the secure connection to Google couldn't be verified"
+        default: return "network error \(e.code.rawValue)"
+        }
+    }
+
     /// Parses `Retry-After: 12` or a google.rpc.RetryInfo `retryDelay: "12s"`.
     static func retryDelay(header: String?, details: String?) -> TimeInterval? {
-        if let h = header, let s = Double(h.trimmingCharacters(in: .whitespaces)) { return s }
-        if let d = details?.trimmingCharacters(in: .whitespaces), d.hasSuffix("s"), let s = Double(d.dropLast()) { return s }
+        if let h = header, let s = Double(h.trimmingCharacters(in: .whitespaces)), s.isFinite, s >= 0 { return min(s, 60) }
+        if let d = details?.trimmingCharacters(in: .whitespaces), d.hasSuffix("s"), let s = Double(d.dropLast()), s.isFinite, s >= 0 { return min(s, 60) }
         return nil
     }
 

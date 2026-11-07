@@ -146,40 +146,80 @@ public struct DNSMessage: Sendable {
 public enum DNSWire {
     public static func normalize(_ name: String) -> String {
         var s = name.lowercased()
-        while s.hasSuffix(".") { s.removeLast() }
+        while s.hasSuffix("."), !s.hasSuffix("\\.") || s.hasSuffix("\\\\.") { s.removeLast() }
         return s
     }
 
     /// Reads a possibly compressed name. Returns the name and the offset just past it in the original stream.
+    /// Hardening (hx4): compression pointers must point strictly backwards (RFC 1035 4.1.4 "prior occurrence"),
+    /// which makes loops impossible; the jump count and 255-byte wire length are still capped. Label bytes
+    /// that would change the meaning of the text form are escaped in RFC 4343 presentation format: an embedded
+    /// `.` becomes `\.`, a backslash `\\`, and control bytes `\DDD`, so a single label such as
+    /// "evil.example" can never masquerade as two labels, and attacker bytes cannot inject newlines into logs/UI.
     public static func readName(_ b: [UInt8], at start: Int) throws -> (String, Int) {
         var labels: [String] = []
         var off = start, end = -1, jumps = 0, total = 0
         while true {
-            guard off < b.count else { throw DNSParseError.truncated }
+            guard off >= 0, off < b.count else { throw DNSParseError.truncated }
             let len = Int(b[off])
-            if len == 0 { off += 1; break }
+            if len == 0 { off += 1; total += 1; break }
             if len & 0xC0 == 0xC0 {
                 guard off + 1 < b.count else { throw DNSParseError.truncated }
                 let ptr = (len & 0x3F) << 8 | Int(b[off + 1])
                 if end < 0 { end = off + 2 }
                 jumps += 1
-                guard jumps < 64, ptr < b.count else { throw DNSParseError.pointerLoop }
+                guard jumps < 64, ptr < off, ptr < b.count else { throw DNSParseError.pointerLoop }
                 off = ptr; continue
             }
             guard len & 0xC0 == 0 else { throw DNSParseError.badLabel }
             guard off + 1 + len <= b.count else { throw DNSParseError.truncated }
             total += len + 1
             guard total <= 255 else { throw DNSParseError.nameTooLong }
-            labels.append(String(decoding: b[(off + 1)...(off + len)], as: UTF8.self).lowercased())
+            labels.append(escapeLabel(b[(off + 1)...(off + len)]))
             off += 1 + len
         }
+        guard total <= 255 else { throw DNSParseError.nameTooLong }
         return (labels.joined(separator: "."), end >= 0 ? end : off)
+    }
+
+    /// RFC 4343 presentation escaping of one label (lowercased ASCII; UTF-8 bytes kept for mDNS names).
+    static func escapeLabel(_ bytes: ArraySlice<UInt8>) -> String {
+        var out = [UInt8](); out.reserveCapacity(bytes.count)
+        for var c in bytes {
+            if c >= 0x41 && c <= 0x5A { c += 0x20 }
+            if c == 0x2E || c == 0x5C { out.append(0x5C); out.append(c) }
+            else if c < 0x20 || c == 0x7F {
+                out.append(0x5C); out += Array(String(format: "%03d", Int(c)).utf8)
+            } else { out.append(c) }
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    /// Splits presentation text into wire labels, undoing `\.`, `\\` and `\DDD` escapes.
+    static func wireLabels(_ name: String) -> [[UInt8]] {
+        let b = Array(name.utf8)
+        var labels: [[UInt8]] = [], cur: [UInt8] = [], i = 0
+        while i < b.count {
+            let c = b[i]
+            if c == 0x5C, i + 1 < b.count {
+                if i + 3 < b.count, (b[i+1...i+3]).allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }),
+                   let v = Int(String(decoding: b[i+1...i+3], as: UTF8.self)), v <= 255 {
+                    cur.append(UInt8(v)); i += 4; continue
+                }
+                cur.append(b[i + 1]); i += 2; continue
+            }
+            if c == 0x2E { if !cur.isEmpty { labels.append(cur) }; cur = []; i += 1; continue }
+            cur.append(c); i += 1
+        }
+        if !cur.isEmpty { labels.append(cur) }
+        return labels
     }
 
     public static func encodeName(_ name: String) -> [UInt8] {
         var out = [UInt8]()
-        for label in normalize(name).split(separator: ".", omittingEmptySubsequences: true) {
-            let bytes = Array(label.utf8.prefix(63))
+        for label in wireLabels(normalize(name)) {
+            let bytes = Array(label.prefix(63))
+            guard out.count + bytes.count + 2 <= 255 else { break }
             out.append(UInt8(bytes.count)); out += bytes
         }
         out.append(0)

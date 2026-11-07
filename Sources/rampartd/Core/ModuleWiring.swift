@@ -138,7 +138,8 @@ final class BehaviourPersistence: PersistenceService {
         if let old = try? PersistenceSnapshot.load(from: snapshotURL) {
             let diff = PersistenceDiffer.diff(baseline: old, current: current)
             if !diff.isEmpty {
-                findings = engine.evaluatePersistence(added: diff.added, changed: diff.changed)
+                findings = PersistenceWiringPolicy.apply(engine.evaluatePersistence(added: diff.added, changed: diff.changed),
+                                                      records: diff.added + diff.changed.map(\.new), root: runtime.root)
                 logInfo("persistence diff: +\(diff.added.count) ~\(diff.changed.count) -\(diff.removed.count), \(findings.count) finding(s)")
             }
         } else {
@@ -162,9 +163,35 @@ extension BehaviourWiring {
         // Never flag Rampart's own binaries (dev builds live in hidden .build folders).
         let own = [URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent().path + "/",
                    "/Applications/Rampart.app/", "/Library/PrivilegedHelperTools/app.rampart."]
+        let root = runtime.root
         pipeline.behaviour = { ev in
-            e.process(ev).filter { d in !own.contains { p in d.path?.hasPrefix(p) == true } }
+            e.process(ev).filter { d in !own.contains { p in d.path?.hasPrefix(p) == true } }.compactMap { d in
+                // Launch-item findings in real time get the same policy as the persistence scan.
+                guard let p = d.path, p.hasSuffix(".plist"), p.contains("/LaunchAgents/") || p.contains("/LaunchDaemons/") else { return d }
+                let kind: PersistenceItem.Kind = p.contains("/LaunchDaemons/") ? .launchDaemon : .launchAgent
+                guard let r = PersistenceScanner.parseLaunchdPlist(path: p, kind: kind) else { return d }
+                return PersistenceWiringPolicy.apply([d], records: [r], root: root).first
+            }
         }
         return " + RampartBehaviour.BehaviourEngine"
+    }
+}
+
+enum PersistenceWiringPolicy {
+    /// Own plists pointing at our verified binary are dropped; benign user agents become notes (LaunchItemPolicy).
+    static func apply(_ ds: [Detection], records: [PersistenceRecord], root: URL) -> [Detection] {
+        guard !ds.isEmpty else { return ds }
+        let pins = LaunchItemPolicy.trustedCDHashes(root: root)
+        var byPath: [String: PersistenceRecord] = [:]
+        for r in records { byPath[r.item.location] = r; if let t = r.item.target { byPath[t] = byPath[t] ?? r } }
+        return ds.compactMap { d in
+            guard let p = d.path, let r = byPath[p], [.launchAgent, .launchDaemon].contains(r.item.kind) else { return d }
+            if LaunchItemPolicy.isGenuineOwnPlist(r.item.location, trustedCDHashes: pins, ownTeamID: nil) { return nil }
+            let home = Util.homeDirectories().first { r.item.location.hasPrefix($0 + "/") } ?? "/nonexistent"
+            if LaunchItemPolicy.isBenignUserAgent(plist: r.item.location, target: r.item.target, arguments: r.arguments, home: home) {
+                return LaunchItemPolicy.asNote(d)
+            }
+            return d
+        }
     }
 }

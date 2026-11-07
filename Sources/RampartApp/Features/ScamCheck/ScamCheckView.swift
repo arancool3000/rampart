@@ -144,7 +144,7 @@ struct ScamCheckView: View {
                 }.secondaryActionStyle()
                 Button("Clear") { model.clear() }.secondaryActionStyle().disabled(model.input.isEmpty && model.report == nil)
                 Spacer()
-                if let f = model.droppedFileName { Label(f, systemImage: "envelope").font(.callout).foregroundStyle(.secondary) }
+                if let f = model.droppedFileName { Label(SafeText.line(f, max: 80), systemImage: "envelope").font(.callout).foregroundStyle(.secondary) }
                 Menu("Try an example") {
                     ForEach(ScamCheckExamples.all, id: \.title) { ex in Button(ex.title) { model.input = ex.text; model.droppedFileName = nil; model.check() } }
                 }.menuStyle(.borderlessButton).fixedSize()
@@ -220,7 +220,7 @@ struct VerdictCard: View {
                         Badge(text: kindLabel)
                         if report.language != "en" { Badge(text: report.language.uppercased()) }
                     }
-                    Text(report.headline).font(.body).fixedSize(horizontal: false, vertical: true)
+                    Text(SafeText.line(report.headline, max: 240)).font(.body).fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
                 RiskGauge(score: report.score, tint: tint, animate: appeared && !reduceMotion)
@@ -241,7 +241,7 @@ struct VerdictCard: View {
                 }
             }
             let benign = report.signals.filter { $0.category == .benign }
-            if !benign.isEmpty { ForEach(benign, id: \.id) { s in Label { Text(s.title).font(.callout) } icon: { Image(systemName: "checkmark.circle").foregroundStyle(Color.statusProtected) } } }
+            if !benign.isEmpty { ForEach(benign, id: \.id) { s in Label { Text(SafeText.line(s.title)).font(.callout) } icon: { Image(systemName: "checkmark.circle").foregroundStyle(Color.statusProtected) } } }
 
             if !report.analysedText.isEmpty && report.kind != .url {
                 DisclosureGroup("Highlighted text") { HighlightedText(text: report.analysedText, highlights: report.highlights, tint: tint).padding(.top, Spacing.s) }
@@ -259,13 +259,13 @@ struct VerdictCard: View {
                 Spacer()
                 Button { copyReport() } label: { Label("Copy report", systemImage: "doc.on.doc") }.buttonStyle(.borderless)
             }
-            if let e = model.aiError { Text(e).font(.caption).foregroundStyle(Color.statusAction) }
+            if let e = model.aiError { Text(SafeText.line(e, max: 240)).font(.caption).foregroundStyle(Color.statusAction) }
             if let ai = report.aiOpinion { AIOpinionView(opinion: ai) }
         }
         .card(tint: tint)
         .onAppear { withAnimation(reduceMotion ? nil : .spring(response: 0.5, dampingFraction: 0.7)) { appeared = true } }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(report.verdict.title), risk \(report.score) out of 100. \(report.headline)")
+        .accessibilityLabel("\(report.verdict.title), risk \(report.score) out of 100. \(SafeText.line(report.headline, max: 240))")
     }
 
     private func copyReport() {
@@ -303,12 +303,12 @@ struct SignalRow: View {
             Image(systemName: signal.score >= 70 ? "exclamationmark.octagon.fill" : signal.score >= 35 ? "exclamationmark.triangle.fill" : "info.circle.fill")
                 .foregroundStyle(tint).symbolRenderingMode(.hierarchical).frame(width: 20)
             VStack(alignment: .leading, spacing: 3) {
-                HStack { Text(signal.title).font(.body.weight(.medium)); Spacer(); Text("+\(signal.score)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary) }
-                Text(signal.explanation).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                HStack { Text(SafeText.line(signal.title)).font(.body.weight(.medium)); Spacer(); Text("+\(signal.score)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary) }
+                Text(SafeText.line(signal.explanation, max: 400)).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if !signal.evidence.isEmpty {
                     FlowLayout(spacing: 6) {
                         ForEach(Array(signal.evidence.prefix(4).enumerated()), id: \.offset) { _, ev in
-                            Text(ev.text.count > 70 ? String(ev.text.prefix(70)) + "…" : ev.text)
+                            Text(SafeText.line(ev.text, max: 70))
                                 .font(.caption.monospaced()).lineLimit(1)
                                 .padding(.horizontal, 6).padding(.vertical, 2)
                                 .background(tint.opacity(0.14), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
@@ -326,9 +326,9 @@ struct AIOpinionView: View {
     private var tint: Color { switch opinion.verdict { case .likelySafe: return .statusProtected; case .suspicious: return .statusAttention; case .likelyScam: return .statusAction } }
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
-            HStack { Label("AI second opinion · \(opinion.provider)", systemImage: "sparkles").font(.headline); Spacer(); Text(opinion.verdict.title).font(.callout.weight(.semibold)).foregroundStyle(tint); Text("\(opinion.confidence)%").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
-            Text(opinion.summary).font(.callout).fixedSize(horizontal: false, vertical: true)
-            ForEach(opinion.reasons, id: \.self) { r in Label { Text(r).font(.callout).foregroundStyle(.secondary) } icon: { Image(systemName: "circle.fill").font(.system(size: 5)).foregroundStyle(.secondary) } }
+            HStack { Label("AI second opinion · \(SafeText.line(opinion.provider, max: 40))", systemImage: "sparkles").font(.headline); Spacer(); Text(opinion.verdict.title).font(.callout.weight(.semibold)).foregroundStyle(tint); Text("\(opinion.confidence)%").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
+            Text(SafeText.line(opinion.summary, max: 400)).font(.callout).fixedSize(horizontal: false, vertical: true)
+            ForEach(opinion.reasons, id: \.self) { r in Label { Text(SafeText.line(r, max: 240)).font(.callout).foregroundStyle(.secondary) } icon: { Image(systemName: "circle.fill").font(.system(size: 5)).foregroundStyle(.secondary) } }
             Text("AI opinions can be wrong. RamPart's offline verdict above stays the primary result.").font(.caption).foregroundStyle(.tertiary)
         }
         .padding(Spacing.m)
@@ -376,10 +376,10 @@ struct LinksCard: View {
                 HStack(alignment: .top, spacing: Spacing.m) {
                     Image(systemName: u.verdict == .likelySafe ? "link" : "link.badge.plus").foregroundStyle(tint).frame(width: 20)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(u.host ?? u.original).font(.body.weight(.medium)).textSelection(.enabled)
-                        if let b = u.brandMatch { Text("Pretends to be \(b)").font(.callout).foregroundStyle(tint) }
-                        Text(u.original).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
-                        if let top = u.signals.first, top.score > 0 { Text(top.explanation).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                        Text(SafeText.line(u.host ?? u.original)).font(.body.weight(.medium)).textSelection(.enabled)
+                        if let b = u.brandMatch { Text("Pretends to be \(SafeText.line(b, max: 60))").font(.callout).foregroundStyle(tint) }
+                        Text(SafeText.line(u.original, max: 240)).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled)
+                        if let top = u.signals.first, top.score > 0 { Text(SafeText.line(top.explanation, max: 400)).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
                     }
                     Spacer()
                     Badge(text: u.verdict.title, tint: tint)

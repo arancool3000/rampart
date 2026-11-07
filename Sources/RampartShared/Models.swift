@@ -225,6 +225,8 @@ public struct ProtectionStatus: Codable, Sendable {
     public var openDetections: Int
     /// When definitions (hash feeds, blocklists, rules) last updated successfully; nil = never.
     public var definitionsUpdated: Date? = nil
+    /// `IPC.version` of the daemon that answered; nil = a daemon older than v6.
+    public var ipcVersion: Int? = nil
     public init(realtimeOn: Bool = false, sources: [String: Bool] = [:], webProtectionOn: Bool = false,
                 fullDiskAccess: Bool = false, lastScan: Date? = nil, signatureVersion: String = "0",
                 xprotectVersion: String? = nil, securityScore: Int? = nil, openDetections: Int = 0) {
@@ -288,6 +290,22 @@ public enum IPCRequest: Codable, Sendable {
     case restoreQuarantinedTo(id: UUID, path: String, allow: Bool)
     case exportQuarantined(id: UUID, path: String)
     case sandboxRun(id: UUID, confirmation: String)
+    // v6: Emergency Lockdown (RampartGuard/EmergencyLockdown.swift); all answered with `.emergency(Data)`
+    case emergencyStatus
+    case emergencyLockdown(reason: String)
+    case emergencyRescan
+    case liftEmergencyLockdown(token: String, force: Bool)
+    case emergencyAck(actionIDs: [String])
+    // v6: deep URL chain check (redirect chain + page signals), served off the IPC thread
+    case checkURLChain(url: String)   // -> .urlVerdict(Data) with JSON of RampartWeb.ChainReport
+    // v7: Cat & Mouse (RampartGuard Deception*); answered with `.deception(Data)` (JSON of DeceptionStatus)
+    case deceptionStatus
+    case deceptionSetDecoys(on: Bool)
+    case deceptionSetMaze(on: Bool)
+    case deceptionRemoveAll
+    case deceptionSetTarpit(on: Bool, port: UInt16, scope: String)
+    case deceptionSetTone(serious: Bool)
+    case deceptionEvidence(catchID: UUID)            // -> .deceptionEvidence(Data)
 }
 
 public enum IPCResponse: Codable, Sendable {
@@ -298,7 +316,10 @@ public enum IPCResponse: Codable, Sendable {
     case quarantine([QuarantineRecord])
     case posture([PostureCheck])
     case persistence([PersistenceItem])
-    case scanProgress(scanned: Int, total: Int, current: String)
+    /// walkFinished: the file walk is done, so `total` is final. timedOut: files whose deep checks hit their time
+    /// limit so far. secondsSinceLastCompletion: time since any file finished (large = a big file is being checked).
+    /// Optional so replies from older daemons (without these keys) still decode (SE-0295 decodeIfPresent).
+    case scanProgress(scanned: Int, total: Int, current: String, walkFinished: Bool? = nil, timedOut: Int? = nil, secondsSinceLastCompletion: Double? = nil)
     case scanFinished(scanned: Int, detections: [Detection], seconds: Double)
     case event(Detection)
     // v2
@@ -321,4 +342,9 @@ public enum IPCResponse: Codable, Sendable {
     // v5
     case exported(path: String, password: String)
     case sandboxReport(Data)  // JSON of rampartd SandboxReport (mirrored in the app's QuarantineManager.swift)
+    // v6
+    case emergency(Data)      // JSON of RampartGuard.EmergencyStatus
+    // v7
+    case deception(Data)          // JSON of RampartGuard.DeceptionStatus
+    case deceptionEvidence(Data)  // JSON of RampartGuard.DeceptionEvidence
 }

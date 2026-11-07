@@ -72,12 +72,31 @@ public final class UnifiedLogParser {
             if lower.contains("override") { detail["gatekeeper"] = "override" }
             else if lower.contains("deny") || lower.contains("denied") || lower.contains("rejected") { detail["gatekeeper"] = "deny" }
         }
+        else if subsystem == "com.apple.pasteboard" {
+            // Best effort: the wording is not documented. Emit a clipboardRead only for access/read lines, and name the
+            // reading app when the message carries its path or bundle id. R59/R59R decide whether it matters.
+            detail["channel"] = "pasteboard"
+            if lower.contains("access") || lower.contains("read") || lower.contains("paste") {
+                detail["type"] = "clipboardRead"
+                if let b = Self.firstBundleID(message) { detail["reader_bundle"] = b }
+            }
+        }
         if let p = Self.firstPath(message) { path = p }
         parsed += 1
         let proc = pid > 0 ? ProcessInfoLite(pid: pid, ppid: 0, path: procPath,
                                              isPlatformBinary: procPath.hasPrefix("/System/") || procPath.hasPrefix("/usr/libexec/")) : nil
         return SecurityEvent(date: Self.parseTimestamp(obj["timestamp"] as? String) ?? Date(), kind: kind,
                              process: proc, path: path, detail: detail, source: "unifiedlog")
+    }
+
+    /// First reverse-DNS token (e.g. com.example.App) in a log message, bounded.
+    static func firstBundleID(_ s: String) -> String? {
+        for token in s.split(whereSeparator: { " ,\"'()<>[]:;".contains($0) }) where token.count <= 155 {
+            let parts = token.split(separator: ".")
+            if parts.count >= 3, parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" } }),
+               parts[0].allSatisfy(\.isLetter) { return String(token) }
+        }
+        return nil
     }
 
     static func firstMatch(_ s: String, prefix: String) -> String? {
@@ -108,7 +127,9 @@ public final class UnifiedLogSource: EventSource, CPUReporting {
         #"subsystem == "com.apple.xprotect" OR subsystem == "com.apple.XProtectFramework" OR process BEGINSWITH "XProtect" "# +
         #"OR subsystem == "com.apple.backgroundtaskmanagement" "# +
         #"OR (subsystem == "com.apple.TCC" AND eventMessage CONTAINS "AUTHREQ") "# +
-        #"OR process == "syspolicyd""#
+        #"OR process == "syspolicyd" "# +
+        // b5x: best effort. macOS 15.4+ logs programmatic pasteboard reads (the privacy alert) under this subsystem.
+        #"OR (subsystem == "com.apple.pasteboard" AND (eventMessage CONTAINS[c] "access" OR eventMessage CONTAINS[c] "read"))"#
     public static let binary = "/usr/bin/log"
 
     public let name = "unifiedlog"

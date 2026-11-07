@@ -19,12 +19,20 @@ public enum FileSniffer {
     }
 
     /// Sniffs an already-open regular file.
-    public static func kind(fd: Int32, size: UInt64, path: String) -> FileKind {
+    public static func kind(fd: Int32, size: UInt64, path: String) -> FileKind { sniff(fd: fd, size: size, path: path).kind }
+
+    /// Sniffs an already-open regular file and also returns the header bytes read (for triage).
+    public static func sniff(fd: Int32, size: UInt64, path: String) -> (kind: FileKind, header: [UInt8]) {
         var header = [UInt8](repeating: 0, count: headerLength)
         let n = header.withUnsafeMutableBytes { pread(fd, $0.baseAddress, $0.count, 0) }
-        guard n > 0 else { return .other }
-        let k = kind(header: Array(header[0..<n]), path: path)
-        if k != .other { return k }
+        guard n > 0 else { return (.other, []) }
+        header.removeSubrange(n...)
+        let k = kind(header: header, path: path)
+        if k != .other { return (k, header) }
+        return (trailerKind(fd: fd, size: size), header)
+    }
+
+    private static func trailerKind(fd: Int32, size: UInt64) -> FileKind {
         // UDIF disk images have no header magic; the 512-byte "koly" trailer identifies them.
         if size >= 512 {
             var trailer = [UInt8](repeating: 0, count: 4)
@@ -64,6 +72,11 @@ public enum FileSniffer {
             || starts([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) || starts(Array("Rar!".utf8))
             || starts([0x28, 0xB5, 0x2F, 0xFD]) || starts(Array("ustar".utf8), at: 257) {
             return .archive
+        }
+        // .Z, lz4, cpio, Apple Archive (.aar/.yaa), zlib-wrapped blobs (trial-inflated), legacy .lzma.
+        switch ArchiveFormat.detect(header: h, path: path) {
+        case .compressZ, .lz4, .cpio, .appleArchive, .zlib, .lzma: return .archive
+        default: break
         }
         if starts(Array("%PDF".utf8)) || starts([0xD0, 0xCF, 0x11, 0xE0]) || starts(Array("{\\rtf".utf8)) {
             return .document

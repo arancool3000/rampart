@@ -205,6 +205,138 @@ public struct PageAnalyzer: Sendable {
                 out.append(ScamSignal(id: "page.credform.otp", category: .pageCredentialForm, title: "Asks for password and one-time code together", explanation: "Real-time phishing kits ask for both so they can log in as you immediately.", score: 50))
             }
         }
+        out += PageAnalyzer.lureSignals(url: url, title: title, h1: signals?.h1, overlay: overlay, visible: text,
+                                         downloadLinks: (signals?.downloadLinks ?? []) + PageAnalyzer.installerHrefs(html, base: url),
+                                         scarewareMatched: out.contains { $0.id == "page.scareware.alert" })
         return out
     }
+}
+
+// MARK: X3-4 / W-X6-1: fake antivirus, fake updates, Gatekeeper bypass, fake downloads
+// Mirrors Extensions/chromium/shared/heuristics.js `extraPageSignals`, so Safari and the in-app browser get the same rules.
+extension PageAnalyzer {
+    static func re(_ p: String) -> NSRegularExpression { try! NSRegularExpression(pattern: p, options: [.caseInsensitive]) }
+    static let disableAV = re(#"\b(disable|turn\s+off|switch\s+off|pause|deactivate|uninstall)\b[^\n]{0,20}?\b(protection|antivirus|anti-virus|real-?time|rampart|defender|firewall|security\s+software|xprotect|gatekeeper)"#)
+    static let callSupport = re(#"\b(call|contact|dial|phone|ring)\b[^\n]{0,20}?\b(support|technician|apple|microsoft|help\s*desk|helpline|toll[-\s]?free|our\s+(team|experts?|agents?))"#)
+    static let virusCount = re(#"\b\d{1,4}\s+(viruses|threats|infections|trojans|spyware|malware\s+(items|files|threats))\b"#)
+    static let fakeUpdate = re(#"\b(?:your\s+)?(?:version\s+of\s+)?(google\s+chrome|chrome|safari|firefox|microsoft\s+edge|edge|flash(?:\s+player)?|browser|macos|mac\s?os)\s+(?:is\s+)?(?:out\s+of\s+date|outdated|needs?\s+(?:an?\s+)?update|requires?\s+an?\s+update|critical\s+update)"#)
+    static let gatekeeperBypass = try! NSRegularExpression(pattern: #"(app\s+is\s+damaged|can.?t\s+be\s+opened|cannot\s+be\s+opened|unidentified\s+developer).{0,300}?(xattr\s+-c|xattr\s+-d|right.?click.{0,40}?open|open\s+anyway|sudo\s+spctl)"#, options: [.caseInsensitive, .dotMatchesLineSeparators])
+    static let bareXattr = re(#"\bxattr\s+-(c|cr|rc|d)\b"#)
+    static let installerPath = re(#"\.(dmg|pkg|mpkg|zip|app|iso)$"#)
+    static let hrefAttr = re(#"\bhref\s*=\s*["']([^"'\s>]+)["']"#)
+    static let updateBrands: [String: [String]] = [
+        "chrome": ["google.com"], "google chrome": ["google.com"], "safari": ["apple.com"], "macos": ["apple.com"], "mac os": ["apple.com"], "macos ": ["apple.com"],
+        "firefox": ["mozilla.org", "mozilla.net", "firefox.com"], "edge": ["microsoft.com"], "microsoft edge": ["microsoft.com"],
+        "flash": ["adobe.com"], "flash player": ["adobe.com"],
+    ]
+    static let allUpdateDomains = ["google.com", "apple.com", "mozilla.org", "mozilla.net", "firefox.com", "microsoft.com", "adobe.com"]
+    static let apps: [(String, [String])] = [
+        ("google chrome", ["google.com"]), ("chrome", ["google.com"]), ("firefox", ["mozilla.org", "mozilla.net", "firefox.com"]), ("zoom", ["zoom.us", "zoom.com"]),
+        ("notion", ["notion.so", "notion.com", "notion-static.com"]), ("slack", ["slack.com", "slack-edge.com"]), ("microsoft teams", ["microsoft.com", "office.com"]),
+        ("microsoft office", ["microsoft.com", "office.com"]), ("discord", ["discord.com", "discordapp.net", "discordapp.com"]), ("telegram", ["telegram.org"]),
+        ("whatsapp", ["whatsapp.com", "whatsapp.net"]), ("spotify", ["spotify.com", "scdn.co"]), ("vlc", ["videolan.org"]), ("1password", ["1password.com"]),
+        ("brave browser", ["brave.com"]), ("anydesk", ["anydesk.com"]), ("teamviewer", ["teamviewer.com"]), ("obs studio", ["obsproject.com"]), ("ledger live", ["ledger.com"]),
+        ("metamask", ["metamask.io"]), ("visual studio code", ["microsoft.com", "visualstudio.com"]), ("vscode", ["microsoft.com", "visualstudio.com"]),
+        ("chatgpt", ["openai.com", "chatgpt.com"]), ("claude desktop", ["anthropic.com", "claude.ai"]), ("tradingview", ["tradingview.com"]), ("photoshop", ["adobe.com"]),
+        ("adobe acrobat", ["adobe.com"]), ("adobe reader", ["adobe.com"]), ("logi options", ["logitech.com", "logi.com"]), ("signal desktop", ["signal.org"]),
+    ]
+    static let downloadMirrors: Set<String> = ["github.com", "githubusercontent.com", "sourceforge.net", "apple.com"]
+
+    static func first(_ r: NSRegularExpression, _ s: String) -> NSTextCheckingResult? { r.firstMatch(in: s, range: NSRange(location: 0, length: (s as NSString).length)) }
+
+    /// Installer links found in raw HTML (resolved against the page URL), capped.
+    static func installerHrefs(_ html: String?, base: ParsedURL?) -> [String] {
+        guard let html else { return [] }
+        let ns = html as NSString
+        var out: [String] = []
+        for m in hrefAttr.matches(in: html, range: NSRange(location: 0, length: ns.length)).prefix(400) {
+            let href = decodeEntities(ns.substring(with: m.range(at: 1)))
+            let abs: URL? = base.flatMap { URL(string: $0.original) }.flatMap { URL(string: href, relativeTo: $0)?.absoluteURL } ?? URL(string: href)
+            guard let u = abs, let scheme = u.scheme?.lowercased(), scheme == "http" || scheme == "https" else { continue }
+            if first(installerPath, u.path) != nil { out.append(u.absoluteString) }
+            if out.count >= 30 { break }
+        }
+        return out
+    }
+
+    static func registrable(_ urlOrHost: String) -> String? {
+        let s = urlOrHost.contains("://") ? urlOrHost : "https://" + urlOrHost
+        return URLAnalyzer.parse(s)?.registrable
+    }
+
+    /// `trigger` matches somewhere with any of `others` within ±radius characters.
+    static func near(_ text: String, _ trigger: NSRegularExpression, _ others: [NSRegularExpression], radius: Int) -> Bool {
+        let ns = text as NSString
+        for m in trigger.matches(in: text, range: NSRange(location: 0, length: ns.length)).prefix(50) {
+            let lo = max(0, m.range.location - radius), hi = min(ns.length, m.range.location + m.range.length + radius)
+            let win = ns.substring(with: NSRange(location: lo, length: hi - lo))
+            if others.contains(where: { first($0, win) != nil }) { return true }
+        }
+        return false
+    }
+
+    static func lureSignals(url: ParsedURL?, title: String, h1: String?, overlay: String, visible: String,
+                            downloadLinks: [String], scarewareMatched: Bool) -> [ScamSignal] {
+        var out: [ScamSignal] = []
+        let pageReg = url?.registrable
+        let dev = WebVerdictService.isDeveloperHost(url?.asciiHost)
+        let text = [title, h1 ?? "", overlay, visible].joined(separator: "\n")
+        let installers = downloadLinks.compactMap { l -> (String, String)? in
+            guard let r = registrable(l), let u = URL(string: l), first(installerPath, u.path) != nil else { return nil }
+            return (l, r)
+        }
+
+        // X3-4: telling the user to switch protection off, close to "call support", a virus count or scareware wording.
+        if near(text, disableAV, [callSupport, virusCount, scareware], radius: 400) || (scarewareMatched && first(disableAV, text) != nil) {
+            out.append(ScamSignal(id: "page.fakeav", category: .pageScareware, title: "Fake security alert telling you to turn off protection",
+                                  explanation: "No real antivirus asks you to switch it off. RamPart can't be disabled by a website.", score: 70,
+                                  evidence: first(disableAV, text).map { [ScamHighlight(text: String((text as NSString).substring(with: $0.range).prefix(160)), kind: .phrase)] } ?? []))
+        }
+
+        // W-X6-1 (1): "your browser is out of date".
+        if let m = first(fakeUpdate, text) {
+            let brand = (text as NSString).substring(with: m.range(at: 1)).lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let own = brand == "browser" ? allUpdateDomains : (updateBrands[brand] ?? allUpdateDomains)
+            if !(pageReg.map(own.contains) ?? false) {
+                let offBrand = installers.contains { !own.contains($0.1) }
+                let flash = brand.hasPrefix("flash")
+                out.append(ScamSignal(id: "page.fakeupdate", category: .pageScareware, title: flash ? "Fake Flash Player update" : "Fake browser or system update",
+                                      explanation: flash ? "Flash Player was discontinued in 2020. Any page offering a Flash update is a trap."
+                                                         : "Browsers and macOS update themselves from their own settings, never from a web page" + (offBrand ? ", and this download isn't from the vendor's site." : "."),
+                                      score: flash || offBrand ? 85 : 55,
+                                      evidence: [ScamHighlight(text: String((text as NSString).substring(with: m.range).prefix(160)), kind: .phrase)]))
+            }
+        }
+
+        // W-X6-1 (2): Gatekeeper bypass instructions. Skipped on developer sites (open-source READMEs say exactly this).
+        if !dev {
+            if let m = first(gatekeeperBypass, text) {
+                out.append(ScamSignal(id: "page.gatekeeper.bypass", category: .pageClickFix, title: "Tells you to bypass macOS's malware check",
+                                      explanation: "“App is damaged” followed by xattr, spctl or Open Anyway steps is how fake downloads get past Gatekeeper.", score: 80,
+                                      evidence: [ScamHighlight(text: String((text as NSString).substring(with: m.range).prefix(160)), kind: .phrase)]))
+            } else if first(bareXattr, visible + "\n" + overlay) != nil {
+                out.append(ScamSignal(id: "page.gatekeeper.xattr", category: .pageClickFix, title: "Tells you to remove macOS's download protection",
+                                      explanation: "The xattr command strips the quarantine flag that lets macOS check a download.", score: 50))
+            }
+        }
+
+        // W-X6-1 (3): page named after a well-known app, installer from someone else's domain.
+        let named = (title + " \n " + (h1 ?? "")).lowercased()
+        for (app, domains) in apps {
+            let esc = NSRegularExpression.escapedPattern(for: app)
+            guard first(re("(^|[^a-z0-9])" + esc + "([^a-z0-9]|$)"), named) != nil else { continue }
+            if let pr = pageReg, domains.contains(pr) || downloadMirrors.contains(pr) { break }
+            if dev { break }
+            if let bad = installers.first(where: { !domains.contains($0.1) && !downloadMirrors.contains($0.1) }) {
+                out.append(ScamSignal(id: "page.fakedownload", category: .lure, title: "Download is not from the developer's site",
+                                      explanation: "This page is named after \(app) but its installer comes from \(bad.1). Get \(app) from \(domains[0]).", score: 40,
+                                      evidence: [ScamHighlight(text: bad.0, kind: .link)]))
+            }
+            break
+        }
+        return out
+    }
+
+    /// The existing scareware text rule's regex (for the proximity check).
+    static var scareware: NSRegularExpression { textRules.first { $0.id == "page.scareware.alert" }!.regex }
 }

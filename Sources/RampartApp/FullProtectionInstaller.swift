@@ -19,6 +19,8 @@ final class FullProtectionInstaller {
         if Headless.active { return "Not available in test runs." }
         if !Bundle.main.bundlePath.hasPrefix("/Applications/") { return "Move \(Product.name) to your Applications folder first, then try again." }
         if !FileManager.default.isExecutableFile(atPath: cliURL.path) { return "This copy of \(Product.name) is missing its installer." }
+        // The installer must be this bundle's own file, not a symlink out of it.
+        if cliURL.resolvingSymlinksInPath().path != cliURL.standardizedFileURL.path { return "This copy of \(Product.name) has a damaged installer. Download it again." }
         return nil
     }
 
@@ -53,7 +55,10 @@ final class FullProtectionInstaller {
 
     private func finished(ok: Bool, output: String) {
         guard ok else {
-            let last = output.split(separator: "\n").last.map(String.init) ?? ""
+            // Shown in our UI: keep it short and strip the "rampart: " prefix and control characters.
+            var last = output.split(separator: "\n").last.map(String.init) ?? ""
+            if last.hasPrefix("rampart: ") { last.removeFirst("rampart: ".count) }
+            last = String(last.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7f }.prefix(240))
             phase = .failed(last.lowercased().contains("cancel") ? "The password prompt was cancelled. Nothing was changed." : (last.isEmpty ? "The installer stopped before finishing. Nothing was changed." : last))
             return
         }

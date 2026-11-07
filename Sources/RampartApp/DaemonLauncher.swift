@@ -27,7 +27,9 @@ final class DaemonLauncher {
     private(set) var child: Process?
     static let agentPlist = "app.rampart.userdaemon.plist"
 
+    /// hx8: QA flags are ignored by a copy installed in /Applications (see DaemonPeerTrust.devOverridesAllowed).
     private static func arg(_ name: String) -> String? {
+        guard DaemonPeerTrust.devOverridesAllowed else { return nil }
         let a = CommandLine.arguments
         guard let i = a.firstIndex(of: name), i + 1 < a.count else { return nil }
         return a[i + 1]
@@ -81,6 +83,10 @@ final class DaemonLauncher {
     /// Starts the helper if needed and waits up to `timeout` for its socket.
     func launchAndWait(client: DaemonClient, timeout: TimeInterval = 10) async -> State {
         guard let helper = helperURL else { return .failed("No helper binary in this build.") }
+        // hx8: only ever start the helper this app's signature vouches for (not a swapped or symlinked file).
+        guard DaemonPeerTrust.fileSatisfiesHelperRequirement(helper.path) else {
+            return .failed("The protection service file in this copy of \(Product.name) has been changed or isn't signed like the app, so it wasn't started. Reinstalling \(Product.name) fixes this.")
+        }
         if isInstalledCopy, Self.socketOverride == nil, !Headless.active, registerAgent() {
             if await waitForSocket(client: client, timeout: timeout) { return .agent }
         }
@@ -95,24 +101,31 @@ final class DaemonLauncher {
         if CommandLine.arguments.contains("--helper-no-realtime") { args += ["--no-realtime"] }
         // ZERO POP-UPS RULE: test runs never let the daemon schedule work or spawn privileged tools
         // (sfltool, profiles, …), so nothing can show a dialog.
+        // hx8: never pass loader-injection variables on to the helper.
+        var env = Self.sanitizedEnvironment(ProcessInfo.processInfo.environment)
         if Headless.active || CommandLine.arguments.contains("--helper-no-realtime") {
             if !args.contains("--no-scheduler") { args += ["--no-scheduler"] }
-            var env = ProcessInfo.processInfo.environment
             env["RAMPART_NO_PRIVILEGED_TOOLS"] = "1"
-            p.environment = env
         }
+        p.environment = env
         p.arguments = args
         p.standardInput = FileHandle.nullDevice
         let logDir = Self.rootOverride.map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Rampart")
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
         let logURL = logDir.appendingPathComponent("rampartd-user.log")
-        if !FileManager.default.fileExists(atPath: logURL.path) { FileManager.default.createFile(atPath: logURL.path, contents: nil) }
-        if let h = try? FileHandle(forWritingTo: logURL) { h.seekToEndOfFile(); p.standardOutput = h; p.standardError = h }
+        // hx8: open with O_NOFOLLOW so a planted symlink can't redirect the helper's output into another file.
+        let lfd = open(logURL.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        if lfd >= 0 { let h = FileHandle(fileDescriptor: lfd, closeOnDealloc: true); p.standardOutput = h; p.standardError = h }
+        else { p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice }
         do { try p.run() } catch { return .failed("Couldn't start basic protection: \(error.localizedDescription)") }
         child = p
         if await waitForSocket(client: client, timeout: timeout) { return .running(pid: p.processIdentifier) }
         return p.isRunning ? .failed("Basic protection started but isn't answering yet.") : .failed("Basic protection stopped right after starting. See \(logURL.path).")
+    }
+
+    static func sanitizedEnvironment(_ env: [String: String]) -> [String: String] {
+        env.filter { k, _ in !k.hasPrefix("DYLD_") && k != "MallocStackLogging" && !k.hasPrefix("__XPC_DYLD") }
     }
 
     private func waitForSocket(client: DaemonClient, timeout: TimeInterval) async -> Bool {
@@ -124,11 +137,37 @@ final class DaemonLauncher {
         return false
     }
 
+    /// hx8: the build that last started the user helper. When the app was updated in place, the running helper is
+    /// still the old binary (whose signature no longer matches this app's requirement), so it is restarted.
+    static let helperBuildKey = "helper.lastBuild"
+    static var currentBuild: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "") + "-" + Product.version
+    }
+
+    /// Restarts the user helper so it runs the binary inside the (updated) bundle. Never in headless/dev runs.
+    func restartAfterUpdate() {
+        guard !Headless.active else { return }
+        stopChild()
+        if #available(macOS 13, *), isInstalledCopy {
+            let svc = SMAppService.agent(plistName: Self.agentPlist)
+            if svc.status == .enabled { try? svc.unregister(); try? svc.register() }
+        }
+        UserDefaults.standard.set(Self.currentBuild, forKey: Self.helperBuildKey)
+    }
+
     private func registerAgent() -> Bool {
         guard #available(macOS 13, *) else { return false }
         let plist = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchAgents/\(Self.agentPlist)")
         guard FileManager.default.fileExists(atPath: plist.path) else { return false }
         let svc = SMAppService.agent(plistName: Self.agentPlist)
+        let last = UserDefaults.standard.string(forKey: Self.helperBuildKey)
+        if svc.status == .enabled, let last, last != Self.currentBuild {
+            // Updated since the helper was started: restart it on the new binary.
+            try? svc.unregister()
+            UserDefaults.standard.set(Self.currentBuild, forKey: Self.helperBuildKey)
+            do { try svc.register(); return svc.status == .enabled } catch { return false }
+        }
+        UserDefaults.standard.set(Self.currentBuild, forKey: Self.helperBuildKey)
         if svc.status == .enabled { return true }
         do { try svc.register(); return svc.status == .enabled } catch { return false }
     }

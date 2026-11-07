@@ -1,5 +1,6 @@
 import Foundation
 import RampartShared
+import Security
 
 // rampartd — Rampart protection daemon.
 //   As root (LaunchDaemon): state in /Library/Application Support/Rampart, socket /var/run/rampart.sock.
@@ -49,6 +50,22 @@ if getuid() != 0 && !userMode {
     exit(77)
 }
 
+// hx7: as root, run only as the installed, root-owned helper (defence in depth against a manual misinstall that would
+// let a user-writable binary run as root). `--root`/`--user` development runs are never root.
+if getuid() == 0 && !userMode {
+    let me = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
+    var why: String? = nil
+    if me != "/Library/PrivilegedHelperTools/\(Product.daemonLabel)" { why = "not running from /Library/PrivilegedHelperTools/\(Product.daemonLabel) (\(me))" }
+    for p in [me, (me as NSString).deletingLastPathComponent] where why == nil {
+        var st = stat()
+        if lstat(p, &st) != 0 || st.st_uid != 0 || st.st_mode & 0o022 != 0 { why = "\(p) is not root-owned or is writable by others" }
+    }
+    if let why {
+        FileHandle.standardError.write(Data("rampartd: refusing to run as root: \(why)\n".utf8))
+        exit(78)
+    }
+}
+
 let runtime = Runtime(root: rootOverride, userMode: userMode || getuid() != 0, socketPath: socketOverride)
 if printConfig {
     let enc = JSONEncoder.rampart; enc.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -68,14 +85,54 @@ let stateLockFD: Int32 = {
     return fd   // held open (and locked) for the life of the process
 }()
 _ = stateLockFD
+// State-file hardening (hx10): as the system service, the state folder must not be writable by anyone but root and the
+// files holding detections, activity, allow rules, policy and keys are 0600 even if an older version left them looser.
+if getuid() == 0 && !runtime.userMode {
+    var st = stat()
+    if lstat(runtime.root.path, &st) == 0 {
+        if st.st_uid != 0 { _ = chown(runtime.root.path, 0, 0) }
+        if st.st_mode & 0o022 != 0 { _ = chmod(runtime.root.path, mode_t(st.st_mode & 0o755)) }
+    }
+    for f in ["detections.json", "state.json", "activity.jsonl", "allowrules.json", "remote-policy.json", "guard.key", "rampartd.lock"] {
+        let path = runtime.root.appendingPathComponent(f).path
+        if lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_mode & 0o077 != 0 { _ = chmod(path, 0o600) }
+    }
+}
 DLog.shared.verbose = verbose
 DLog.shared.openFile(runtime.logFile)
 logInfo("rampartd \(Product.version) starting pid=\(getpid()) uid=\(getuid()) root=\(runtime.root.path) mode=\(runtime.userMode ? "user" : "system")")
 
+// b5x: one private clipboard-fingerprint key per state root (0600), shared in-process by PasteGuard, the behaviour
+// engine and EventHub through RAMPART_CLIPFP_KEY, and stable across restarts so stored clip tokens stay comparable.
+if getenv("RAMPART_CLIPFP_KEY") == nil {
+    let path = runtime.root.appendingPathComponent("clipfp.key")
+    var hex = SecureStore.read(path).flatMap { String(data: $0, encoding: .utf8) }?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if hex.count != 64 || !hex.allSatisfy(\.isHexDigit) {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess {
+            hex = bytes.map { String(format: "%02x", $0) }.joined()
+            try? SecureStore.write(Data(hex.utf8), to: path)
+        } else { hex = "" }
+    }
+    if hex.count == 64 { setenv("RAMPART_CLIPFP_KEY", hex, 1) }
+}
 DaemonWiring.install()
 let services = Services.make(runtime: runtime, daemon: true)
+// hx4 N1: before anything else, give DNS back if a previous run died while it pointed at us.
+(services.web as? WebProtection)?.recoverAtLaunch()
 for w in services.wiring { logInfo("wired \(w)") }
 let protection = Protection(runtime: runtime, services: services)
+// hx9: feed-lost / impostor detections from the event hub, and DoH pin failures, reach the detection store.
+DaemonWiring.hub?.onDetection = { protection.handle($0) }
+(services.web as? WebProtection)?.onDetection = { protection.handle($0) }
+// Emergency Lockdown: re-applies a persisted lockdown and starts its watch timer.
+Emergency.start(protection)
+// Cat & Mouse: messages to Activity, lure detections to the store, emergencies to the lockdown trigger.
+if let dec = DaemonWiring.deception {
+    dec.notify = { m in protection.activity.add(.detection, m.title, detail: m.body, outcome: "decoy", severity: m.severity) }
+    dec.onLureDetection = { d in protection.handle(d) }
+    dec.onEmergency = { why in _ = try? Emergency.manual(protection, peer: .local, reason: "Cat & Mouse: " + why) }
+}
 let router = Router(protection)
 let server = IPCServer(path: runtime.socketPath, router: router, userMode: runtime.userMode)
 do { try server.start() } catch {
@@ -95,7 +152,10 @@ if let g = services.guardian {
 }
 protection.activity.add(.system, "\(Product.name) protection started",
                         detail: runtime.userMode ? "User mode: protecting your files without system changes" : "System service",
-                        outcome: protection.services.realtime?.isRunning == true ? "real-time on" : "real-time off")
+                        outcome: protection.services.realtime?.isRunning == true ? "real-time on" : "real-time off",
+                        event: .serviceStarted, actor: .system,
+                        facts: ["real-time protection": protection.services.realtime?.isRunning == true ? "On" : "Off",
+                                "mode": runtime.userMode ? "User mode" : "System service"])
 if runtime.config.webProtection, !runtime.userMode, let web = services.web {
     do { try web.setOn(true) } catch { logWarn("web protection failed to start: \(error.localizedDescription)") }
 }
@@ -117,10 +177,11 @@ func onSignal(_ sig: Int32, _ handler: @escaping () -> Void) {
 }
 func shutdown(_ why: String) {
     logInfo("shutting down (\(why))")
-    protection.activity.add(.system, "\(Product.name) protection stopped", detail: why)
+    protection.activity.add(.system, "\(Product.name) protection stopped", detail: why, event: .serviceStopped, actor: .system)
     scheduler.stop()
     services.realtime?.stop()
     if let w = services.web, w.isOn { try? w.setOn(false) }
+    (services.web as? WebProtection)?.restoreOnExit()
     server.stop()
     exit(0)
 }

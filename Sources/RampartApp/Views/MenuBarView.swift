@@ -39,6 +39,10 @@ struct MenuBarView: View {
             }
             .font(.callout)
             .card(padding: Spacing.s)
+            if model.mode == .live {
+                EmergencyMenuItem { model.selection = .emergency; openMain() }
+                    .buttonStyle(.borderless)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Menu {
                     if let until = model.pausedUntil {
@@ -92,7 +96,7 @@ struct MenuBarView: View {
             VStack(alignment: .leading, spacing: Spacing.s) {
                 Text("\(p.kind.title) · \(p.fraction.map { "\(Int($0 * 100))%" } ?? "Finding files…")").font(.headline).monospacedDigit()
                 if let f = p.fraction { ProgressView(value: f).tint(Color.rampartTeal) } else { ProgressView().progressViewStyle(.linear).tint(Color.rampartTeal) }
-                Text(p.current).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                Text(SafeText.path(p.current)).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                 HStack {
                     if model.mode != .live { Button(p.paused ? "Resume" : "Pause") { model.togglePause() } }
                     Button("Stop") { model.stopScan() }

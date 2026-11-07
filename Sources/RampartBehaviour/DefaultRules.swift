@@ -13,6 +13,9 @@ enum DefaultRules {
     "editors": ["vim?", "nvim", "nano", "pico", "emacs.*", "code", "Code( Helper.*)?", "Cursor( Helper.*)?", "TextEdit", "BBEdit", "sublime_text", "Sublime Text", "zed", "Zed", "Xcode", "mate", "micro", "hx", "helix", "Nova", "CotEditor"],
     "installers": ["installer", "installd", "system_installd", "package_script_service", "Installer", "softwareupdated", "mdmclient", "Jamf.*", "jamf", "Kandji.*", "brew", "conda", "pyenv", "rustup(-init)?", "volta", "mise", "asdf", "fnm", "uv", "pixi", "chezmoi", "stow", "yadm", "nix.*", "git"],
     "devtools": ["swift-build", "swift", "swift-frontend", "swiftc", "cargo", "rustc", "go", "node", "npm", "npx", "pnpm", "yarn", "bun", "deno", "make", "gmake", "cmake", "ninja", "clang(\\+\\+)?", "ld", "python[0-9.]*", "pip[0-9.]*", "uv", "poetry", "gradle.*", "java", "mvn", "dotnet", "xcodebuild", "Code Helper.*", "Cursor Helper.*", "Electron", "git", "brew", "bundle", "rake", "gem", "docker", "claude", "codex"],
+    "officeApps": ["Microsoft (Word|Excel|PowerPoint|Outlook)", "Pages", "Numbers", "Keynote", "Preview", "Adobe Acrobat.*", "AdobeAcrobat", "Acrobat.*"],
+    "memoryTools": ["lldb", "lldb-rpc-server", "gdb", "vmmap", "leaks", "sample", "heap", "malloc_history", "footprint", "stringdups", "lsmp", "dtrace", "dtruss", "frida.*", "debugserver"],
+    "minerArgs": ["stratum\\+(tcp|ssl|tls)://", "--donate-level", "(^|\\s)(-o|--url)(\\s+|=)\\S+:(3333|4444|5555|7777|14444|14433|45700)\\b", "--randomx", "--coin(\\s+|=)(monero|xmr)\\b", "--cpu-max-threads-hint", "\\bxmrig\\b"],
     "passwordManagers": ["1Password.*", "Bitwarden.*", "Dashlane.*", "KeePassXC", "Enpass", "LastPass", "Keeper.*", "Proton Pass"],
     "backup": ["Backblaze.*", "bztransmit", "bzfilelist", "Arq.*", "backupd", "CCC.*", "Carbon Copy Cloner", "Dropbox.*", "bird", "cloudd", "fileproviderd", "Google Drive.*", "OneDrive.*", "mds", "mds_stores", "mdworker.*", "mdworker_shared", "Time Machine", "rampartd", "rampart"],
     "fetchers": ["curl", "wget", "nscurl", "aria2c", "fetch", "http", "xh"],
@@ -34,8 +37,25 @@ enum DefaultRules {
       "/\\.ssh/id_[a-z0-9_]+(\\s|$|\")",
       "/\\.aws/credentials",
       "/\\.config/gcloud/",
-      "/\\.kube/config"
+      "/\\.kube/config",
+      "/\\.config/gh/hosts\\.yml",
+      "/\\.npmrc$|/\\.npmrc(\\s|\")",
+      "/\\.pypirc(\\s|$|\")",
+      "/\\.docker/config\\.json",
+      "/\\.git-credentials(\\s|$|\")",
+      "/\\.netrc(\\s|$|\")",
+      "/\\.gnupg/",
+      "/\\.(zsh|bash)_history(\\s|$|\")",
+      "Library/Messages/chat\\.db",
+      "Library/Safari/(History\\.db|Form Values)",
+      "\\.kdbx(\\s|$|\")",
+      "/\\.config/solana/",
+      "Library/Application Support/[Rr]am[Pp]art/(Vault|Chats)(/|\\s|$|\")",
+      "\\.rpvault(\\s|$|\")",
+      "Local Extension Settings/(nkbihfbeogaeaoehlefnkodbefgpgknn|bfnaelmomeimhlpmgjnjophhpkkoljpa|ejbalbakoplchlghecdalmeeeajnimhm|hnfanknocfeofbddgcijnmhnfnkdnaad|fhbohimaelbohpjbbldcngcnapndodjp|egjidjbpglichdcondbcbdnbeeppgdph|acmacodkjbdgmoleebolmdjonilkdbch|aholpfdialjgjfhomihkjbmgjidlcdno)"
     ],
+    "sshDirArg": ["/\\.ssh/?(\\s|$|\")", "(^|\\s)\\.ssh/?(\\s|$)", "/\\.ssh/id_[a-z0-9_]+(\\s|$|\")"],
+    "appleCredReaders": ["@interpreters", "sqlite3", "cp", "ditto", "cat", "tar", "bsdtar", "zip", "rsync", "scp", "curl", "base64", "xxd", "strings", "head", "tail", "dd", "openssl", "plutil", "security"],
     "securityTools": ["(?i)(rampart|lulu|blockblock|little ?snitch|knockknock|oversight|reikey|xprotect|malwarebytes|sentinel(one|d)|crowdstrike|falcon|jamf ?protect|sophos|avast|norton|bitdefender|intego|clamav|eset)"],
     "browserRegex": ["(?i)(chrome|safari|firefox|brave|edge|arc|opera|vivaldi|chromium|orion|webkit)"]
   },
@@ -68,7 +88,9 @@ enum DefaultRules {
        {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/Library/Launch(Agents|Daemons)/[^/]+\\.plist$"], "pathNot": ["homebrew\\.mxcl\\."], "process": ["@shells", "@interpreters", "cp", "mv", "tee", "ditto", "cat", "curl", "wget", "defaults", "plutil", "PlistBuddy", "echo", "printf"], "ancestor": ["@browsers", "@scriptHosts"]},
        {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/Library/Launch(Agents|Daemons)/[^/]+\\.plist$"], "pathNot": ["homebrew\\.mxcl\\."], "process": ["@shells", "@interpreters", "cp", "mv", "tee", "ditto", "cat", "curl", "wget", "defaults", "plutil", "PlistBuddy", "echo", "printf"], "requireMark": {"name": "pasteEntry", "scope": "global", "window": 600}},
        {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/Library/Launch(Agents|Daemons)/[^/]+\\.plist$"], "pathNot": ["homebrew\\.mxcl\\."], "lineageUntrusted": true},
-       {"kinds": ["exec"], "process": ["launchctl"], "args": ["\\b(load|bootstrap|submit)\\b"], "argsNot": ["homebrew\\.mxcl\\."], "lineageUntrusted": true}
+       {"kinds": ["exec"], "process": ["launchctl"], "args": ["\\b(load|bootstrap|submit)\\b"], "argsNot": ["homebrew\\.mxcl\\."], "lineageUntrusted": true},
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/Library/Launch(Agents|Daemons)/~\\$[^/]*\\.plist$"]},
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/Library/Launch(Agents|Daemons)/[^/]+\\.plist$"], "ancestor": ["@officeApps"]}
      ]},
     {"id": "R09", "name": "Launch item injects a dylib", "type": "strong", "category": "persistence", "score": 75, "stage": "persistence", "subject": "lineage", "builtin": true,
      "why": "A launchd job sets DYLD_* environment variables, which injects code into the launched program.",
@@ -81,7 +103,10 @@ enum DefaultRules {
      "why": "A cron, at or periodic job was added. These are rare on modern macOS and are used for stealthy persistence.",
      "matchers": [
        {"kinds": ["exec"], "process": ["crontab"], "argsNot": ["\\s-(l|e|r)\\b"]},
-       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["^(/private)?/usr/lib/cron/(tabs|jobs)/", "^(/private)?/etc/crontab$", "^(/private)?/etc/periodic/", "^/usr/local/etc/periodic/", "^(/private)?/etc/periodic\\.conf"], "processNot": ["cron", "atrun", "periodic", "crontab", "@installers"]}
+       {"kinds": ["exec"], "process": ["at", "batch"], "argsNot": ["\\s-(l|r|d)\\b"]},
+       {"kinds": ["exec"], "process": ["launchctl"], "args": ["\\b(load|enable|bootstrap)\\b.*com\\.apple\\.atrun"]},
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["^(/private)?/usr/lib/cron/(tabs|jobs)/", "^(/private)?/etc/crontab$", "^(/private)?/etc/periodic/", "^/usr/local/etc/periodic/", "^(/private)?/etc/periodic\\.conf"], "processNot": ["cron", "atrun", "periodic", "crontab", "@installers"]},
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["^(/private)?/var/at/(tabs|jobs)/"], "processNot": ["cron", "atrun", "@installers"]}
      ]},
     {"id": "R12", "name": "Shell startup file gains a fetch or hidden-exec line", "type": "strong", "category": "persistence", "score": 70, "stage": "persistence", "subject": "lineage", "builtin": true,
      "why": "A line added to a shell startup file downloads remote content, runs something from a hidden or temp path, decodes an encoded blob, exports DYLD_* or overrides sudo/ssh."},
@@ -93,20 +118,33 @@ enum DefaultRules {
     {"id": "R14", "name": "New SSH authorized key", "type": "strong", "category": "backdoor", "score": 70, "stage": "persistence", "subject": "lineage", "alwaysActive": true, "interactiveFactor": 0.5,
      "why": "A key was added to ~/.ssh/authorized_keys outside an interactive ssh or editor session, granting remote login.",
      "matchers": [
-       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/\\.ssh/authorized_keys2?$"], "processNot": ["@editors", "ssh-copy-id", "sshd", "sshd-session"], "ancestorNot": ["ssh-copy-id", "@editors"]}
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/\\.ssh/authorized_keys2?$"], "processNot": ["@editors", "ssh-copy-id", "sshd", "sshd-session"], "ancestorNot": ["ssh-copy-id", "@editors"]},
+       {"kinds": ["exec"], "process": ["tee", "cp", "mv", "ditto", "sed", "dd"], "args": ["/\\.ssh/authorized_keys2?(\\s|$)"], "ancestorNot": ["ssh-copy-id", "@editors"]}
      ]},
     {"id": "R15", "name": "Remote Login enabled", "type": "weak", "category": "backdoor", "score": 45, "stage": "persistence", "subject": "lineage", "interactiveFactor": 0.6,
      "why": "SSH Remote Login was switched on from the command line rather than System Settings.",
      "matchers": [
        {"kinds": ["exec"], "process": ["systemsetup"], "args": ["-setremotelogin\\s+on"]},
-       {"kinds": ["exec"], "process": ["launchctl"], "args": ["\\b(load|enable|bootstrap)\\b.*(ssh\\.plist|com\\.openssh\\.sshd)"]}
+       {"kinds": ["exec"], "process": ["launchctl"], "args": ["\\b(load|enable|bootstrap)\\b.*(ssh\\.plist|com\\.openssh\\.sshd)"]},
+       {"kinds": ["exec"], "process": ["kickstart"], "argsAny": ["(^|\\s)-activate\\b", "-access\\s+-on\\b"]},
+       {"kinds": ["exec"], "process": ["launchctl"], "args": ["\\b(load|enable|bootstrap)\\b.*com\\.apple\\.screensharing"]}
      ]},
     {"id": "R16", "name": "Sudoers or authorization database changed", "type": "strong", "category": "backdoor", "score": 75, "stage": "evasion", "subject": "lineage", "interactiveFactor": 0.5,
      "why": "sudo rules or the authorization database were modified outside an installer, which can grant silent root.",
      "matchers": [
        {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["^(/private)?/etc/sudoers(\\.d/.*)?$"], "processNot": ["visudo", "@installers"]},
        {"kinds": ["exec"], "process": ["security"], "args": ["authorizationdb\\s+write"]},
-       {"kinds": ["exec"], "process": ["tee"], "args": ["/etc/sudoers"]}
+       {"kinds": ["exec"], "process": ["tee"], "args": ["/etc/sudoers"]},
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["^(/private)?/etc/pam\\.d/", "^/usr/local/lib/pam/"], "processNot": ["@installers"]},
+       {"kinds": ["exec"], "process": ["cp", "mv", "tee", "sed", "ditto", "ln", "install"], "args": ["/etc/pam\\.d/|/usr/local/lib/pam/"]}
+     ]},
+    {"id": "R16b", "name": "Hidden or new admin account", "type": "strong", "category": "backdoor", "score": 75, "stage": "persistence", "subject": "lineage", "alwaysActive": true, "interactiveFactor": 0.5,
+     "why": "A user account was created from the command line, hidden from the login window, or added to the admin group: a classic way to keep a backdoor login.",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["sysadminctl"], "args": ["-addUser\\b"]},
+       {"kinds": ["exec"], "process": ["dscl"], "args": ["-create\\s+/Users/\\S+(\\s+IsHidden\\s+1|\\s+UniqueID\\s+[0-4]\\d\\d\\b)"]},
+       {"kinds": ["exec"], "process": ["dseditgroup"], "args": ["-a\\s+\\S+.*\\badmin\\b"]},
+       {"kinds": ["exec"], "process": ["dscl"], "args": ["-append\\s+/Groups/admin\\s+GroupMembership"]}
      ]},
     {"id": "R17", "name": "Authorization or directory-services plugin added", "type": "strong", "category": "backdoor", "score": 80, "stage": "credential", "subject": "target",
      "why": "A bundle was placed in SecurityAgentPlugins or DirectoryServices PlugIns, where it can see login passwords.",
@@ -124,7 +162,14 @@ enum DefaultRules {
      "why": "A browser extension was installed outside the web store, or a force-install policy was written outside MDM.",
      "matchers": [
        {"kinds": ["exec"], "process": ["defaults"], "args": ["write", "com\\.(google\\.chrome|brave\\.browser|microsoft\\.edgemac|vivaldi|operasoftware)", "(ExtensionInstallForcelist|ExtensionInstallSources|ExtensionSettings|ExtensionInstallAllowlist)"]},
-       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["^/Library/Managed Preferences/.*com\\.(google\\.Chrome|brave\\.Browser|microsoft\\.Edge).*\\.plist$", "^/Library/Preferences/com\\.(google\\.Chrome|brave\\.Browser|microsoft\\.Edge)\\.plist$", "/distribution/policies\\.json$"], "processNot": ["mdmclient", "ManagedClient", "@installers"]}
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["^/Library/Managed Preferences/.*com\\.(google\\.Chrome|brave\\.Browser|microsoft\\.Edge).*\\.plist$", "^/Library/Preferences/com\\.(google\\.Chrome|brave\\.Browser|microsoft\\.Edge)\\.plist$", "/distribution/policies\\.json$"], "processNot": ["mdmclient", "ManagedClient", "@installers"]},
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/(Google/Chrome|BraveSoftware/Brave-Browser|Microsoft Edge|Chromium|Vivaldi)/External Extensions/[^/]+\\.json$", "^/Library/Application Support/[^/]+/(Chrome/)?External Extensions/"], "processNot": ["@browsers", "@installers", "mdmclient"]}
+     ]},
+    {"id": "R20L", "name": "Browser relaunched with a sideloaded extension", "type": "strong", "category": "adware", "score": 70, "stage": "persistence", "subject": "none",
+     "why": "An untrusted program or a pasted command restarted the browser with --load-extension, which loads an unpacked extension that never went through the web store (Adload/Shlayer style).",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["@browsers"], "argsAny": ["--load-extension=", "--disable-extensions-except="], "lineageUntrusted": true},
+       {"kinds": ["exec"], "process": ["@browsers"], "argsAny": ["--load-extension=", "--disable-extensions-except="], "requireMark": {"name": "pasteEntry", "scope": "global", "window": 600}}
      ]},
     {"id": "R21", "name": "High-permission browser extension added", "type": "weak", "category": "adware", "score": 35, "stage": "persistence", "subject": "target", "builtin": true,
      "why": "A new browser extension requests access to all sites together with cookies, web requests or native messaging."},
@@ -134,18 +179,25 @@ enum DefaultRules {
      "why": "A configuration profile was installed outside the organisation's MDM; profiles can add root certificates, proxies, DNS and browser policies.",
      "matchers": [
        {"kinds": ["other", "persistenceAdded"], "detail": {"subsystem": "com\\.apple\\.ManagedClient", "message": "install(ed|ing)?\\b.*profile"}},
-       {"kinds": ["exec"], "process": ["open"], "args": ["\\.mobileconfig\\b"], "lineageUntrusted": true}
+       {"kinds": ["exec"], "process": ["open"], "args": ["\\.mobileconfig\\b"], "lineageUntrusted": true},
+       {"kinds": ["exec"], "process": ["open"], "args": ["\\.mobileconfig\\b"], "requireMark": {"name": "pasteEntry", "scope": "global", "window": 600}},
+       {"kinds": ["exec"], "process": ["profiles"], "args": ["\\b(install|-I)\\b"], "lineageUntrusted": true}
      ]},
     {"id": "R24", "name": "New trusted root certificate", "type": "strong", "category": "suspicious", "score": 80, "stage": "evasion", "subject": "lineage", "alwaysActive": true, "interactiveFactor": 0.5,
      "why": "A certificate was added to the trust store; a rogue root CA lets an attacker intercept HTTPS.",
      "matchers": [
-       {"kinds": ["exec"], "process": ["security"], "args": ["add-trusted-cert"]}
+       {"kinds": ["exec"], "process": ["security"], "args": ["add-trusted-cert"]},
+       {"kinds": ["exec"], "process": ["security"], "args": ["trust-settings-import"]},
+       {"kinds": ["exec"], "process": ["security"], "args": ["add-certificates.*-k\\s+\\S*System\\.keychain"]}
      ]},
     {"id": "R25", "name": "Proxy, DNS or hosts redirect", "type": "weak", "category": "adware", "score": 50, "stage": "evasion", "subject": "lineage", "interactiveFactor": 0.6,
      "why": "System proxy, DNS servers or /etc/hosts entries were changed by a script rather than a VPN client or System Settings.",
      "matchers": [
        {"kinds": ["exec"], "process": ["networksetup"], "argsAny": ["-set(webproxy|securewebproxy|socksfirewallproxy|autoproxyurl|dnsservers|proxyautodiscovery)\\b"]},
-       {"kinds": ["fileWrite", "fileCreate", "fileRename"], "path": ["^(/private)?/etc/hosts$", "^(/private)?/etc/resolver/"], "processNot": ["@editors", "@installers"]}
+       {"kinds": ["fileWrite", "fileCreate", "fileRename"], "path": ["^(/private)?/etc/hosts$", "^(/private)?/etc/resolver/"], "processNot": ["@editors", "@installers"]},
+       {"kinds": ["exec"], "process": ["tee", "sed", "cp", "mv", "ditto"], "args": ["/etc/hosts\\b|/etc/resolver/"]},
+       {"kinds": ["fileWrite", "fileCreate", "fileRename"], "path": ["^/Library/Preferences/SystemConfiguration/preferences\\.plist$"], "processNot": ["configd", "networksetup", "System Settings", "System Preferences", "@installers", "mdmclient", "rampartd"]},
+       {"kinds": ["exec"], "process": ["scutil"], "argsNot": ["\\s--?(get|dns|proxy|nwi|r|w|nc|renew|g|cn)\\b"], "lineageUntrusted": true}
      ]},
     {"id": "R26", "name": "System extension from an unfamiliar developer", "type": "weak", "category": "suspicious", "score": 45, "stage": "persistence", "subject": "target", "builtin": true,
      "why": "A newly activated system extension belongs to a Team ID that was not present in the baseline."},
@@ -192,7 +244,7 @@ enum DefaultRules {
      "why": "A command classified as risky was copied from a web page and, within ten minutes, a Terminal shell ran a matching download/decode/script command.",
      "matchers": [
        {"kinds": ["exec"], "ancestor": ["@terminals"], "clipboardOverlap": 0.6, "argsNot": ["@installerHosts"], "setMark": {"name": "pasteEntry", "from": "global", "window": 600}},
-       {"kinds": ["exec"], "ancestor": ["@terminals"], "argsAny": ["\\b(curl|wget)\\b", "base64\\s+(-d|--decode|-D)", "\\bosascript\\b", "\\bopenssl\\s+(enc|base64)\\b"], "argsNot": ["@installerHosts"], "requireMark": {"name": "riskyClipboard", "scope": "global", "window": 600}, "setMark": {"name": "pasteEntry", "from": "global", "window": 600}}
+       {"kinds": ["exec"], "ancestor": ["@terminals"], "argsAny": ["\\b(curl|wget)\\b", "base64\\s+(-d|--decode|-D)", "\\bosascript\\b", "\\bopenssl\\s+(enc|base64)\\b", "\\bpython[0-9.]*\\s+-c\\b.*\\b(exec|eval|b64decode|urlopen)\\b", "\\b(perl|ruby)\\s+-e\\b.*\\b(eval|decode_base64|unpack)\\b"], "argsNot": ["@installerHosts"], "requireMark": {"name": "riskyClipboard", "scope": "global", "window": 600}, "setMark": {"name": "pasteEntry", "from": "global", "window": 600}}
      ]},
     {"id": "R32", "name": "Apple paste warning overridden", "type": "strong", "category": "malware", "score": 65, "stage": "entry", "subject": "lineage",
      "why": "The user bypassed macOS's 'Possible malware, paste blocked' warning in Terminal.",
@@ -210,7 +262,8 @@ enum DefaultRules {
      "why": "A web browser started a shell, script interpreter or downloader, which browsers do not normally do.",
      "matchers": [
        {"kinds": ["exec"], "process": ["@shells", "@interpreters", "@fetchers"], "ancestor": ["@browsers"], "ancestorNot": ["@terminals"], "setMark": {"name": "entry", "from": "story", "window": 1800}},
-       {"kinds": ["exec"], "process": ["@shells", "@interpreters", "@fetchers"], "detail": {"responsible_path": "(?i)(chrome|safari|firefox|brave|edge|arc|opera|vivaldi|chromium|orion)"}, "ancestorNot": ["@terminals"], "setMark": {"name": "entry", "from": "story", "window": 1800}}
+       {"kinds": ["exec"], "process": ["@shells", "@interpreters", "@fetchers"], "detail": {"responsible_path": "(?i)(chrome|safari|firefox|brave|edge|arc|opera|vivaldi|chromium|orion)"}, "ancestorNot": ["@terminals"], "setMark": {"name": "entry", "from": "story", "window": 1800}},
+       {"kinds": ["exec"], "process": ["@shells", "@interpreters", "@fetchers"], "ancestor": ["@officeApps"], "ancestorNot": ["@terminals"], "setMark": {"name": "entry", "from": "story", "window": 1800}}
      ]},
     {"id": "L09", "name": "Untrusted code launched from a disk image", "type": "weak", "category": "suspicious", "score": 30, "stage": "entry", "subject": "actor",
      "why": "An unsigned or ad-hoc signed program was run from a mounted disk image, the usual fake-installer delivery.",
@@ -232,18 +285,39 @@ enum DefaultRules {
      "why": "The keychain CLI was asked for a browser's 'Safe Storage' key (which decrypts saved passwords and cookies) by something other than the browser.",
      "matchers": [
        {"kinds": ["exec"], "process": ["security"], "args": ["find-generic-password", "safe storage|-w?a\\s+\"?(chrome|brave|edge|opera|vivaldi|arc|chromium)"], "ancestorNot": ["@browsers"]},
-       {"kinds": ["exec"], "process": ["security"], "args": ["dump-keychain"], "ancestorNot": ["@passwordManagers"]}
+       {"kinds": ["exec"], "process": ["security"], "args": ["dump-keychain"], "ancestorNot": ["@passwordManagers"]},
+       {"kinds": ["exec"], "process": ["security"], "args": ["find-(generic|internet)-password", "app\\.rampart\\."], "ancestorNot": ["rampartd", "RamPart", "rampart", "RampartApp", "rampart-agent"]}
      ]},
     {"id": "R37", "name": "Credential store accessed by a foreign process", "type": "weak", "category": "infostealer", "score": 50, "stage": "credential", "subject": "lineage",
      "why": "A process that is not the owning browser/app, a password manager or a backup tool referenced browser, keychain, wallet or cloud-credential files.",
      "matchers": [
-       {"kinds": ["exec"], "argsAny": ["@sensitivePaths"], "processNot": ["@browsers", "@passwordManagers", "@backup", "ssh", "ssh-add", "ssh-keygen", "scp", "git", "kubectl", "aws", "gcloud", "security", "@editors"]},
-       {"kinds": ["fileClose", "other"], "path": ["@sensitivePaths"], "processNot": ["@browsers", "@passwordManagers", "@backup", "ssh", "ssh-add", "ssh-agent", "git", "kubectl", "aws", "gcloud", "securityd", "secd", "trustd", "Keychain Access", "@editors"], "trust": "nonApple", "detailNot": {"modified": "^1$"}}
+       {"kinds": ["exec"], "argsAny": ["@sensitivePaths"], "processNot": ["@browsers", "@passwordManagers", "@backup", "ssh", "ssh-add", "ssh-keygen", "scp", "git", "git-credential-.*", "gh", "docker.*", "gpg.*", "kubectl", "aws", "gcloud", "security", "@editors", "@shells", "rampartd", "RamPart"]},
+       {"kinds": ["exec"], "argsAny": ["@sshDirArg"], "process": ["scp", "rsync", "sftp", "tar", "bsdtar", "zip", "ditto", "7z", "7zz", "cp"], "argsNot": ["\\.pub(\\s|$)"]},
+       {"kinds": ["fileClose", "other"], "path": ["@sensitivePaths"], "processNot": ["@browsers", "@passwordManagers", "@backup", "@shells", "@terminals", "@devtools", "@installers", "ssh", "ssh-add", "ssh-agent", "git", "git-credential-.*", "gh", "docker.*", "gpg.*", "pinentry.*", "twine", "atuin", "fzf", "mcfly", "kubectl", "aws", "gcloud", "securityd", "secd", "trustd", "mds.*", "backupd", "cloudd", "Safari", "com\\.apple\\.WebKit\\..*", "SafariBookmarksSyncAgent", "Messages", "imagent", "IMDPersistenceAgent", "Keychain Access", "@editors", "rampartd", "RamPart"], "trust": "nonApple", "detailNot": {"modified": "^1$"}},
+       {"kinds": ["fileClose", "other"], "path": ["@sensitivePaths"], "pathNot": ["/\\.(zsh|bash)_history$"], "process": ["@appleCredReaders"], "processNot": ["securityd", "secd", "trustd", "Keychain Access", "@backup"], "detailNot": {"modified": "^1$"}},
+       {"kinds": ["fileClose", "other"], "path": ["@sensitivePaths"], "process": ["@devtools", "@interpreters"], "pathNot": ["/\\.(npmrc|pypirc|netrc|git-credentials)$", "/\\.docker/config\\.json$", "/\\.config/gh/", "/\\.(zsh|bash)_history$", "/\\.kube/config$", "/\\.config/gcloud/", "/\\.aws/"], "detailNot": {"modified": "^1$"}}
      ]},
     {"id": "R38", "name": "Credential-store copy staged in temp", "type": "strong", "category": "infostealer", "score": 80, "stage": "collection", "subject": "lineage", "alwaysActive": true,
      "why": "Files named like browser, keychain or wallet stores were created in a temp or hidden folder: credentials being staged for theft.",
      "matchers": [
-       {"kinds": ["fileCreate", "fileRename", "fileWrite"], "path": ["^(/private)?/(tmp|var/folders|var/tmp)/.*/(Login Data|Cookies|Web Data|Local State|logins\\.json|key4\\.db|cookies\\.sqlite|login\\.keychain-db|wallet\\.dat)$", "^/Users/(Shared|[^/]+/\\.[^/]+)/.*/(Login Data|Cookies|Web Data|logins\\.json|key4\\.db|login\\.keychain-db|wallet\\.dat)$"], "processNot": ["@browsers", "@passwordManagers", "@backup"]}
+       {"kinds": ["fileCreate", "fileRename", "fileWrite"], "path": ["^(/private)?/(tmp|var/folders|var/tmp)/.*/(Login Data|Cookies|Web Data|Local State|logins\\.json|key4\\.db|cookies\\.sqlite|login\\.keychain-db|wallet\\.dat)$", "^/Users/(Shared|[^/]+/\\.[^/]+)/.*/(Login Data|Cookies|Web Data|logins\\.json|key4\\.db|login\\.keychain-db|wallet\\.dat)$"], "processNot": ["@browsers", "@passwordManagers", "@backup"]},
+       {"kinds": ["fileCreate", "fileRename", "fileWrite"], "path": ["^(/private)?/(tmp|var/folders|var/tmp)/.*\\.(rpvault|kdbx)$", "^/Users/(Shared|[^/]+/\\.[^/]+)/.*\\.(rpvault|kdbx)$"], "processNot": ["@passwordManagers", "@backup", "rampartd", "RamPart"]}
+     ]},
+    {"id": "R37S", "name": "SSH keys copied to another host", "type": "strong", "category": "infostealer", "score": 70, "stage": "exfil", "subject": "lineage", "interactiveFactor": 0.5,
+     "why": "The whole ~/.ssh folder or a private key was copied to a remote host with scp/rsync, which hands an attacker your SSH logins.",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["scp", "rsync", "sftp"], "argsAny": ["@sshDirArg"], "args": ["\\S+@?\\S+:\\S*(\\s|$)"], "argsNot": ["\\.pub(\\s|$)"]}
+     ]},
+    {"id": "R37b", "name": "Document sweep", "type": "weak", "category": "infostealer", "score": 45, "stage": "collection", "subject": "lineage",
+     "why": "One untrusted program opened many documents on the Desktop or in Documents within a minute, or copied documents into a hidden or temp staging folder, as file-grabber stealers do.",
+     "matchers": [
+       {"kinds": ["fileClose"], "path": ["^/Users/[^/]+/(Desktop|Documents)/.*\\.(txt|pdf|docx?|rtf|kdbx|key|wallet|xlsx?|csv|png|jpe?g)$"], "trust": "untrusted", "threshold": {"count": 25, "window": 60, "distinct": "path", "groupBy": "actor"}},
+       {"kinds": ["fileCreate"], "path": ["^(/private)?/(tmp|var/folders|var/tmp)/.*\\.(txt|pdf|docx?|rtf|kdbx|key|wallet)$", "^/Users/(Shared|[^/]+/\\.[^/]+)/.*\\.(txt|pdf|docx?|rtf|kdbx|key|wallet)$"], "lineageUntrusted": true, "threshold": {"count": 10, "window": 120, "distinct": "path", "groupBy": "actor"}}
+     ]},
+    {"id": "R43C", "name": "Credentials or archive staged into iCloud Drive", "type": "weak", "category": "infostealer", "score": 50, "stage": "exfil", "subject": "lineage",
+     "why": "An untrusted program wrote an archive or credential file into iCloud Drive, which uploads it off the Mac without any outbound connection from the program itself.",
+     "matchers": [
+       {"kinds": ["fileCreate", "fileWrite", "fileRename"], "path": ["/Library/Mobile Documents/com~apple~CloudDocs/(.*/)?(\\.[^/]+/|[^/]*\\.(zip|tgz|tar|gz|7z|rar|kdbx|rpvault|sqlite|db|keychain-db)$|(Login Data|Cookies|key4\\.db|logins\\.json|wallet\\.dat)$)"], "lineageUntrusted": true}
      ]},
     {"id": "R39", "name": "Honeytoken credential touched", "type": "strong", "category": "infostealer", "score": 95, "stage": "credential", "subject": "actor", "alwaysActive": true, "builtin": true,
      "why": "A Rampart decoy credential file was read, copied or modified. Nothing legitimate opens it."},
@@ -258,6 +332,11 @@ enum DefaultRules {
        {"kinds": ["dnsQuery", "networkConnect"], "detail": {"name": "^(api\\.telegram\\.org|discord(app)?\\.com)\\.?$"}, "processNot": ["@messagingApps", "@browsers"]},
        {"kinds": ["networkConnect"], "detail": {"remote_ip": "^(149\\.154\\.(16[0-9]|17[0-5])\\.|91\\.108\\.([4-9]|1[0-9]|2[0-3]|5[6-9])\\.|91\\.105\\.19[23]\\.|185\\.76\\.151\\.)"}, "processNot": ["@messagingApps", "@browsers"]},
        {"kinds": ["dnsQuery", "networkConnect"], "detail": {"host": "^(api\\.telegram\\.org|discord(app)?\\.com)\\.?$"}, "processNot": ["@messagingApps", "@browsers"]}
+     ]},
+    {"id": "R42D", "name": "DNS tunnelling pattern", "type": "weak", "category": "infostealer", "score": 55, "stage": "exfil", "subject": "actor",
+     "why": "One program resolved many different long, random-looking subdomains in a minute, the signature of data smuggled out inside DNS queries.",
+     "matchers": [
+       {"kinds": ["dnsQuery"], "detail": {"name": "^(?=[a-z0-9]*[0-9])(?=[a-z0-9]*[a-z])[a-z0-9]{24,63}\\.|^[a-z0-9]{40,63}\\.|^([a-z0-9]{16,63}\\.){3,}"}, "processNot": ["@browsers", "mDNSResponder", "rampartd"], "trust": "nonApple", "threshold": {"count": 10, "window": 60, "distinct": "detail:name", "groupBy": "actor"}}
      ]},
     {"id": "L03", "name": "Archive of a temp staging folder", "type": "weak", "category": "infostealer", "score": 20, "stage": "collection", "subject": "lineage", "devSensitive": true,
      "why": "A temp or hidden folder was archived, as stealers do before upload.",
@@ -356,7 +435,7 @@ enum DefaultRules {
     {"id": "L04", "name": "Decoded payload fed to an interpreter", "type": "weak", "category": "suspicious", "score": 40, "stage": "execution", "subject": "lineage", "devSensitive": true,
      "why": "Base64/openssl-decoded data was piped into a shell or interpreter, or written into a temp folder.",
      "matchers": [
-       {"kinds": ["exec"], "argsAny": ["(base64\\s+(-d|--decode|-D)|openssl\\s+(enc|base64)\\s.*-d)[^|]*\\|\\s*(sudo\\s+)?(/[^ ]*/)?((ba|z)?sh|python[0-9.]*|perl|osascript|ruby|node)\\b", "(base64\\s+(-d|--decode|-D)|openssl\\s+enc\\s.*-d).*(-o|>)\\s*(/private)?/(tmp|var/folders|Users/Shared)/"]}
+       {"kinds": ["exec"], "argsAny": ["(base64\\s+(-d|--decode|-D)|openssl\\s+(enc|base64)\\s.*-d)[^|]*\\|\\s*(sudo\\s+)?(/[^ ]*/)?((ba|z)?sh|python[0-9.]*|perl|osascript|ruby|node)\\b", "(base64\\s+(-d|--decode|-D)|openssl\\s+enc\\s.*-d).*(-o|>)\\s*(/private)?/(tmp|var/folders|Users/Shared)/", "(exec|eval)\\s*\\(\\s*(base64\\.b64decode|codecs\\.decode|zlib\\.decompress|bytes\\.fromhex|__import__\\(.base64.\\))", "osascript\\s+-l\\s+JavaScript.*(NSData|dataWithContentsOfURL|doShellScript)"]}
      ]},
     {"id": "L05", "name": "Made executable in temp then run", "type": "sequence", "category": "suspicious", "score": 45, "stage": "execution", "subject": "actor", "devSensitive": true,
      "why": "A file in a temp or hidden folder was marked executable and then run.",
@@ -372,6 +451,8 @@ enum DefaultRules {
      "why": "Gatekeeper assessments or download quarantine were switched off from the command line.",
      "matchers": [
        {"kinds": ["exec"], "process": ["spctl"], "argsAny": ["--(master-disable|global-disable)"]},
+       {"kinds": ["exec"], "process": ["socketfilterfw"], "argsAny": ["--setglobalstate\\s+off", "--setblockall\\s+off", "--setstealthmode\\s+off"], "ancestorNot": ["rampartd", "RamPart"]},
+       {"kinds": ["exec"], "process": ["pfctl"], "args": ["(^|\\s)-d\\b"], "ancestorNot": ["rampartd", "RamPart"]},
        {"kinds": ["exec"], "process": ["defaults"], "args": ["write"], "argsAny": ["LSQuarantine\\s+-bool\\s+(no|false|0)", "GKAutoRearm\\s+-bool\\s+(no|false|0)", "EnableAssessment\\s+-bool\\s+(no|false|0)"]}
      ]},
     {"id": "L07", "name": "Inline AppleScript automating Finder/System Events/Terminal", "type": "weak", "category": "suspicious", "score": 40, "stage": "execution", "subject": "lineage",
@@ -383,6 +464,46 @@ enum DefaultRules {
      "why": "sudo -S read a password from standard input inside an untrusted chain, typically after phishing it.",
      "matchers": [
        {"kinds": ["exec"], "process": ["sudo"], "args": ["(^|\\s)-[A-Za-z]*S"], "lineageUntrusted": true}
+     ]},
+    {"id": "L11", "name": "Indicator removal", "type": "weak", "category": "suspicious", "score": 45, "stage": "evasion", "subject": "lineage", "interactiveFactor": 0.6,
+     "why": "System logs were erased, or shell history or crash logs were deleted by a script, which hides what an attacker did.",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["log"], "args": ["(^|\\s)erase\\b"]},
+       {"kinds": ["exec"], "process": ["rm", "srm", "shred"], "argsAny": ["/\\.(zsh|bash)_history\\b", "(^|\\s)/var/log/", "/Library/Logs/DiagnosticReports"], "lineageUntrusted": true},
+       {"kinds": ["exec"], "process": ["@shells"], "argsAny": ["\\bhistory\\s+-c\\b", "unset\\s+HISTFILE", "HISTFILE=/dev/null"], "lineageUntrusted": true}
+     ]},
+    {"id": "R55M", "name": "Memory of a security tool read", "type": "strong", "category": "malware", "score": 85, "stage": "credential", "subject": "lineage", "alwaysActive": true, "interactiveFactor": 0.3,
+     "why": "A debugger or memory-inspection tool attached to RamPart or another security tool; it can read unlocked vault secrets straight out of memory.",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["@memoryTools"], "argsAny": ["@securityTools"]},
+       {"kinds": ["exec"], "process": ["@memoryTools"], "detail": {"target_process": "(?i)(rampart|lulu|blockblock|little ?snitch|knockknock|oversight|xprotect)"}}
+     ]},
+    {"id": "R59", "name": "Clipboard hijacker", "type": "weak", "category": "infostealer", "score": 50, "stage": "collection", "subject": "lineage",
+     "why": "An untrusted program read and rewrote the clipboard over and over, as crypto-address swappers do.",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["pbpaste", "pbcopy"], "lineageUntrusted": true, "threshold": {"count": 5, "window": 120, "groupBy": "story"}},
+       {"kinds": ["other"], "detail": {"type": "^clipboardRead$"}, "trust": "untrusted", "threshold": {"count": 3, "window": 120, "groupBy": "actor"}}
+     ]},
+    {"id": "R59R", "name": "Clipboard read by an untrusted program", "type": "weak", "category": "infostealer", "score": 40, "stage": "collection", "subject": "actor",
+     "why": "An unsigned or ad-hoc signed program read the clipboard, where copied passwords and one-time codes sit briefly.",
+     "matchers": [
+       {"kinds": ["other"], "detail": {"type": "^clipboardRead$"}, "trust": "untrusted"}
+     ]},
+    {"id": "R60", "name": "Installed app modified by an untrusted program", "type": "strong", "category": "malware", "score": 70, "stage": "persistence", "subject": "lineage",
+     "why": "Code inside an installed app in /Applications was replaced by an untrusted program or script, which trojanises the app.",
+     "matchers": [
+       {"kinds": ["fileWrite", "fileCreate", "fileRename"], "path": ["^/Applications/[^/]+\\.app/Contents/"], "pathNot": ["^/Applications/(Ledger Live|Exodus|Trezor Suite|Electrum|Atomic Wallet|Wasabi Wallet|Sparrow|Coinomi|Guarda)\\.app/"], "lineageUntrusted": true, "processNot": ["@installers", "Autoupdate", "Sparkle.*", "Updater", "storedownloadd", "appstoreagent"], "ancestorNot": ["@installers", "Autoupdate", "Sparkle.*"]}
+     ]},
+    {"id": "R60W", "name": "Crypto wallet app trojanised", "type": "strong", "category": "infostealer", "score": 90, "stage": "credential", "subject": "lineage", "alwaysActive": true,
+     "why": "A crypto wallet app's code (for example app.asar) was replaced by another program; trojanised wallets steal seed phrases.",
+     "matchers": [
+       {"kinds": ["fileWrite", "fileCreate", "fileRename"], "path": ["^/Applications/(Ledger Live|Exodus|Trezor Suite|Electrum|Atomic Wallet|Wasabi Wallet|Sparrow|Coinomi|Guarda)\\.app/Contents/"], "processNot": ["@installers", "Autoupdate", "Sparkle.*", "Ledger Live", "Exodus", "Trezor Suite", "Electrum", "Atomic Wallet", "ShipIt"], "ancestorNot": ["@installers"]}
+     ]},
+    {"id": "R62", "name": "Cryptominer", "type": "strong", "category": "miner", "score": 65, "stage": "impact", "subject": "lineage",
+     "why": "A program started with mining-pool arguments (stratum URL, pool port, RandomX/Monero options) or an untrusted program connected to a well-known mining-pool port.",
+     "matchers": [
+       {"kinds": ["exec"], "argsAny": ["@minerArgs"]},
+       {"kinds": ["networkConnect"], "detail": {"remote_port": "^(3333|4444|5555|7777|14444|14433|45700)$"}, "trust": "untrusted"}
      ]}
   ]
 }

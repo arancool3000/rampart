@@ -13,8 +13,19 @@ import CommonCrypto
 public enum VaultCrypto {
     public static let minimumIterations = 600_000
     public static let targetMilliseconds = 300.0
+    /// Upper bound accepted from any file header (calibration never exceeds it). A tampered header with a
+    /// huge count would otherwise hang the app for hours or trap converting to UInt32.
+    public static let maximumIterations = 20_000_000
+    /// Lowest count accepted from a file header (test vaults use 10,000; real ones >= 600,000).
+    public static let floorIterations = 1_000
+
+    /// True when KDF parameters read from an untrusted file are safe to run.
+    public static func acceptableKDF(iterations: Int, salt: Data) -> Bool {
+        (floorIterations...maximumIterations).contains(iterations) && (16...64).contains(salt.count)
+    }
 
     public static func pbkdf2(password: String, salt: Data, iterations: Int, length: Int = 32) -> SecretKeyBytes {
+        precondition(iterations > 0 && iterations <= Int(UInt32.max) && !salt.isEmpty, "PBKDF2 parameters out of range")
         var pw = Array(password.utf8)
         defer { secureZero(&pw) }
         var out = [UInt8](repeating: 0, count: length)
@@ -78,6 +89,8 @@ public enum VaultCrypto {
 struct VaultFile {
     static let magic = Data("RAMPVLT\0".utf8)
     static let currentVersion: UInt16 = 1
+    /// Refuse to parse anything bigger (the item cap times the 1 MB attachment cap is far below this).
+    static let maxFileBytes = 512 * 1_048_576
 
     struct KDF: Codable {
         var algorithm: String   // "pbkdf2-hmac-sha256"
@@ -127,6 +140,7 @@ struct VaultFile {
 
     static func parse(_ d: Data) throws -> VaultFile {
         let d = Data(d) // rebase indices to 0
+        guard d.count <= maxFileBytes else { throw VaultError.badFormat("file too large") }
         guard d.count > 8 + 2 + 4 + 4 + 32, d.prefix(8) == magic else { throw VaultError.badFormat("not a RamPart vault") }
         let version = UInt16(d[8]) << 8 | UInt16(d[9])
         guard version >= 1 else { throw VaultError.badFormat("bad version") }

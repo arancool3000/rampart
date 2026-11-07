@@ -238,14 +238,21 @@ final class AIChatModel {
         }
     }
 
-    private var history: [ChatTurn] {
-        messages.suffix(6).compactMap { m in
-            switch m.payload {
-            case .text(let t) where m.isUser: return ChatTurn(role: .user, text: t)
-            case .reply(let r): return ChatTurn(role: .assistant, text: r.answer)
-            default: return nil
-            }
+    /// Earlier Ask turns only: a user question counts only when the assistant answered it as a chat reply.
+    /// Pasted scam messages, links, detection requests and RamPart's own result lines never go back to the model
+    /// as "the user said", so text from those can't later steer the assistant or its proposals.
+    private var history: [ChatTurn] { Self.history(from: messages) }
+
+    static func history(from messages: [Message]) -> [ChatTurn] {
+        var out: [ChatTurn] = []
+        for (i, m) in messages.enumerated() {
+            guard case .reply(let r) = m.payload, !m.isUser, i > 0 else { continue }
+            let q = messages[i - 1]
+            guard q.isUser, case .text(let t) = q.payload else { continue }
+            out.append(ChatTurn(role: .user, text: t))
+            out.append(ChatTurn(role: .assistant, text: r.answer))
         }
+        return Array(out.suffix(6))
     }
 
     // MARK: Actions (all user-initiated)
@@ -289,6 +296,8 @@ final class AIChatModel {
 
     func applyAction(_ p: AIProposedAction, confirmedLowering: Bool) {
         guard actionStates[p.id] == .pending || { if case .failed = actionStates[p.id] { return true }; return false }() else { return }
+        // Only proposals shown in the open conversation can run (never one from another or a restored chat).
+        guard messages.contains(where: { if case .reply(let r) = $0.payload { return r.actions?.contains { $0.id == p.id } == true }; return false }) else { return }
         actionStates[p.id] = .running
         let gate = gate
         let chatID = currentID

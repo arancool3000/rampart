@@ -149,9 +149,22 @@ public enum AIActionValidator {
         public var settings: RampartSettings?
         public var fixableFailing: Set<String>     // posture ids that are failing and fixable now
         public var lockdownOn: Bool?
-        public init(settings: RampartSettings? = nil, fixableFailing: Set<String> = AIAction.fixableCheckIDs, lockdownOn: Bool? = nil) {
-            self.settings = settings; self.fixableFailing = fixableFailing; self.lockdownOn = lockdownOn
+        /// The user's own words (current question plus their recent questions). When set, a protection-lowering
+        /// proposal survives only if the user themselves asked to lower something: text in DATA blocks (posture
+        /// details, pasted messages) can never be the reason a lowering card appears.
+        public var userIntent: String?
+        public init(settings: RampartSettings? = nil, fixableFailing: Set<String> = AIAction.fixableCheckIDs, lockdownOn: Bool? = nil,
+                    userIntent: String? = nil) {
+            self.settings = settings; self.fixableFailing = fixableFailing; self.lockdownOn = lockdownOn; self.userIntent = userIntent
         }
+    }
+
+    private static let loweringIntentRE = try! NSRegularExpression(pattern:
+        #"(?i)\b(off|disable[ds]?|disabling|deactivate|stop|pause|exclude|excluding|exclusion|exception|ignore|whitelist|allowlist|allow|skip|lower|less|fewer|quiet|silence|too many|false (positive|alarm)|developer|dev mode|unlock|remove|turn it off|annoying|slow(s|ing)? (down|my)|interfer\w*|block(s|ing|ed)? my)\b"#)
+
+    /// Whether the user's own words ask to relax protection in some way.
+    public static func hasLoweringIntent(_ text: String) -> Bool {
+        loweringIntentRE.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) != nil
     }
 
     static let broadPaths: Set<String> = ["/", "~", "~/", "/Users", "/Applications", "/System", "/Library", "/private", "/tmp",
@@ -200,6 +213,7 @@ public enum AIActionValidator {
                 }
             }
             guard let action = a, seen.insert(action).inserted else { continue }
+            if action.lowersProtection, let intent = context.userIntent, !hasLoweringIntent(intent) { continue }
             out.append(AIProposedAction(action: action, reason: Clean.text(r.reason, max: 240)))
             if out.count == 3 { break }
         }
@@ -264,16 +278,32 @@ public final class AIActionGate: @unchecked Sendable {
     private let lock = NSLock()
     private var proposals: [UUID: AIProposedAction] = [:]
     private var states: [UUID: State] = [:]
-    public init() {}
+    private var registered: [UUID: Date] = [:]
+    /// A proposal is only valid while the conversation is fresh: after this long it expires, so an old card
+    /// (validated against settings that may since have changed) can't be applied later.
+    public let ttl: TimeInterval
+    private let now: @Sendable () -> Date
+    public init(ttl: TimeInterval = 15 * 60, now: @escaping @Sendable () -> Date = { Date() }) { self.ttl = ttl; self.now = now }
 
+    /// Registers fresh proposals. Ids already seen (even after they ran or were dismissed) are never re-armed.
     public func register(_ p: [AIProposedAction]) {
         lock.lock(); defer { lock.unlock() }
-        for a in p where proposals[a.id] == nil { proposals[a.id] = a; states[a.id] = .pending }
+        for a in p where proposals[a.id] == nil { proposals[a.id] = a; states[a.id] = .pending; registered[a.id] = now() }
     }
     public func dismiss(_ id: UUID) { lock.lock(); defer { lock.unlock() }; if states[id] == .pending { states[id] = .dismissed } }
     public func state(_ id: UUID) -> State? { lock.lock(); defer { lock.unlock() }; return states[id] }
 
-    public enum ApproveError: Error, Equatable { case unknown, notPending, needsConfirmation }
+    public enum ApproveError: Error, Equatable, CustomStringConvertible {
+        case unknown, notPending, needsConfirmation, expired
+        public var description: String {
+            switch self {
+            case .unknown: return "this suggestion isn't from the current conversation"
+            case .notPending: return "this suggestion was already handled"
+            case .needsConfirmation: return "it needs your confirmation first"
+            case .expired: return "this suggestion expired. Ask again to get a fresh one"
+            }
+        }
+    }
 
     /// Claims a proposal for execution (pending or failed -> running). Throws if it can't run.
     private func claim(_ id: UUID, confirmedLowering: Bool) throws -> AIProposedAction {
@@ -282,6 +312,7 @@ public final class AIActionGate: @unchecked Sendable {
         var runnable = states[id] == .pending
         if case .failed = states[id] { runnable = true }
         guard runnable else { throw ApproveError.notPending }
+        if let t = registered[id], now().timeIntervalSince(t) > ttl || now() < t { states[id] = .dismissed; throw ApproveError.expired }
         if p.lowersProtection && !confirmedLowering { throw ApproveError.needsConfirmation }
         states[id] = .running
         return p
@@ -297,7 +328,7 @@ public final class AIActionGate: @unchecked Sendable {
             finish(id, .done(r))
             return r
         } catch {
-            finish(id, .failed("\(error)"))
+            finish(id, .failed(Clean.text("\(error)", max: 300)))
             throw error
         }
     }

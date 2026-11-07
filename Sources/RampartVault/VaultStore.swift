@@ -20,7 +20,15 @@ public final class VaultStore: @unchecked Sendable {
     private var _items: [UUID: VaultItem] = [:]
     private var _meta = VaultMeta()
 
-    public init(directory: URL = VaultStore.defaultDirectory) { self.directory = directory }
+    /// Wrong-master-password backoff (shared by unlock, re-authentication and password change).
+    public let throttle: UnlockThrottle
+    var stateURL: URL { directory.appendingPathComponent("vault.state") }
+    private var rollback: RollbackGuard { RollbackGuard(url: stateURL) }
+
+    public init(directory: URL = VaultStore.defaultDirectory) {
+        self.directory = directory
+        throttle = UnlockThrottle(url: directory.appendingPathComponent("unlock-throttle.json"))
+    }
 
     public var exists: Bool { FileManager.default.fileExists(atPath: fileURL.path) }
     public var isUnlocked: Bool { mutex.withLock { vaultKey != nil } }
@@ -68,44 +76,66 @@ public final class VaultStore: @unchecked Sendable {
         return h
     }
 
-    public func unlock(masterPassword: String) throws {
+    /// Opens the vault. `acceptRollback` is only for the user's explicit "Open Anyway" after `.rolledBack`.
+    public func unlock(masterPassword: String, acceptRollback: Bool = false) throws {
         let file = try readFile()
-        guard file.header.kdf.algorithm == "pbkdf2-hmac-sha256", file.header.kdf.iterations >= 1000 else {
+        let key = try unwrapKey(file, password: masterPassword)
+        try load(file, key: key, acceptRollback: acceptRollback)
+    }
+
+    /// Validates untrusted KDF parameters, applies the wrong-password backoff and unwraps the vault key.
+    private func unwrapKey(_ file: VaultFile, password: String) throws -> SecretKeyBytes {
+        guard file.header.kdf.algorithm == "pbkdf2-hmac-sha256",
+              VaultCrypto.acceptableKDF(iterations: file.header.kdf.iterations, salt: file.header.kdf.salt) else {
             throw VaultError.badFormat("unknown key derivation")
         }
-        let kek = VaultCrypto.pbkdf2(password: masterPassword, salt: file.header.kdf.salt, iterations: file.header.kdf.iterations)
+        try throttle.check()
+        let kek = VaultCrypto.pbkdf2(password: password, salt: file.header.kdf.salt, iterations: file.header.kdf.iterations)
         defer { kek.wipe() }
         var raw: Data
         do { raw = try VaultCrypto.open(file.header.wrappedKey, key: VaultCrypto.symmetric(kek), aad: VaultFile.wrapAAD(file.header)) }
-        catch { throw VaultError.wrongPassword }
-        let key = SecretKeyBytes(data: raw)
-        secureZero(&raw)
-        try load(file, key: key)
+        catch { throttle.recordFailure(); throw VaultError.wrongPassword }
+        defer { secureZero(&raw) }
+        guard raw.count == 32 else { throw VaultError.tampered }
+        throttle.recordSuccess()
+        return SecretKeyBytes(data: raw)
     }
 
-    /// Re-authentication check (e.g. before revealing setup links). Doesn't change any state.
+    /// Re-authentication check (e.g. before revealing setup links). Doesn't change any state except the
+    /// wrong-password backoff, which it shares with unlock (so it can't be used as an unthrottled oracle).
     public func verifyMasterPassword(_ password: String) -> Bool {
-        guard let file = try? readFile() else { return false }
-        let kek = VaultCrypto.pbkdf2(password: password, salt: file.header.kdf.salt, iterations: file.header.kdf.iterations)
-        defer { kek.wipe() }
-        return (try? VaultCrypto.open(file.header.wrappedKey, key: VaultCrypto.symmetric(kek), aad: VaultFile.wrapAAD(file.header))) != nil
+        guard let file = try? readFile(), let key = try? unwrapKey(file, password: password) else { return false }
+        key.wipe()
+        return true
     }
 
     /// Unlock with a vault key recovered another way (Touch ID). Verifies the file MAC.
-    func unlock(vaultKey key: SecretKeyBytes) throws {
-        try load(try readFile(), key: key)
+    func unlock(vaultKey key: SecretKeyBytes, acceptRollback: Bool = false) throws {
+        try load(try readFile(), key: key, acceptRollback: acceptRollback)
     }
 
     private func readFile() throws -> VaultFile {
         guard exists else { throw VaultError.noVault }
         let d: Data
-        do { d = try Data(contentsOf: fileURL) } catch { throw VaultError.io(error.localizedDescription) }
+        do {
+            // Refuse a symlinked vault file (it could point anywhere) and oversized files before reading.
+            let v = try fileURL.resourceValues(forKeys: [.isSymbolicLinkKey, .fileSizeKey])
+            if v.isSymbolicLink == true { throw VaultError.badFormat("the vault file is a link") }
+            if (v.fileSize ?? 0) > VaultFile.maxFileBytes { throw VaultError.badFormat("file too large") }
+            d = try Data(contentsOf: fileURL)
+        } catch let e as VaultError { throw e } catch { throw VaultError.io(error.localizedDescription) }
         return try VaultFile.parse(d)
     }
 
-    private func load(_ file: VaultFile, key: SecretKeyBytes) throws {
+    private func load(_ file: VaultFile, key: SecretKeyBytes, acceptRollback: Bool = false) throws {
         guard file.verify(vaultKey: key) else { throw VaultError.tampered }
         let id = file.header.vaultID
+        if let expected = rollback.expected(for: id), file.header.generation < expected {
+            guard acceptRollback else { throw VaultError.rolledBack(found: file.header.generation, expected: expected) }
+            rollback.record(id, generation: file.header.generation, allowLower: true)
+        } else {
+            rollback.record(id, generation: file.header.generation)
+        }
         let ik = VaultFile.itemKey(key, id)
         var items: [UUID: VaultItem] = [:]
         do {
@@ -120,7 +150,7 @@ public final class VaultStore: @unchecked Sendable {
                 items[item.id] = item
             }
             mutex.withLock { vaultKey = key; header = file.header; _items = items; _meta = meta }
-        } catch { throw VaultError.tampered }
+        } catch let e as VaultError { throw e } catch { throw VaultError.tampered }
     }
 
     /// Drops the key and every decrypted item from memory.
@@ -153,11 +183,14 @@ public final class VaultStore: @unchecked Sendable {
         }
     }
 
-    /// Adds many items with one backup and one write (imports).
+    /// Adds many items with one backup and one write (imports). Never overwrites an existing item: an
+    /// imported item whose ID is already in the vault gets a fresh ID (an export file can't replace entries).
     public func insert(_ items: [VaultItem]) throws {
         try mutex.withLock {
             guard vaultKey != nil else { throw VaultError.locked }
+            for i in items { for a in i.attachments where a.data.count > Attachment.maxBytes { throw VaultError.attachmentTooLarge } }
             for var i in items {
+                if _items[i.id] != nil { i.id = UUID() }
                 if i.passwordModified == nil, !i.password.isEmpty { i.passwordModified = i.modified }
                 _items[i.id] = i
             }
@@ -186,11 +219,12 @@ public final class VaultStore: @unchecked Sendable {
     public func changeMasterPassword(current: String, new: String, iterations: Int? = nil) throws {
         guard iterations != nil || Self.isAcceptableMaster(new) else { throw VaultError.weakMasterPassword }
         let file = try readFile()
-        let kek = VaultCrypto.pbkdf2(password: current, salt: file.header.kdf.salt, iterations: file.header.kdf.iterations)
-        defer { kek.wipe() }
-        guard (try? VaultCrypto.open(file.header.wrappedKey, key: VaultCrypto.symmetric(kek), aad: VaultFile.wrapAAD(file.header))) != nil else {
-            throw VaultError.wrongPassword
-        }
+        let check = try unwrapKey(file, password: current)
+        // The password must open the vault that is unlocked right now, not just whatever file is on disk.
+        let matches: Bool? = mutex.withLock { vaultKey.map { k in k.withBytes { a in check.withBytes { b in a == b } } } }
+        check.wipe()
+        guard let matches else { throw VaultError.locked }
+        guard matches else { throw VaultError.tampered }
         let iters = iterations ?? VaultCrypto.calibrateIterations()
         try mutex.withLock {
             guard let key = vaultKey, let h = header else { throw VaultError.locked }
@@ -223,6 +257,7 @@ public final class VaultStore: @unchecked Sendable {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         } catch { throw VaultError.io("Could not save the vault: \(error.localizedDescription)") }
         header = h
+        rollback.record(h.vaultID, generation: h.generation)
     }
 
     private func ensureDirectory(_ url: URL) throws {
@@ -235,7 +270,10 @@ public final class VaultStore: @unchecked Sendable {
     public func backups() -> [URL] {
         let fm = FileManager.default
         let urls = (try? fm.contentsOfDirectory(at: backupDirectory, includingPropertiesForKeys: nil)) ?? []
-        return urls.filter { $0.pathExtension == "rpvault" }.sorted { $0.lastPathComponent > $1.lastPathComponent }
+        return urls.filter { u in
+            u.pathExtension == "rpvault" && (try? u.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+                && (try? u.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true
+        }.sorted { $0.lastPathComponent > $1.lastPathComponent }
     }
 
     private func backupIfNeeded(force: Bool) throws {
@@ -256,13 +294,19 @@ public final class VaultStore: @unchecked Sendable {
 
     /// Replaces the vault with a backup (after backing up the current file) and locks.
     public func restore(backup: URL) throws {
-        _ = try VaultFile.parse(try Data(contentsOf: backup))
+        if (try? backup.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true { throw VaultError.badFormat("the backup is a link") }
+        let data = try Data(contentsOf: backup)
+        let parsed = try VaultFile.parse(data)
+        // Only backups of THIS vault: a planted file from another vault would be a phishing / swap vector.
+        if let current = vaultID, parsed.header.vaultID != current { throw VaultError.badFormat("that backup belongs to a different vault") }
         try mutex.withLock {
             try backupIfNeeded(force: true)
             let tmp = directory.appendingPathComponent(".restore.tmp")
             try? FileManager.default.removeItem(at: tmp)
-            try FileManager.default.copyItem(at: backup, to: tmp)
+            try data.write(to: tmp) // the bytes we validated, not a second read of the path
             _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: tmp)
+            // The user chose this older copy: move the anti-rollback mark down to it.
+            rollback.record(parsed.header.vaultID, generation: parsed.header.generation, allowLower: true)
             lock()
             header = nil
         }

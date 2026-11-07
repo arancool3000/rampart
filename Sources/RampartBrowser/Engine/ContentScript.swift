@@ -30,12 +30,22 @@ enum ContentScript {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// hx6: patches the prototypes (not the `navigator.clipboard` instance, which a page could bypass
+    /// with `Clipboard.prototype.writeText.call(...)` or `delete document.execCommand`), makes every
+    /// patch non-writable and non-configurable, re-applies them to same-origin child frames as soon as a
+    /// page touches or inserts one (a fresh about:blank realm otherwise hands out unpatched originals), and
+    /// reports through an attribute set-then-removed on <html>: the isolated-world scanner reads the
+    /// removal's MutationRecord, which page scripts can neither cancel nor forge after the fact.
     static var pageWorldShim: String {
         """
         (function(){
-          if (window.__rampartShim) return; window.__rampartShim = true;
+          if (window.__rampartShim) return;
+          try { Object.defineProperty(window, '__rampartShim', { value: true, configurable: false, writable: false }); } catch(e) { return; }
           const MARKERS = \(jsArray(clipboardMarkers));
           const REPLACEMENT = "RamPart blocked a command this page tried to copy to your clipboard.";
+          const ATTR = 'data-rampart-clipboard';
+          const setA = Element.prototype.setAttribute, remA = Element.prototype.removeAttribute;
+          const docEl = Object.getOwnPropertyDescriptor(Document.prototype, 'documentElement').get;
           function suspicious(t){
             if (typeof t !== 'string') return false; const s = t.toLowerCase().trim();
             if (s.length < 6 || s.length > 4000) return false;
@@ -45,43 +55,57 @@ enum ContentScript {
             return false;
           }
           function report(t){
+            try { const h = docEl.call(document); setA.call(h, ATTR, String(t).slice(0, 400)); remA.call(h, ATTR); } catch(e){}
+          }
+          const lock = (obj, name, value) => { try { Object.defineProperty(obj, name, { configurable:false, writable:false, value }); } catch(e){} };
+          const soft = (obj, name, value) => { try { Object.defineProperty(obj, name, { configurable:true, writable:true, value }); } catch(e){} };
+          const done = new WeakSet();
+          function harden(w){
             try {
-              const html = document.documentElement;
-              html.setAttribute('data-rampart-clipboard', String(t).slice(0, 400));
-              html.dispatchEvent(new Event('rampart-clipboard-blocked'));
+              if (!w || done.has(w)) return; done.add(w);
+              const C = w.Clipboard && w.Clipboard.prototype;
+              if (C && C.writeText) {
+                const oText = C.writeText;
+                lock(C, 'writeText', function(t){ if (suspicious(t)) { report(t); return oText.call(this, REPLACEMENT); } return oText.call(this, t); });
+                if (C.write) { const oWrite = C.write; lock(C, 'write', function(items){
+                  try { for (const it of items) { if (it && it.types && Array.prototype.includes.call(it.types, 'text/plain')) { report('[clipboard.write with text/plain]'); return oText.call(this, REPLACEMENT); } } } catch(e){}
+                  return oWrite.call(this, items); }); }
+              }
+              const D = w.DataTransfer && w.DataTransfer.prototype;
+              if (D && D.setData) { const oSet = D.setData; lock(D, 'setData', function(type, data){
+                if (/text/.test(String(type)) && suspicious(data)) { report(data); return oSet.call(this, type, REPLACEMENT); }
+                return oSet.call(this, type, data); }); }
+              const P = w.Document && w.Document.prototype;
+              if (P && P.execCommand) { const oExec = P.execCommand; lock(P, 'execCommand', function(cmd, ui, val){
+                if (String(cmd).toLowerCase() === 'copy') {
+                  let sel = ''; try { sel = String(w.getSelection && w.getSelection()); } catch(e){}
+                  const active = this.activeElement; const v = active && 'value' in active ? String(active.value) : '';
+                  if (suspicious(sel) || suspicious(v)) {
+                    report(suspicious(sel) ? sel : v);
+                    try { if (active && 'value' in active) { active.value = REPLACEMENT; active.select && active.select(); } else if (w.getSelection) { w.getSelection().removeAllRanges(); } } catch(e){}
+                  }
+                }
+                return oExec.call(this, cmd, ui, val); }); }
             } catch(e){}
           }
+          function sweep(){ try { for (let i = 0; i < window.length; i++) { try { harden(window[i]); } catch(e){} } } catch(e){} }
+          harden(window);
           try {
-            const cb = navigator.clipboard;
-            if (cb) {
-              const origText = cb.writeText.bind(cb);
-              const origWrite = cb.write ? cb.write.bind(cb) : null;
-              Object.defineProperty(cb, 'writeText', { configurable:false, writable:false, value: function(t){
-                if (suspicious(t)) { report(t); return origText(REPLACEMENT); }
-                return origText(t);
-              }});
-              if (origWrite) Object.defineProperty(cb, 'write', { configurable:false, writable:false, value: function(items){
-                try { for (const it of items) { if (it.types && it.types.includes('text/plain')) { report('[clipboard.write with text/plain]'); return origText(REPLACEMENT); } } } catch(e){}
-                return origWrite(items);
-              }});
+            const F = HTMLIFrameElement.prototype;
+            for (const name of ['contentWindow', 'contentDocument']) {
+              const d = Object.getOwnPropertyDescriptor(F, name); if (!d || !d.get) continue; const g = d.get;
+              Object.defineProperty(F, name, { configurable:true, enumerable:d.enumerable, get: function(){
+                const r = g.call(this); try { harden(name === 'contentWindow' ? r : (r && r.defaultView)); } catch(e){} return r; } });
             }
-            const origSet = DataTransfer.prototype.setData;
-            DataTransfer.prototype.setData = function(type, data){
-              if (/text/.test(String(type)) && suspicious(data)) { report(data); return origSet.call(this, type, REPLACEMENT); }
-              return origSet.call(this, type, data);
-            };
-            const origExec = document.execCommand.bind(document);
-            document.execCommand = function(cmd, ui, val){
-              if (String(cmd).toLowerCase() === 'copy') {
-                const sel = String(window.getSelection && window.getSelection());
-                const active = document.activeElement; const v = active && 'value' in active ? String(active.value) : '';
-                if (suspicious(sel) || suspicious(v)) {
-                  report(suspicious(sel) ? sel : v);
-                  try { if (active && 'value' in active) { active.value = REPLACEMENT; active.select && active.select(); } } catch(e){}
-                }
-              }
-              return origExec(cmd, ui, val);
-            };
+            const N = Node.prototype;
+            for (const name of ['appendChild', 'insertBefore', 'replaceChild']) { const o = N[name]; soft(N, name, function(){ const r = o.apply(this, arguments); sweep(); return r; }); }
+            const E = Element.prototype;
+            for (const name of ['append', 'prepend', 'after', 'before', 'replaceWith', 'insertAdjacentElement', 'insertAdjacentHTML']) { const o = E[name]; if (o) soft(E, name, function(){ const r = o.apply(this, arguments); sweep(); return r; }); }
+            for (const name of ['write', 'writeln']) { const o = Document.prototype[name]; if (o) soft(Document.prototype, name, function(){ const r = o.apply(this, arguments); sweep(); return r; }); }
+            for (const name of ['innerHTML', 'outerHTML']) {
+              const d = Object.getOwnPropertyDescriptor(E, name); if (!d || !d.set) continue; const st = d.set;
+              Object.defineProperty(E, name, { configurable:true, enumerable:d.enumerable, get: d.get, set: function(v){ st.call(this, v); sweep(); } });
+            }
           } catch(e){}
         })();
         """
@@ -99,7 +123,9 @@ enum ContentScript {
           function count(text, list){ const t = text.toLowerCase(); return list.filter(p => t.includes(p)); }
           function overlays(){
             const out = []; const W = innerWidth, H = innerHeight;
+            let n = 0;
             for (const el of document.querySelectorAll('body *')) {
+              if (++n > 4000) break;   // hx6: bound the cost on huge DOMs
               const cs = getComputedStyle(el); if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
               const r = el.getBoundingClientRect(); if (r.width < W*0.9 || r.height < H*0.9) continue;
               out.push({el, text: (el.innerText||'').trim(), opacity: parseFloat(cs.opacity||'1'), pe: cs.pointerEvents, z: cs.zIndex});
@@ -137,11 +163,15 @@ enum ContentScript {
               post('\(formsHandler)', {forms, brandHints: hints, title: document.title});
             }
           }
-          document.documentElement.addEventListener('rampart-clipboard-blocked', () => {
-            const t = document.documentElement.getAttribute('data-rampart-clipboard') || '';
-            post('\(clipboardHandler)', {findings: [{kind:'clipboardCommand', detail: t.slice(0, 80), sample: t}]});
-          });
-          let timer = null; const schedule = () => { clearTimeout(timer); timer = setTimeout(scan, 600); };
+          // hx6: the shim sets then removes the attribute; the removal record carries the text as oldValue.
+          try { new MutationObserver((recs) => { for (const r of recs) { if (r.oldValue) {
+              const t = String(r.oldValue);
+              post('\(clipboardHandler)', {findings: [{kind:'clipboardCommand', detail: t.slice(0, 80), sample: t}]});
+            } } }).observe(document, {attributes:true, subtree:true, attributeFilter:['data-rampart-clipboard'], attributeOldValue:true}); } catch(e){}
+          // hx6: throttle, not debounce. A page that mutates the DOM every few hundred ms used to postpone the
+          // scan forever; now a scan always runs within ~1.5 s of a change.
+          let timer = null, last = 0;
+          const schedule = () => { if (timer) return; const wait = Math.max(600, last + 1500 - Date.now()); timer = setTimeout(() => { timer = null; last = Date.now(); scan(); }, wait); };
           if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', schedule); else schedule();
           window.addEventListener('load', () => setTimeout(scan, 1200));
           try { new MutationObserver(schedule).observe(document.documentElement, {childList:true, subtree:true, characterData:true}); } catch(e){}

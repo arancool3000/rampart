@@ -3,7 +3,7 @@ import RampartShared
 
 /// Engine version; part of the scan-cache key so cached verdicts are invalidated on upgrade.
 public enum EngineInfo {
-    public static let version = "engine-1"
+    public static let version = "engine-2"
 }
 
 /// Errors raised by the RampartEngine module.

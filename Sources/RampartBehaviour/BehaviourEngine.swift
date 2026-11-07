@@ -68,6 +68,8 @@ public final class BehaviourEngine: @unchecked Sendable {
     private let trustEval: TrustEvaluator
     private let ruleByID: [String: Rule]
     private let matchRules: [Rule]
+    /// Decoys each pid has touched (R39 calm path for a user opening one decoy).
+    var honeyTouches: [Int32: Set<String>] = [:]
     private var stories: [String: Story] = [:]
     private var marks: [String: [Mark]] = [:]
     private var thresholds: [String: [(Date, String)]] = [:]
@@ -210,6 +212,12 @@ public final class BehaviourEngine: @unchecked Sendable {
     func clipboardMatch(_ ctx: Context, min: Double) -> (Double, Int, String, String?)? {
         let now = ctx.event.date
         var best: (Double, Int, String, String?)?
+        // Telemetry's ClipboardMemory (keyed HMAC, daemon-private key) already matched this exec to a recent copy.
+        if ctx.event.detail["clipboard_match"] == "1", let o = Double(ctx.event.detail["clipboard_overlap"] ?? ""), o >= min,
+           let cls = ctx.event.detail["clipboard_class"], cls == "risky",
+           let app = ctx.event.detail["clipboard_source_app"], anyRegex(["@browserRegex"], app) {
+            best = (o, 2, app, nil)
+        }
         for c in clipboards where now.timeIntervalSince(c.date) <= config.clipboardWindow && now >= c.date {
             let o = ClipboardFingerprint.overlap(command: ctx.argv, clip: c.tokens, salt: config.clipboardSalt)
             if o.fraction >= min && o.shared >= 2 && o.distinctive >= 1 && o.fraction > (best?.0 ?? -1) { best = (o.fraction, o.shared, c.source, c.verdict) }
@@ -422,7 +430,14 @@ public final class BehaviourEngine: @unchecked Sendable {
         if !config.honeytokens.isEmpty {
             let tokens = Set(config.honeytokens.map(PathUtil.canonical))
             if let t = paths.first(where: { tokens.contains($0) }), e.kind != .exec, !atomicSave {
-                hit("R39", "Decoy \(PathUtil.basename(t)) touched (\(e.kind.rawValue)).", label: t)
+                // The user opening one decoy in a trusted GUI app (TextEdit, Preview) is not an infostealer: no alarm
+                // here; the Cat & Mouse service records a calm note (mirrors DeceptionUserOpen.isCalm).
+                let pid = e.process?.pid ?? 0
+                if pid > 0 { var set = honeyTouches[pid] ?? []; set.insert(t); honeyTouches[pid] = set; if honeyTouches.count > 512 { honeyTouches.removeAll() } }
+                let isRead = (e.kind == .fileClose && e.detail["modified"] == "0") || e.detail["es_event"] == "open"
+                if !(isRead && isTrustedGUIActor(ctx) && (honeyTouches[pid]?.count ?? 0) <= 1) {
+                    hit("R39", "Decoy \(PathUtil.basename(t)) touched (\(e.kind.rawValue)).", label: t)
+                }
             } else if e.kind == .exec, let t = tokens.first(where: { ctx.argv.contains($0) }) {
                 hit("R39", "Command line references decoy \(PathUtil.basename(t)).", label: t)
             }
@@ -545,11 +560,36 @@ public final class BehaviourEngine: @unchecked Sendable {
         init(key: String, date: Date) { self.key = key; self.lastActivity = date }
     }
 
+    /// Credential-theft and exfiltration rules that the built-in toolchain allows (Homebrew, Command Line Tools)
+    /// never hide: a compromised npm/pip/brew package runs under those interpreters (X6 B-X6-1).
+    static let toolchainNeverHides: Set<String> = ["R30", "R36", "R37", "R37b", "R37S", "R38", "R39", "R42", "R42D", "R43", "R43C",
+                                                   "R44", "R45", "R59", "R59R", "R60", "R60W", "R62", "L11"]
+
+    /// A path allow broader than one user-owned subfolder (e.g. "/", "/Users/", "~", "~/Downloads/", "/Applications/").
+    public static func isBroadPrefix(_ prefix: String) -> Bool {
+        let comps = prefix.split(separator: "/").filter { !$0.isEmpty }
+        if comps.isEmpty { return true }
+        if comps.first == "Users" || comps.first == "private" { return comps.count <= 3 }
+        return comps.count <= 1
+    }
+
     func isAllowlisted(node: ProcessNode?, rule: Rule?, path: String? = nil) -> Bool {
         for a in config.allowlist {
             if let ids = a.ruleIDs, let r = rule, !ids.contains(r.id) { continue }
             if a.ruleIDs != nil && rule == nil { continue }
             if a.weakOnly == true, let r = rule, r.type == .strong { continue }
+            let builtinToolchain = BehaviourConfig.defaultAllowlist.contains(a)
+            // Built-in toolchain allows only quiet build/dev noise, never credential theft or exfiltration.
+            if builtinToolchain, let r = rule, Self.toolchainNeverHides.contains(r.id) { continue }
+            if let p = a.pathPrefix, !builtinToolchain, a.ruleIDs == nil {
+                // A broad folder allow (home, a top-level folder) is never honoured, whatever it says.
+                if Self.isBroadPrefix(p) { continue }
+                // User folder allows are weak-only unless they explicitly opt out (weakOnly: false).
+                if a.teamID == nil, a.signingID == nil, a.weakOnly == nil, let r = rule, r.type == .strong { continue }
+            }
+            // Always-on strong rules (password-dialog lures, keychain/credential theft, kill chains…) can't be
+            // silenced by a broad Team-ID, signing-ID or folder allow. Only an allow that names the rule ID can.
+            if let r = rule, r.alwaysActive == true, r.type == .strong, a.ruleIDs == nil { continue }
             var ok = a.teamID != nil || a.signingID != nil || a.pathPrefix != nil
             if let t = a.teamID { ok = ok && node?.teamID == t }
             if let s = a.signingID { ok = ok && node?.signingID == s }
@@ -574,7 +614,11 @@ public final class BehaviourEngine: @unchecked Sendable {
             if let n = h.ctx.node { apply(trust: trustOf(n), path: n.path, label: "program"); identity = n.teamID ?? n.signingID ?? n.path }
         case .target:
             if let t = h.targetPath, t.hasPrefix("/") {
-                apply(trust: trustEval.trust(path: t), path: t, label: "target"); identity = t
+                // R07 on an Apple target only fires for inline downloaded/encoded code: the interpreter's signature
+                // says nothing about that code, so it earns no "Apple" discount.
+                let tt = trustEval.trust(path: t)
+                if !(rule.id == "R07" && tt == .apple) { apply(trust: tt, path: t, label: "target") }
+                identity = t
             }
         case .none:
             break
@@ -592,8 +636,11 @@ public final class BehaviourEngine: @unchecked Sendable {
             if h.ctx.event.date.timeIntervalSince(first) < 3600 && trustOf(n) != .apple { m *= 1.2; why.append("first seen < 1 h ×1.2") }
         }
         let names = h.ctx.names
+        // "Typed by hand" discount: not when the session shows a paste from the web (pasteEntry), and not while a
+        // risky command copied from a browser is armed (riskyClipboard): then the terminal activity may be pasted.
         if let f = rule.interactiveFactor, h.ctx.chain.contains(where: { nameIn($0.name, ["@terminals"]) }),
-           activeMarks("pasteEntry", window: nil, now: h.ctx.event.date).isEmpty {
+           activeMarks("pasteEntry", window: nil, now: h.ctx.event.date).isEmpty,
+           activeMarks("riskyClipboard", window: nil, now: h.ctx.event.date).isEmpty {
             m *= f; why.append("typed in an interactive terminal ×\(f)")
         }
         if rule.devSensitive == true && config.developerMode && names.dropFirst().contains(where: { nameIn($0, ["@devtools"]) }) {

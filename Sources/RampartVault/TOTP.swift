@@ -49,6 +49,9 @@ public struct TOTP: Codable, Hashable, Sendable {
         }
     }
 
+    /// Parameters a code can safely be computed with (anything else came from a malformed import).
+    public var isWellFormed: Bool { !secret.isEmpty && secret.count <= 1024 && (6...10).contains(digits) && (1...300).contains(period) }
+
     public var uri: String {
         var c = URLComponents()
         c.scheme = "otpauth"; c.host = kind.rawValue
@@ -64,14 +67,20 @@ public struct TOTP: Codable, Hashable, Sendable {
 
     public func code(at date: Date = Date()) -> String {
         if kind == .hotp { return Self.hotp(secret: secret, counter: counter, digits: digits, algorithm: algorithm) }
-        return Self.hotp(secret: secret, counter: UInt64(max(0, date.timeIntervalSince1970) / Double(period)), digits: digits, algorithm: algorithm)
+        let p = Double(max(1, period)), t = date.timeIntervalSince1970
+        let step = t.isFinite ? min(max(0, t) / p, Double(UInt64.max / 2)) : 0
+        return Self.hotp(secret: secret, counter: UInt64(step), digits: digits, algorithm: algorithm)
     }
 
     public func secondsRemaining(at date: Date = Date()) -> Int {
-        period - Int(date.timeIntervalSince1970.rounded(.down)) % period
+        let p = max(1, period), t = date.timeIntervalSince1970
+        guard t.isFinite, abs(t) < 1e15 else { return p }
+        return p - Int(t.rounded(.down)) % p
     }
 
     public static func hotp(secret: Data, counter: UInt64, digits: Int, algorithm: Algorithm) -> String {
+        // 1...10 digits: more would overflow the modulus (10^20 > UInt64.max); <1 would trap the loop below.
+        let digits = min(10, max(1, digits))
         var c = counter.bigEndian
         let msg = withUnsafeBytes(of: &c) { Data($0) }
         let key = SymmetricKey(data: secret)

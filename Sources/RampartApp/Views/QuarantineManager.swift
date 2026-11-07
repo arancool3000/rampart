@@ -28,6 +28,25 @@ struct SandboxReport: Codable, Sendable {
     var profile: String
 }
 
+/// File names and item output are attacker-controlled. Strip control and bidirectional-override characters (a
+/// right-to-left override can make "gpj.app" read as "ppa.jpg") and cap length before showing them in RamPart's UI.
+enum QuarantineText {
+    static func clean(_ s: String) -> String {
+        String(String.UnicodeScalarView(s.unicodeScalars.filter { c in
+            switch c.value {
+            case 0x0A, 0x09: return true
+            case 0x00...0x1F, 0x7F...0x9F, 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069, 0x061C: return false
+            default: return true
+            }
+        }))
+    }
+    static func name(_ path: String, max: Int = 60) -> String {
+        let n = clean((path as NSString).lastPathComponent).replacingOccurrences(of: "\n", with: " ")
+        guard n.count > max else { return n }
+        return String(n.prefix(max - 12)) + "\u{2026}" + String(n.suffix(11))
+    }
+}
+
 /// The Quarantine tab: every isolated item, with restore, delete, export and sandbox actions. Multi-select for bulk work.
 struct QuarantineManagerView: View {
     let records: [QuarantineRecord]
@@ -111,18 +130,18 @@ struct QuarantineManagerView: View {
                 HStack(spacing: Spacing.s) {
                     Image(systemName: "lock.square.stack").foregroundStyle(Color.statusQuarantined).font(.title3).frame(width: 24)
                         .accessibilityHidden(true)
-                    Text((r.originalPath as NSString).lastPathComponent).lineLimit(1)
+                    Text(QuarantineText.name(r.originalPath, max: 120)).lineLimit(1)
                 }
             }
             .width(min: 160, ideal: 220)
             TableColumn("Original path") { r in
-                Text((r.originalPath as NSString).abbreviatingWithTildeInPath)
+                Text(SafeText.path((r.originalPath as NSString).abbreviatingWithTildeInPath))
                     .font(.callout.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
                     .help(r.originalPath)
             }
             .width(min: 160, ideal: 260)
             TableColumn("Date", value: \.date) { r in Text(Fmt.dayTime(r.date)).foregroundStyle(.secondary) }.width(min: 100, ideal: 120)
-            TableColumn("Detection", value: \.detectionName) { r in Text(r.detectionName).lineLimit(1).help(r.detectionName) }.width(min: 120, ideal: 170)
+            TableColumn("Detection", value: \.detectionName) { r in Text(SafeText.line(r.detectionName)).lineLimit(1).help(SafeText.line(r.detectionName, max: 300)) }.width(min: 120, ideal: 170)
             TableColumn("Size", value: \.size) { r in Text(Fmt.bytes(r.size)).monospacedDigit().foregroundStyle(.secondary) }.width(min: 60, ideal: 70)
         }
         .scrollContentBackground(.hidden)
@@ -179,7 +198,7 @@ struct QuarantineManagerView: View {
 
     private var restoreTitle: String {
         guard let p = pendingRestore else { return "" }
-        let what = p.records.count == 1 ? "\u{201C}\((p.records[0].originalPath as NSString).lastPathComponent)\u{201D}" : "\(p.records.count) items"
+        let what = p.records.count == 1 ? "\u{201C}\(QuarantineText.name(p.records[0].originalPath))\u{201D}" : "\(p.records.count) items"
         return p.allow ? "Restore and allow \(what)?" : "Restore \(what)?"
     }
 
@@ -190,7 +209,7 @@ struct QuarantineManagerView: View {
     }
 
     private var deleteTitle: String {
-        pendingDelete.count == 1 ? "Delete \u{201C}\((pendingDelete[0].originalPath as NSString).lastPathComponent)\u{201D} permanently?"
+        pendingDelete.count == 1 ? "Delete \u{201C}\(QuarantineText.name(pendingDelete[0].originalPath))\u{201D} permanently?"
             : "Delete \(pendingDelete.count) items permanently?"
     }
 
@@ -285,11 +304,11 @@ struct SandboxRunSheet: View {
     private var confidence: Int? { detection?.confidence }
     private var needsTyped: Bool { (confidence ?? 100) >= 90 }
     private var canRun: Bool { understood && !running && (!needsTyped || typed == "RUN") && model.mode == .live }
-    private var name: String { (record.originalPath as NSString).lastPathComponent }
+    private var name: String { QuarantineText.name(record.originalPath) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
-            Text(report == nil ? "Run \u{201C}\(name)\u{201D} in a sandbox?" : "Sandbox report: \(name)").font(.title2.weight(.semibold))
+            Text(report == nil ? "Run \u{201C}\(SafeText.line(name))\u{201D} in a sandbox?" : "Sandbox report: \(SafeText.line(name))").font(.title2.weight(.semibold))
             if let report { SandboxReportView(report: report) } else { setup }
             HStack {
                 if running, let s = startedAt {
@@ -323,8 +342,9 @@ struct SandboxRunSheet: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("What \(Product.name) does").font(.headline)
                 bullet("Copies the item to a private temporary folder (never its original location).")
-                bullet("Blocks network access, writing anywhere outside that folder, starting other programs, and reading your keychains, browser profiles, ~/.ssh, Documents, Desktop and Downloads.")
-                bullet("Stops it and anything it started after 60 seconds, then deletes the folder.")
+                bullet("Blocks network access, writing anywhere outside that folder, starting other programs (scripts can't run commands, so many stop early), talking to system services, and reading anything in your home folder, other users' folders or external drives. It can still read macOS's own files.")
+                bullet("Removes links inside the item that point outside that folder, and stops it if it writes more than 256 MB.")
+                bullet("Stops it after 60 seconds, then deletes the folder.")
                 bullet("Shows its output and the files it tried to touch.")
             }
             .font(.callout)
@@ -384,21 +404,22 @@ struct SandboxReportView: View {
                 .font(.callout)
                 if !report.touchedPaths.isEmpty {
                     section("Files it tried to touch") {
-                        Text(report.touchedPaths.joined(separator: "\n")).font(.caption.monospaced()).textSelection(.enabled)
+                        Text(QuarantineText.clean(report.touchedPaths.joined(separator: "\n"))).font(.caption.monospaced()).textSelection(.enabled)
                     }
                 }
                 let other = report.violations.filter { !$0.operation.hasPrefix("file-") }
                 if !other.isEmpty {
                     section("Other blocked actions") {
-                        Text(other.prefix(200).map { "\($0.operation) \($0.target)" }.joined(separator: "\n"))
+                        Text(QuarantineText.clean(other.prefix(200).map { "\($0.operation) \($0.target)" }.joined(separator: "\n")))
                             .font(.caption.monospaced()).textSelection(.enabled)
                     }
                 }
-                section("Output") {
-                    Text(report.stdout.isEmpty ? "(none)" : report.stdout).font(.caption.monospaced()).textSelection(.enabled)
+                // hx3: this text comes from the item, not from RamPart; label it so and strip spoofing characters.
+                section("Output printed by the item (not from \(Product.name))") {
+                    Text(report.stdout.isEmpty ? "(none)" : QuarantineText.clean(report.stdout)).font(.caption.monospaced()).textSelection(.enabled)
                 }
                 if !report.stderr.isEmpty {
-                    section("Errors") { Text(report.stderr).font(.caption.monospaced()).textSelection(.enabled) }
+                    section("Error output printed by the item") { Text(QuarantineText.clean(report.stderr)).font(.caption.monospaced()).textSelection(.enabled) }
                 }
                 if report.outputTruncated { Text("Output was cut at 64 KB.").font(.caption).foregroundStyle(.secondary) }
                 ForEach(report.notes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }

@@ -3,6 +3,13 @@ import AppKit
 import RampartShared
 import RampartAI
 
+/// hx8: multi-paragraph text (AI answers, what was sent) keeps its line breaks but loses control, bidi and invisible characters.
+private func safeMultiline(_ s: String) -> String {
+    var out = String.UnicodeScalarView()
+    for u in s.unicodeScalars where u == "\n" || !SafeText.isUnsafeScalar(u) { out.append(u) }
+    return String(out)
+}
+
 /// "AI Assistant" screen (owner: A1). The app agent adds the sidebar entry: `AIAssistantView()`.
 /// To explain a detection from elsewhere: `AIChatModel.shared.explain(detection)` then select this screen.
 struct AIAssistantView: View {
@@ -211,7 +218,7 @@ struct AIAssistantView: View {
                     }
                 }
                 if let d = model.detections.first(where: { !$0.resolved }) ?? model.detections.first {
-                    SuggestionChip(symbol: "questionmark.bubble", title: "Explain “\(d.name)”", subtitle: "Sends the detection name and evidence only") {
+                    SuggestionChip(symbol: "questionmark.bubble", title: "Explain “\(SafeText.line(d.name, max: 60))”", subtitle: "Sends the detection name and evidence only") {
                         chat.explain(d)
                     }
                 }
@@ -237,7 +244,7 @@ struct AIAssistantView: View {
         VStack(alignment: .leading, spacing: Spacing.s) {
             if showPreview, let p = chat.preview(posture: model.posture) {
                 DisclosureGroup {
-                    ScrollView { Text(verbatim: p.text).font(.caption.monospaced()).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                    ScrollView { Text(verbatim: safeMultiline(p.text)).font(.caption.monospaced()).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
                         .frame(maxHeight: 140)
                 } label: {
                     HStack(spacing: 6) {
@@ -325,7 +332,7 @@ private struct MessageRow: View {
             HStack {
                 Spacer(minLength: 80)
                 VStack(alignment: .trailing, spacing: 4) {
-                    Text(verbatim: AIChatModel.mainText(message.payload))
+                    Text(verbatim: safeMultiline(AIChatModel.mainText(message.payload)))
                         .textSelection(.enabled)
                         .padding(.horizontal, 14).padding(.vertical, 9)
                         .background(LinearGradient(colors: [Color.rampartTeal.opacity(0.9), Color.rampartTeal.opacity(0.7)], startPoint: .top, endPoint: .bottom),
@@ -336,9 +343,13 @@ private struct MessageRow: View {
             }
         } else {
             HStack(alignment: .top, spacing: Spacing.m) {
-                IconBadge(symbol: isError ? "exclamationmark.bubble" : "sparkles", tint: isError ? .orange : .rampartTeal, size: 28)
+                IconBadge(symbol: isError ? "exclamationmark.bubble" : (isLocal ? "checkmark.shield" : "sparkles"), tint: isError ? .orange : .rampartTeal, size: 28)
                 VStack(alignment: .leading, spacing: Spacing.s) {
-                    if let t = message.title { Text(t).font(.headline).fontDesign(.rounded) }
+                    if let t = message.title { Text(verbatim: SafeText.line(t)).font(.headline).fontDesign(.rounded) }
+                    // Who is speaking: model text is always labelled as the AI's, so it can't pass as RamPart's own voice.
+                    Text(verbatim: isLocal ? "RamPart" : (isError ? "RamPart · couldn't get an answer" : "AI answer (Google Gemini) · can be wrong"))
+                        .font(.caption2.weight(.medium)).foregroundStyle(.secondary)
+                        .accessibilityLabel(isLocal ? "From RamPart" : "From the AI, may be wrong")
                     content
                     if let s = message.sent { SentDisclosure(sent: s, redaction: message.redactionSummary, meta: message.meta) }
                 }
@@ -349,14 +360,26 @@ private struct MessageRow: View {
     }
 
     private var isError: Bool { if case .error = message.payload { return true }; return false }
+    /// Non-user plain text is only ever written locally (e.g. "Done: …" after an Apply), never by the model.
+    private var isLocal: Bool { if case .text = message.payload { return true }; return false }
     private var done: Bool { reduceMotion || message.revealed == .max }
     private func revealed(_ s: String) -> String { done ? s : String(s.prefix(message.revealed)) }
+
+    /// RamPart's own (local) finding, styled as RamPart's voice, not the AI's.
+    private var injectionNotice: some View {
+        Label { Text(verbatim: PromptKit.injectionNotice).font(.callout.weight(.medium)) }
+            icon: { Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.orange) }
+            .padding(8)
+            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .accessibilityLabel("RamPart warning: " + PromptKit.injectionNotice)
+    }
 
     @ViewBuilder private var content: some View {
         switch message.payload {
         case .text(let t), .error(let t):
-            Text(verbatim: t).foregroundStyle(isError ? .secondary : .primary)
+            Text(verbatim: safeMultiline(t)).foregroundStyle(isError ? .secondary : .primary)
         case .reply(let r):
+            if r.injectionDetected == true { injectionNotice }
             body(revealed(r.answer))
             if done {
                 if r.refused { Badge(text: "Declined: outside safe use", tint: .orange) }
@@ -369,10 +392,11 @@ private struct MessageRow: View {
                     .padding(.top, 2)
                 }
                 if !r.relatedCheckIDs.isEmpty {
-                    HStack { ForEach(r.relatedCheckIDs, id: \.self) { Badge(text: $0, tint: .rampartTeal) } }
+                    HStack { ForEach(r.relatedCheckIDs, id: \.self) { Badge(text: SafeText.line($0, max: 40), tint: .rampartTeal) } }
                 }
             }
         case .scam(let s):
+            if s.injectionDetected == true { injectionNotice }
             HStack(spacing: Spacing.s) {
                 verdictBadge(scamVerdict(s.verdict))
                 Text("\(s.score)/100 scam likelihood").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
@@ -380,24 +404,26 @@ private struct MessageRow: View {
             body(revealed(AIChatModel.mainText(message.payload)))
             if done { bullets(s.reasons); if !s.advice.isEmpty && !s.summary.isEmpty { body(s.advice) } }
         case .url(let u):
+            if u.injectionDetected == true { injectionNotice }
             verdictBadge(urlVerdict(u.verdict))
             body(revealed(u.summary))
             if done {
                 ForEach(Array(u.reasons.enumerated()), id: \.offset) { _, r in
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(verbatim: r.signal).font(.callout.weight(.semibold))
-                        Text(verbatim: r.explanation).font(.callout).foregroundStyle(.secondary)
+                        Text(verbatim: SafeText.line(r.signal)).font(.callout.weight(.semibold))
+                        Text(verbatim: SafeText.line(r.explanation, max: 400)).font(.callout).foregroundStyle(.secondary)
                     }
                 }
                 if !u.advice.isEmpty { body(u.advice) }
             }
         case .detection(let d):
+            if d.injectionDetected == true { injectionNotice }
             HStack(spacing: Spacing.s) {
                 Badge(text: "Risk: \(d.risk.rawValue.capitalized)", tint: riskTint(d.risk))
                 Badge(text: "False-alarm chance: \(d.falsePositiveChance.rawValue)", tint: .secondary)
             }
             body(revealed(AIChatModel.mainText(message.payload)))
-            if done { steps(d.nextSteps); if !d.reassurance.isEmpty { Label { Text(verbatim: d.reassurance) } icon: { Image(systemName: "checkmark.shield").foregroundStyle(.green) }.font(.callout) } }
+            if done { steps(d.nextSteps); if !d.reassurance.isEmpty { Label { Text(verbatim: SafeText.line(d.reassurance, max: 400)) } icon: { Image(systemName: "sparkles").foregroundStyle(.secondary) }.font(.callout) } }
         case .plan(let p):
             body(revealed(p.headline))
             if done {
@@ -406,21 +432,21 @@ private struct MessageRow: View {
                         Text("\(item.priority)").font(.caption.weight(.bold)).frame(width: 20, height: 20)
                             .background((item.priority == 1 ? Color.orange : item.priority == 2 ? .yellow : .blue).opacity(0.22), in: Circle())
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(verbatim: item.title).font(.callout.weight(.semibold))
-                            if !item.why.isEmpty { Text(verbatim: item.why).font(.callout).foregroundStyle(.secondary) }
+                            Text(verbatim: SafeText.line(item.title)).font(.callout.weight(.semibold))
+                            if !item.why.isEmpty { Text(verbatim: SafeText.line(item.why, max: 400)).font(.callout).foregroundStyle(.secondary) }
                             steps(item.steps)
                         }
                     }
                 }
                 if !p.alreadyGood.isEmpty {
-                    Label { Text(verbatim: "Already good: " + p.alreadyGood.joined(separator: " · ")) } icon: { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
+                    Label { Text(verbatim: "Already good: " + SafeText.line(p.alreadyGood.joined(separator: " · "), max: 400)) } icon: { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
                         .font(.callout)
                 }
             }
         }
     }
 
-    private func body(_ s: String) -> some View { Text(verbatim: s).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
+    private func body(_ s: String) -> some View { Text(verbatim: safeMultiline(s)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true) }
 
     @ViewBuilder private func steps(_ s: [String]) -> some View {
         if !s.isEmpty {
@@ -428,7 +454,7 @@ private struct MessageRow: View {
                 ForEach(Array(s.enumerated()), id: \.offset) { i, step in
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Text("\(i + 1).").font(.callout.monospacedDigit()).foregroundStyle(Color.rampartTeal)
-                        Text(verbatim: step).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        Text(verbatim: SafeText.line(step, max: 400)).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -437,7 +463,7 @@ private struct MessageRow: View {
     private func bullets(_ s: [String]) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             ForEach(Array(s.enumerated()), id: \.offset) { _, r in
-                HStack(alignment: .firstTextBaseline, spacing: 6) { Text("•").foregroundStyle(.secondary); Text(verbatim: r).font(.callout) }
+                HStack(alignment: .firstTextBaseline, spacing: 6) { Text("•").foregroundStyle(.secondary); Text(verbatim: SafeText.line(r, max: 400)).font(.callout) }
             }
         }
     }
@@ -475,10 +501,10 @@ private struct SentDisclosure: View {
     var body: some View {
         DisclosureGroup(isExpanded: $open) {
             VStack(alignment: .leading, spacing: 6) {
-                if let redaction { Text("Removed before sending: \(redaction)").font(.caption).foregroundStyle(.secondary) }
-                if let meta { Text(meta).font(.caption).foregroundStyle(.tertiary) }
+                if let redaction { Text("Removed before sending: \(SafeText.line(redaction, max: 240))").font(.caption).foregroundStyle(.secondary) }
+                if let meta { Text(SafeText.line(meta, max: 240)).font(.caption).foregroundStyle(.tertiary) }
                 ScrollView {
-                    Text(verbatim: sent).font(.caption.monospaced()).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(verbatim: safeMultiline(sent)).font(.caption.monospaced()).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .frame(maxHeight: 180)
                 .padding(8)
@@ -587,7 +613,7 @@ private struct ChatListColumn: View {
             Button("Rename") { if let r = renaming { chat.rename(r.id, to: renameText) }; renaming = nil }
             Button("Cancel", role: .cancel) { renaming = nil }
         }
-        .confirmationDialog("Delete “\(deleting?.title ?? "")”?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
+        .confirmationDialog("Delete “\(SafeText.line(deleting?.title ?? "", max: 80))”?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible) {
             Button("Delete Chat", role: .destructive) { if let d = deleting { chat.delete(d.id) }; deleting = nil }
             Button("Cancel", role: .cancel) { deleting = nil }
         } message: { Text("This conversation is permanently removed from this Mac.") }
@@ -615,7 +641,7 @@ private struct ChatRow: View {
         HStack(spacing: Spacing.s) {
             Image(systemName: symbol).foregroundStyle(Color.rampartTeal).frame(width: 18)
             VStack(alignment: .leading, spacing: 1) {
-                Text(verbatim: chat.title).font(.callout.weight(selected ? .semibold : .regular)).lineLimit(1)
+                Text(verbatim: SafeText.line(chat.title, max: 80)).font(.callout.weight(selected ? .semibold : .regular)).lineLimit(1)
                 Text(Fmt.dayTime(chat.updated)).font(.caption2).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -623,7 +649,7 @@ private struct ChatRow: View {
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(chat.title), \(chat.mode)\(chat.pinned ? ", pinned" : ""), \(Fmt.dayTime(chat.updated))")
+        .accessibilityLabel("\(SafeText.line(chat.title, max: 80)), \(chat.mode)\(chat.pinned ? ", pinned" : ""), \(Fmt.dayTime(chat.updated))")
         .accessibilityHint("Opens this conversation. Use the context menu to pin, rename or delete.")
     }
 }
@@ -646,12 +672,12 @@ private struct ActionCard: View {
             HStack(spacing: Spacing.s) {
                 Image(systemName: proposal.lowersProtection ? "exclamationmark.shield.fill" : "wand.and.stars")
                     .foregroundStyle(tint).symbolRenderingMode(.hierarchical)
-                Text(verbatim: proposal.title).font(.callout.weight(.semibold))
+                Text(verbatim: SafeText.line(proposal.title)).font(.callout.weight(.semibold))
                 Spacer(minLength: 0)
                 statusBadge
             }
-            if !proposal.reason.isEmpty { Text(verbatim: proposal.reason).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
-            Text(verbatim: proposal.change).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+            if !proposal.reason.isEmpty { Text(verbatim: "AI's reason: " + SafeText.line(proposal.reason, max: 400)).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+            Text(verbatim: SafeText.line(proposal.change, max: 240)).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
             if let w = proposal.action.warning {
                 Label { Text(verbatim: w) } icon: { Image(systemName: "exclamationmark.triangle.fill") }
                     .font(.caption.weight(.medium)).foregroundStyle(.red)
@@ -672,9 +698,9 @@ private struct ActionCard: View {
         .background(tint.opacity(0.07), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(tint.opacity(proposal.lowersProtection ? 0.55 : 0.25)))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Suggested change: \(proposal.title)\(proposal.lowersProtection ? ", lowers protection" : "")")
-        .confirmationDialog("\(proposal.title)?", isPresented: $confirmLowering, titleVisibility: .visible) {
-            Button(proposal.title, role: .destructive) { chat.applyAction(proposal, confirmedLowering: true) }
+        .accessibilityLabel("Suggested change: \(SafeText.line(proposal.title))\(proposal.lowersProtection ? ", lowers protection" : "")")
+        .confirmationDialog("\(SafeText.line(proposal.title))?", isPresented: $confirmLowering, titleVisibility: .visible) {
+            Button(SafeText.line(proposal.title), role: .destructive) { chat.applyAction(proposal, confirmedLowering: true) }
             Button("Keep Protection On", role: .cancel) {}
         } message: { Text(verbatim: (proposal.action.warning ?? "") + " You can change this back in Settings.") }
     }

@@ -48,38 +48,39 @@ enum QuarantineSandbox {
     static func restore(_ p: Protection, id: UUID, to path: String, allow: Bool, peer: Peer) throws -> String {
         let v = try vault(p)
         let rec = try v.metadata(id: id).record
+        try checkItemAccess(rec, peer: peer)
         let dest = try checkDestination(path, peer: peer)
-        let out = try v.restore(id: id, options: QuarantineVault.RestoreOptions(alternatePath: dest, allowlist: false))
-        if getuid() == 0 { lchown(out, peer.uid, getpwuid(peer.uid)?.pointee.pw_gid ?? 20) }
+        // hx3: the copy is created owned by the peer (never briefly root-owned), setuid/setgid bits are dropped, and the
+        // destination folder's owner is re-checked on the pinned descriptor inside the vault.
+        let gid = getpwuid(peer.uid)?.pointee.pw_gid ?? 20
+        let asRoot = getuid() == 0
+        let adminApps = peer.isAdmin && dest.hasPrefix("/Applications/")
+        let opts = QuarantineVault.RestoreOptions(alternatePath: dest, allowlist: false,
+                                                  ownerUID: asRoot ? peer.uid : nil, ownerGID: asRoot ? gid : nil,
+                                                  requireParentOwnerUID: asRoot && !adminApps ? peer.uid : nil)
+        let out = try v.restore(id: id, options: opts)
         if !rec.sha256.isEmpty {
             p.state.update { s in var r = s.restored ?? [:]; if r.count > 500 { r.removeAll() }; r[out] = rec.sha256; s.restored = r }
             if allow { p.allow(sha256: rec.sha256) }
         }
         logInfo("restored \(id.uuidString) to \(out) (chosen location)\(allow ? " (trusted)" : "")")
-        p.activity.add(.restore, "Restored \(rec.detectionName)", detail: out, outcome: allow ? "restored elsewhere and trusted" : "restored elsewhere")
+        p.activity.add(.restore, "Restored \(rec.detectionName)", detail: out, outcome: allow ? "restored elsewhere and trusted" : "restored elsewhere",
+                       event: .restored, actor: .user, target: out, sha256: rec.sha256, refID: id.uuidString, facts: ["threat": rec.detectionName])
         return out
     }
 
+    /// A non-admin may only restore or export items that were theirs (hx3: otherwise the root daemon could hand one
+    /// user another user's quarantined file). Admins can already read everything.
+    static func checkItemAccess(_ rec: QuarantineRecord, peer: Peer) throws {
+        if peer.uid == 0 || peer.isAdmin || rec.ownerUID == peer.uid { return }
+        throw ServiceError.denied("this item belonged to another user; ask an administrator")
+    }
+
     /// Plaintext of a quarantined item (verified metadata, GCM tag and SHA-256). Kept in memory only.
+    /// hx3: decryption stays inside the vault; this file never reads or derives the vault key.
     static func plaintext(_ v: QuarantineVault, id: UUID) throws -> (VaultItemMetadata, Data) {
-        let meta = try v.metadata(id: id)
-        guard meta.status == .quarantined else { throw ServiceError.failed("item is no longer in quarantine") }
-        let keyURL = v.root.appendingPathComponent("vault.key")
-        guard let master = try? Data(contentsOf: keyURL), master.count == 32 else { throw ServiceError.failed("vault key unavailable") }
-        let enc = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: master), info: Data("rampart.vault.enc.v1".utf8), outputByteCount: 32)
-        guard let blob = try? Data(contentsOf: v.itemsDir.appendingPathComponent(id.uuidString + ".rqf")) else {
-            throw ServiceError.notFound("encrypted copy of \(id)")
-        }
-        var plain: Data
-        do { plain = try AES.GCM.open(try AES.GCM.SealedBox(combined: blob), using: enc, authenticating: Data(id.uuidString.utf8)) }
-        catch { throw ServiceError.failed("quarantine copy failed authentication") }
-        if meta.compressed {
-            guard let d = try? (plain as NSData).decompressed(using: .lzfse) as Data else { throw ServiceError.failed("decompression failed") }
-            plain = d
-        }
-        let hex = SHA256.hash(data: plain).map { String(format: "%02x", $0) }.joined()
-        guard hex == meta.record.sha256 else { throw ServiceError.failed("SHA-256 mismatch; not extracting") }
-        return (meta, plain)
+        do { return try v.verifiedPlaintext(id: id) }
+        catch let e as RemediationError { throw ServiceError.failed("\(e)") }
     }
 
     /// Private 0700 temp folder (never the item's original path).
@@ -96,7 +97,10 @@ enum QuarantineSandbox {
     static func removeTree(_ dir: String) {
         guard dir.contains("/rampart-q-") else { return }
         if (try? FileManager.default.removeItem(atPath: dir)) == nil {
-            _ = run("/bin/chmod", ["-R", "u+rwx", dir], timeout: 10)
+            // -P: never follow a symlink the item left behind. Clear user flags too (file-write-flags is denied in the
+            // profile, but be defensive), then retry.
+            _ = run("/usr/bin/chflags", ["-R", "-P", "nouchg,nouappnd", dir], timeout: 10)
+            _ = run("/bin/chmod", ["-R", "-P", "u+rwx", dir], timeout: 10)
             try? FileManager.default.removeItem(atPath: dir)
         }
     }
@@ -135,6 +139,7 @@ enum QuarantineSandbox {
     /// Zip encrypted with the conventional sample password "infected", so it can't be opened or run by accident.
     static func export(_ p: Protection, id: UUID, to path: String, peer: Peer) throws -> (path: String, password: String) {
         let v = try vault(p)
+        try checkItemAccess(try v.metadata(id: id).record, peer: peer)
         let dest = try checkDestination(path, peer: peer)
         let (meta, plain) = try plaintext(v, id: id)
         let tmp = try makePrivateDir(); defer { removeTree(tmp) }
@@ -143,9 +148,19 @@ enum QuarantineSandbox {
         let zip = (tmp as NSString).appendingPathComponent("export.zip")
         let r = run("/usr/bin/zip", ["-q", "-r", "-y", "-P", password, zip, (item as NSString).lastPathComponent], cwd: stage, timeout: 120)
         guard r.status == 0, let z = FileManager.default.contents(atPath: zip) else { throw ServiceError.failed("could not create the encrypted zip") }
-        try writeNew(z, to: dest, mode: 0o600)
-        if getuid() == 0 { chown(dest, peer.uid, getpwuid(peer.uid)?.pointee.pw_gid ?? 20) }
-        p.activity.add(.quarantine, "Exported encrypted copy of \(meta.record.detectionName)", detail: dest, outcome: "exported")
+        // hx3: pin the destination folder (no symlink swapped in after checkDestination), re-check its owner on the
+        // descriptor, and create the zip already owned by the peer.
+        let pinned: SafeFS.PinnedDir
+        do { pinned = try SafeFS.pin((dest as NSString).deletingLastPathComponent) } catch { throw ServiceError.denied("\(error)") }
+        if getuid() == 0, !(peer.isAdmin && dest.hasPrefix("/Applications/")) {
+            guard let st = pinned.stat(), st.st_uid == peer.uid else { throw ServiceError.denied("you don't own \(pinned.realPath)") }
+        }
+        do {
+            try SafeFS.createFile(in: pinned, name: (dest as NSString).lastPathComponent, data: z, mode: 0o600,
+                                  owner: (peer.uid, getpwuid(peer.uid)?.pointee.pw_gid ?? 20))
+        } catch { throw ServiceError.failed("could not save the zip: \(error)") }
+        p.activity.add(.quarantine, "Exported encrypted copy of \(meta.record.detectionName)", detail: dest, outcome: "exported",
+                       event: .exported, actor: .user, target: dest, sha256: meta.record.sha256, facts: ["threat": meta.record.detectionName])
         return (dest, password)
     }
 
@@ -196,11 +211,19 @@ enum QuarantineSandbox {
             let machO: Set<[UInt8]> = [[0xcf, 0xfa, 0xed, 0xfe], [0xce, 0xfa, 0xed, 0xfe], [0xca, 0xfe, 0xba, 0xbe], [0xfe, 0xed, 0xfa, 0xcf], [0xbe, 0xba, 0xfe, 0xca]]
             if !machO.contains(magic) {
                 let first = String(decoding: head, as: UTF8.self).components(separatedBy: "\n").first ?? ""
-                interp = SandboxProfile.interpreter(forExtension: (item as NSString).pathExtension) ?? SandboxProfile.interpreter(forShebang: first)
-                guard interp != nil else { throw ServiceError.failed("this item isn't a program or a script RamPart knows how to run") }
-                notes.append("Script: ran with \(interp!) inside the same profile.")
+                let wanted = SandboxProfile.interpreter(forExtension: (item as NSString).pathExtension) ?? SandboxProfile.interpreter(forShebang: first)
+                guard let wanted else { throw ServiceError.failed("this item isn't a program or a script \(Product.name) knows how to run") }
+                // hx3: run the real interpreter, never the /usr/bin/python3 shim (it can start xcrun or an install prompt).
+                guard let real = SandboxProfile.resolvedInterpreter(wanted) else {
+                    throw ServiceError.unavailable("\(wanted) (install the Command Line Tools to run Python scripts)")
+                }
+                interp = real
+                notes.append("Script: ran with \(real) inside the same profile. Scripts can't start other programs, so many stop early.")
             }
         }
+        // hx3: links in the item that lead outside the sandbox folder (or nowhere) are removed before anything runs.
+        let removed = SandboxProfile.removeEscapingLinks(under: work)
+        if !removed.isEmpty { notes.append("Removed \(removed.count) link(s) in the item that pointed outside the sandbox folder.") }
         guard let rexe = realpath(exe, nil) else { throw ServiceError.failed("executable not found in the item") }
         let realExe = String(cString: rexe); free(rexe)
         guard realExe.hasPrefix(work + "/") else { throw ServiceError.denied("the item's executable points outside the sandbox folder") }
@@ -208,27 +231,34 @@ enum QuarantineSandbox {
 
         let home = Self.home(of: getuid()) ?? NSHomeDirectory()
         let execs = interp.map { [$0, realExe] } ?? [realExe]
+        let interpArgs = interp.map { SandboxProfile.interpreterArguments($0) } ?? []
         guard let profile = SandboxProfile.generate(workDir: work, allowedExec: execs, home: home) else {
             throw ServiceError.failed("could not build the sandbox profile")
         }
         let profilePath = (out as NSString).appendingPathComponent("profile.sb")
         try writeNew(Data(profile.utf8), to: profilePath, mode: 0o600)
-        let argv = ["/usr/bin/sandbox-exec", "-f", profilePath] + (interp.map { [$0, realExe] } ?? [realExe])
+        let argv = ["/usr/bin/sandbox-exec", "-f", profilePath] + (interp.map { [$0] + interpArgs + [realExe] } ?? [realExe])
         let stdoutPath = (out as NSString).appendingPathComponent("stdout"), stderrPath = (out as NSString).appendingPathComponent("stderr")
         let env = ["PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=\(work)", "TMPDIR=\(work)/", "LANG=en_US.UTF-8"]
 
         let started = Date()
         let pid = try spawn(argv, env: env, cwd: work, stdout: stdoutPath, stderr: stderrPath)
-        p.activity.add(.quarantine, "Sandbox run of \(rec.detectionName)", detail: (rec.originalPath as NSString).lastPathComponent, outcome: "started")
+        p.activity.add(.quarantine, "Sandbox run of \(rec.detectionName)", detail: (rec.originalPath as NSString).lastPathComponent, outcome: "started",
+                       event: .sandboxRun, actor: .user, sha256: rec.sha256, facts: ["threat": rec.detectionName])
         var seen: Set<Int32> = [pid]
         var status: Int32 = 0
         var exited = false
+        var overDisk = false
+        var tick = 0
         while Date().timeIntervalSince(started) < SandboxProfile.timeLimit {
             for c in descendants(of: pid) { seen.insert(c) }
             if waitpid(pid, &status, WNOHANG) == pid { exited = true; break }
+            // hx3: stop an item that tries to fill the disk (work folder + captured output), checked every second.
+            tick += 1
+            if tick % 10 == 0, SandboxProfile.diskUsageExceeded([work, stdoutPath, stderrPath]) { overDisk = true; break }
             usleep(100_000)
         }
-        let timedOut = !exited
+        let timedOut = !exited && !overDisk
         // Kill the process tree (group + every descendant we saw), then reap.
         for c in descendants(of: pid) { seen.insert(c) }
         kill(-pid, SIGKILL)
@@ -251,14 +281,17 @@ enum QuarantineSandbox {
         }
         if lr.status != 0 { notes.append("Couldn't read the sandbox log; the list of touched files may be incomplete.") }
         let violations = SandboxProfile.parseViolations(messages, pids: seen)
-        if timedOut { notes.append("Stopped after \(Int(SandboxProfile.timeLimit)) seconds.") }
+        if overDisk { notes.append("Stopped early: it wrote more than \(SandboxProfile.diskLimitBytes >> 20) MB or too many files.") }
+        else if timedOut { notes.append("Stopped after \(Int(SandboxProfile.timeLimit)) seconds.") }
         notes.append("The temporary folder was deleted after the run.")
 
-        let display = ["sandbox-exec", "-f", "profile.sb"] + (interp.map { [$0] } ?? []) + [(item as NSString).lastPathComponent]
+        let display = ["sandbox-exec", "-f", "profile.sb"] + (interp.map { [$0] + interpArgs } ?? []) + [SandboxProfile.sanitizeOutput((item as NSString).lastPathComponent)]
         let exitCode: Int32? = exited ? ((status & 0x7f) == 0 ? (status >> 8) & 0xff : -(status & 0x7f)) : nil
         p.activity.add(.quarantine, "Sandbox run finished: \(rec.detectionName)",
-                       detail: "\(violations.count) blocked action(s)", outcome: timedOut ? "time limit" : "exited")
-        return SandboxReport(itemName: (rec.originalPath as NSString).lastPathComponent, sha256: rec.sha256, command: display,
+                       detail: "\(violations.count) blocked action(s)", outcome: overDisk ? "disk limit" : timedOut ? "time limit" : "exited",
+                       event: .sandboxRun, actor: .user, reason: "\(violations.count) action(s) were blocked by the sandbox.",
+                       sha256: rec.sha256, facts: ["threat": rec.detectionName])
+        return SandboxReport(itemName: SandboxProfile.sanitizeOutput((rec.originalPath as NSString).lastPathComponent), sha256: rec.sha256, command: display,
                              startedAt: started, seconds: seconds, exitStatus: exitCode, timedOut: timedOut,
                              killedProcesses: max(0, killed), stdout: so, stderr: se, outputTruncated: t1 || t2,
                              violations: violations, touchedPaths: SandboxProfile.touchedPaths(violations), notes: notes,
@@ -286,7 +319,7 @@ enum QuarantineSandbox {
         guard let fh = FileHandle(forReadingAtPath: path) else { return ("", false) }
         defer { try? fh.close() }
         let d = (try? fh.read(upToCount: cap + 1)) ?? Data()
-        return (String(decoding: d.prefix(cap), as: UTF8.self), d.count > cap)
+        return (SandboxProfile.sanitizeOutput(String(decoding: d.prefix(cap), as: UTF8.self)), d.count > cap)
     }
 
     /// posix_spawn in a new process group, stdin from /dev/null, output to files, all other fds closed.

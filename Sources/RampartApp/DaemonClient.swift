@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Security
 import RampartShared
 
 /// Talks to rampartd over the length-prefixed JSON Unix-socket protocol defined in RampartShared/IPC.swift.
@@ -7,15 +8,40 @@ import RampartShared
 /// One connection per request; streaming requests (scan, subscribeEvents) keep their connection open.
 final class DaemonClient: @unchecked Sendable {
     enum ClientError: LocalizedError {
-        case notRunning, closed, daemon(String), unexpected
+        case notRunning, closed, daemon(String), unexpected, untrusted, outdated
         var errorDescription: String? {
             switch self {
             case .notRunning: return "The \(Product.name) background service isn't running."
+            case .untrusted: return "Something that isn't \(Product.name)'s background service answered on its connection, so \(Product.name) ignored it. Reinstalling \(Product.name) fixes this."
             case .closed: return "The connection to the background service closed."
             case .daemon(let m): return m
+            case .outdated: return DaemonClient.outdatedMessage
             case .unexpected: return "The background service sent an unexpected reply."
             }
         }
+    }
+
+    static let outdatedMessage = "\(Product.name)'s background service is older than the app. Update it (one password)."
+    /// Set when the daemon answered with something this app can't read, or reported an older IPC version.
+    nonisolated(unsafe) static var daemonOutdated = false
+
+    /// Decodes a reply. Never surfaces raw DecodingError text: an unreadable reply means an older daemon.
+    static func decode(_ data: Data) throws -> IPCResponse {
+        do {
+            let r = try JSONDecoder.rampart.decode(IPCResponse.self, from: data)
+            if case .status(let s) = r { daemonOutdated = (s.ipcVersion ?? 0) < IPC.version }
+            if case .error(let m) = r, isDecodeFailureText(m) { daemonOutdated = true; throw ClientError.outdated }
+            return r
+        } catch is DecodingError {
+            daemonOutdated = true
+            throw ClientError.outdated
+        }
+    }
+
+    /// An older daemon that can't read a newer request answers with Foundation's decoding message.
+    static func isDecodeFailureText(_ m: String) -> Bool {
+        let l = m.lowercased()
+        return l.contains("malformed request") || l.contains("couldn’t be read") || l.contains("couldn't be read") || l.contains("is missing") || l.contains("isn’t in the correct format") || l.contains("isn't in the correct format")
     }
 
     let candidatePaths: [String]
@@ -24,16 +50,21 @@ final class DaemonClient: @unchecked Sendable {
 
     init(paths: [String]? = nil) {
         if let p = paths { candidatePaths = p }
-        else if let i = CommandLine.arguments.firstIndex(of: "--socket"), i + 1 < CommandLine.arguments.count {
+        else if DaemonPeerTrust.devOverridesAllowed, let i = CommandLine.arguments.firstIndex(of: "--socket"), i + 1 < CommandLine.arguments.count {
             candidatePaths = [CommandLine.arguments[i + 1]]
         } else {
             candidatePaths = [IPC.socketPath, IPC.userSocketPath]
         }
     }
 
-    /// Opens a connected socket to the first path that accepts, or nil.
+    /// Set when a socket answered but failed the peer check (fake daemon). Surfaced as `.untrusted`.
+    private(set) var lastRejection: String?
+
+    /// Opens a connected socket to the first path that accepts AND whose peer is the genuine daemon, or nil.
+    /// hx8: nothing (pasted text, URLs, settings, authorization data) is written before the peer is verified.
     private func openSocket(timeout: TimeInterval?) -> Int32? {
         for path in candidatePaths where FileManager.default.fileExists(atPath: path) {
+            if let why = DaemonPeerTrust.socketFileProblem(path: path) { lastRejection = why; continue }
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
             if fd < 0 { continue }
             var one: Int32 = 1
@@ -56,7 +87,14 @@ final class DaemonClient: @unchecked Sendable {
             let rc = withUnsafePointer(to: &addr) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, len) }
             }
-            if rc == 0 { connectedPath = path; return fd }
+            if rc == 0 {
+                if let why = DaemonPeerTrust.peerProblem(fd: fd, path: path) {
+                    lastRejection = why
+                    NSLog("RamPart: refused daemon socket %@: %@", path, why)
+                    close(fd); continue
+                }
+                connectedPath = path; lastRejection = nil; return fd
+            }
             close(fd)
         }
         return nil
@@ -71,13 +109,13 @@ final class DaemonClient: @unchecked Sendable {
     func request(_ req: IPCRequest, timeout: TimeInterval = 10) async throws -> IPCResponse {
         try await withCheckedThrowingContinuation { cont in
             queue.async {
-                guard let fd = self.openSocket(timeout: timeout) else { cont.resume(throwing: ClientError.notRunning); return }
+                guard let fd = self.openSocket(timeout: timeout) else { cont.resume(throwing: self.lastRejection != nil ? ClientError.untrusted : ClientError.notRunning); return }
                 defer { close(fd) }
                 do {
                     let frame = try IPC.encode(req)
                     guard IPC.writeFrame(fd: fd, frame) else { throw ClientError.closed }
                     guard let data = IPC.readFrame(fd: fd) else { throw ClientError.closed }
-                    let resp = try JSONDecoder.rampart.decode(IPCResponse.self, from: data)
+                    let resp = try DaemonClient.decode(data)
                     if case .error(let m) = resp { throw ClientError.daemon(m) }
                     cont.resume(returning: resp)
                 } catch {
@@ -95,7 +133,8 @@ final class DaemonClient: @unchecked Sendable {
         let handle = StreamHandle()
         queue.async {
             guard let fd = self.openSocket(timeout: nil) else {
-                DispatchQueue.main.async { MainActor.assumeIsolated { onEnd(ClientError.notRunning) } }
+                let err: ClientError = self.lastRejection != nil ? .untrusted : .notRunning
+                DispatchQueue.main.async { MainActor.assumeIsolated { onEnd(err) } }
                 return
             }
             handle.setFD(fd)
@@ -103,7 +142,7 @@ final class DaemonClient: @unchecked Sendable {
             do {
                 guard IPC.writeFrame(fd: fd, try IPC.encode(req)) else { throw ClientError.closed }
                 while !handle.isCancelled, let data = IPC.readFrame(fd: fd) {
-                    let resp = try JSONDecoder.rampart.decode(IPCResponse.self, from: data)
+                    let resp = try DaemonClient.decode(data)
                     if case .error(let m) = resp { throw ClientError.daemon(m) }
                     let keepGoing = DispatchQueue.main.sync { MainActor.assumeIsolated { onMessage(resp) } }
                     if !keepGoing { break }
@@ -128,5 +167,95 @@ final class DaemonClient: @unchecked Sendable {
             cancelled = true
             if fd >= 0 { shutdown(fd, SHUT_RDWR); close(fd); fd = -1 }
         }
+    }
+}
+
+// MARK: - hx8: daemon peer verification
+
+/// Decides whether a daemon socket and the process behind it are really RamPart's daemon.
+///
+/// - Root socket (`/var/run/rampart.sock`): the socket file must be a real socket (not a symlink) owned by root,
+///   and the peer (getpeereid) must be uid 0. A user-level attacker can't satisfy either.
+/// - User socket (`~/Library/Application Support/Rampart/rampart.sock`): owned by us, in a folder only we can
+///   write, and the peer process (LOCAL_PEERPID → SecCode) must satisfy the bundled helper's designated
+///   requirement, after this app's own signature (which seals Contents/Helpers) has been verified.
+/// - Any other uid is refused.
+///
+/// Honest limit: with ad-hoc signing there is no Apple-issued identity. Malware running as you that can
+/// rewrite the whole app bundle and re-sign it can still impersonate it; macOS App Management protection is
+/// what stops that, not this check.
+enum DaemonPeerTrust {
+    /// `--socket`, `--helper` and `--daemon-root` are QA flags. A copy installed in /Applications ignores them,
+    /// so other software can't relaunch the real app pointed at a fake daemon.
+    static var devOverridesAllowed: Bool {
+        if CommandLine.arguments.contains("--headless-check") { return true }
+        return !Bundle.main.bundlePath.hasPrefix("/Applications/")
+    }
+
+    // Pure policies live in RampartShared.DaemonPeerPolicy (shared with the CLI and the secure browser).
+    static func socketFileProblem(path: String) -> String? { DaemonPeerPolicy.socketFileProblem(path: path) }
+    static func peerProblem(peerUID: uid_t, myUID: uid_t, rootSocket: Bool, signatureOK: () -> Bool) -> String? {
+        DaemonPeerPolicy.peerProblem(peerUID: peerUID, myUID: myUID, rootSocket: rootSocket, signatureOK: signatureOK)
+    }
+
+    static func peerProblem(fd: Int32, path: String) -> String? {
+        var uid: uid_t = 0, gid: gid_t = 0
+        guard getpeereid(fd, &uid, &gid) == 0 else { return "can't read peer credentials" }
+        return peerProblem(peerUID: uid, myUID: getuid(), rootSocket: path == IPC.socketPath) {
+            var pid: pid_t = 0
+            var len = socklen_t(MemoryLayout<pid_t>.size)
+            guard getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &len) == 0, pid > 0 else { return false }
+            return processSatisfiesHelperRequirement(pid: pid)
+        }
+    }
+
+    static func processSatisfiesHelperRequirement(pid: pid_t) -> Bool {
+        guard let req = helperRequirement else { return unsignedDevBuild }
+        var code: SecCode?
+        let attrs = [kSecGuestAttributePid: pid] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attrs, [], &code) == errSecSuccess, let code else { return false }
+        return SecCodeCheckValidity(code, [], req) == errSecSuccess
+    }
+
+    /// A bare `swift run` build has no app bundle to anchor trust to; it accepts a same-user peer.
+    /// Every packaged copy is an .app with a bundle identifier, so this never applies to a real install.
+    static let unsignedDevBuild: Bool = Bundle.main.bundleIdentifier == nil && !Bundle.main.bundlePath.hasSuffix(".app")
+
+    /// The designated requirement of the helper this app trusts, or nil when it can't be established.
+    /// Order: QA `--helper` override (dev copies only); else the bundled helper, but only after the app's own
+    /// signature, including nested code in Contents/Helpers, verifies.
+    static let helperRequirement: SecRequirement? = {
+        if devOverridesAllowed, let i = CommandLine.arguments.firstIndex(of: "--helper"), i + 1 < CommandLine.arguments.count {
+            return designatedRequirement(ofFile: CommandLine.arguments[i + 1])
+        }
+        let bundle = Bundle.main.bundleURL
+        let helper = bundle.appendingPathComponent("Contents/Helpers/rampartd").path
+        guard FileManager.default.fileExists(atPath: helper) else { return nil }
+        var app: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(bundle as CFURL, [], &app) == errSecSuccess, let app else { return nil }
+        let flags = SecCSFlags(rawValue: kSecCSCheckNestedCode | kSecCSStrictValidate)
+        guard SecStaticCodeCheckValidity(app, flags, nil) == errSecSuccess else { return nil }
+        return designatedRequirement(ofFile: helper)
+    }()
+
+    static func designatedRequirement(ofFile path: String) -> SecRequirement? {
+        var lst = stat()
+        guard lstat(path, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFREG else { return nil }   // no symlinks
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess, let code,
+              SecStaticCodeCheckValidity(code, [], nil) == errSecSuccess else { return nil }
+        var req: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(code, [], &req) == errSecSuccess else { return nil }
+        return req
+    }
+
+    /// Static check used before launching a helper binary.
+    static func fileSatisfiesHelperRequirement(_ path: String) -> Bool {
+        guard let req = helperRequirement else { return unsignedDevBuild }
+        var lst = stat()
+        guard lstat(path, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFREG else { return false }
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess, let code else { return false }
+        return SecStaticCodeCheckValidity(code, [], req) == errSecSuccess
     }
 }

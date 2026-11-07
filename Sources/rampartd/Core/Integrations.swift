@@ -24,6 +24,8 @@ enum Integrations {
     static var daemonHook: ((Services, Runtime) -> Void)?
     /// The YARA engine, if wired (for warm-up and status).
     static var lastYara: AnyObject?
+    /// (ip, host) for every DNS filter answer; the daemon points this at RampartTelemetry.DNSAnswerCache.
+    static var onDNSAnswer: ((String, String) -> Void)?
 
     static func wire(_ s: Services, runtime: Runtime, daemon: Bool) {
         var updaters: [(String, () -> String)] = []
@@ -143,6 +145,8 @@ struct SigningEnricher: FileFactsEnricher {
 
 final class EngineScanService: ScanService {
     let coord: ScanCoordinator
+    /// More folders to skip (Cat & Mouse decoys and maze), set by the daemon wiring.
+    var extraExclusions: (() -> [String])?
     let db: HashDatabase?
     let runtime: Runtime
     init(coord: ScanCoordinator, db: HashDatabase?, runtime: Runtime) { self.coord = coord; self.db = db; self.runtime = runtime }
@@ -156,7 +160,7 @@ final class EngineScanService: ScanService {
         // Our exclusions, minus those that contain an explicitly requested root (the vault is always excluded).
         let ours = runtime.exclusions.filter { ex in !roots.contains { under($0, ex) } }
         // Our own data folders are excluded even when a request names them (or a parent) explicitly.
-        o.walk.excludedPrefixes = Array(Set(WalkOptions.defaultExcludedPrefixes + ours + runtime.ownDataRoots))
+        o.walk.excludedPrefixes = Array(Set(WalkOptions.defaultExcludedPrefixes + ours + runtime.ownDataRoots + (extraExclusions?() ?? [])))
         o.walk.maxFileSize = UInt64(runtime.config.maxFileSizeMB) << 20
         o.unpackArchives = runtime.config.scanArchives
         return o
@@ -166,9 +170,11 @@ final class EngineScanService: ScanService {
         let cancel = ScanCancellation()
         let report = coord.scan(paths: paths, options: options(for: paths), cancel: cancel) { p in
             if cancelled() { cancel.cancel() }
-            progress(p.scanned, max(p.discovered, p.scanned), p.current)
+            progress(p.scanned, max(p.discovered, p.scanned), p.current,
+                     ScanTick(walkFinished: p.walkFinished, timedOut: p.timedOut, secondsSinceLastCompletion: p.secondsSinceLastCompletion))
         }
-        return ScanOutcome(scanned: report.scanned, detections: report.detections, seconds: report.seconds, errors: report.errors)
+        // Files abandoned at the per-file deadline count as "couldn't be scanned".
+        return ScanOutcome(scanned: report.scanned, detections: report.detections, seconds: report.seconds, errors: report.errors + report.timedOut)
     }
 
     func scanFile(_ path: String) -> Detection? {
@@ -220,15 +226,16 @@ final class PostureAdapter: PostureService {
         if dryRun || (fix.requiresRoot && getuid() != 0) {
             throw ServiceError.failed("not running as root; the fix would run:\n\(fix.preview)")
         }
+        // hx10 #12: only allow-listed absolute tools with plain arguments, and never an unbounded wait.
+        guard PostureFixer.isSafe(fix) else { throw ServiceError.denied("unsafe fix") }
         var out: [String] = []
+        let runner = GuardedPostureRunner()
         for cmd in fix.commands {
-            if let why = Privileged.refusal(cmd[0]) { throw ServiceError.denied(why) }
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: cmd[0]); p.arguments = Array(cmd.dropFirst())
-            p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
-            try p.run(); p.waitUntilExit()
-            out.append("\(cmd.joined(separator: " ")) -> \(p.terminationStatus)")
-            if p.terminationStatus != 0 { throw ServiceError.failed("fix failed: \(out.joined(separator: "; "))") }
+            guard let exe = cmd.first else { continue }
+            if let why = Privileged.refusal(exe) { throw ServiceError.denied(why) }
+            let r = runner.run(exe, Array(cmd.dropFirst()), timeout: 30)
+            out.append("\(cmd.joined(separator: " ")) -> \(r.timedOut ? "timed out" : String(r.status))")
+            if !r.usable || r.status != 0 { throw ServiceError.failed("fix failed: \(out.joined(separator: "; "))") }
         }
         // Re-scan to verify the fix took effect.
         let after = PostureScanner(runner: GuardedPostureRunner()).checks().first { $0.id == checkID }
@@ -276,22 +283,132 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
             if server?.isRunning == true { return }
             let list = lists.buildBlocklist()
             cachedList = list
-            let srv = DNSFilterServer(config: DNSFilterConfig(port: UInt16(runtime.dnsPort)), blocklist: list)
+            var cfg = DNSFilterConfig(port: UInt16(runtime.dnsPort))   // listenAddress stays 127.0.0.1 (hx4 N2)
+            cfg.pinStateURL = runtime.root.appendingPathComponent("doh-pins.json")   // hx4 N5: learned DoH key pins
+            let srv = DNSFilterServer(config: cfg, blocklist: list)
             srv.queryLog = { [weak self] e in self?.record(e) }
+            srv.doh.onPinFailure = { [weak self] host, detail in self?.pinFailed(host: host, detail: detail) }
             try srv.start()
             server = srv
             // Point the system resolver at us only as the real root daemon (never in --user/dev runs).
             if getuid() == 0 && !runtime.userMode {
                 let sw = DNSSwitcher(snapshotURL: runtime.root.appendingPathComponent("dns-original.json"), dryRun: false)
-                do { _ = try sw.apply(); switcher = sw } catch { logWarn("DNS switch failed: \(error)") }
+                do { _ = try sw.apply(); switcher = sw; suspendedForHealth = false } catch { logWarn("DNS switch failed: \(error)") }
             }
+            startWatchdogLocked()
             logInfo("web protection on (DNS filter 127.0.0.1:\(runtime.dnsPort))")
         } else {
             if let sw = switcher { _ = sw.restore(); switcher = nil }
+            suspendedForHealth = false
+            watchdog?.cancel(); watchdog = nil
             server?.stop(); server = nil
             saveStatsLocked()
             logInfo("web protection off")
         }
+    }
+
+    // MARK: DNS restore guarantee (hx4 N1)
+
+    /// Detections from the network layer (DoH pin failures); set by the daemon.
+    var onDetection: ((Detection) -> Void)?
+    private var watchdog: DispatchSourceTimer?
+    private var suspendedForHealth = false
+    private var lastPinAlert: [String: Date] = [:]
+    private var mayTouchSystemDNS: Bool { getuid() == 0 && !runtime.userMode && !Privileged.noPrivilegedTools }
+    private var snapshotURL: URL { runtime.root.appendingPathComponent("dns-original.json") }
+
+    /// At launch, before anything else: a DNS snapshot left by a run that died while DNS pointed at us is restored.
+    func recoverAtLaunch() {
+        guard mayTouchSystemDNS else { return }
+        let sw = DNSSwitcher(snapshotURL: snapshotURL, dryRun: false)
+        if sw.needsRecovery(filterRunning: false) { _ = sw.restore(); logWarn("DNS restored at launch: a previous run had left DNS switched") }
+    }
+
+    /// SIGTERM/SIGINT: put DNS back even if the filter already died.
+    func restoreOnExit() {
+        lock.lock(); defer { lock.unlock() }
+        if let sw = switcher { _ = sw.restore(); switcher = nil; logInfo("DNS restored on exit") }
+        else if mayTouchSystemDNS {
+            let sw = DNSSwitcher(snapshotURL: snapshotURL, dryRun: false)
+            if sw.needsRecovery(filterRunning: false) { _ = sw.restore() }
+        }
+    }
+
+    /// Every 10 s while on: a dead filter or an unreachable upstream gives DNS back to the system (visibly), and it is
+    /// switched to RamPart again once the upstream is healthy.
+    private func startWatchdogLocked() {
+        guard watchdog == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "app.rampart.dns.watchdog", qos: .utility))
+        t.schedule(deadline: .now() + 10, repeating: 10, leeway: .seconds(1))
+        t.setEventHandler { [weak self] in self?.watchdogTick() }
+        t.resume(); watchdog = t
+    }
+
+    private var failedProbes = 0
+
+    /// Sends one real A query for a well-known name to the local resolver and waits up to `timeout` for any reply
+    /// with the same ID (NOERROR or NXDOMAIN both prove the resolver answers). No system DNS settings are touched.
+    static func probeResolver(port: UInt16, name: String = "apple.com", timeout: TimeInterval = 2) -> Bool {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var tv = timeval(tv_sec: Int(timeout), tv_usec: Int32((timeout - floor(timeout)) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        let id = UInt16.random(in: 1...UInt16.max)
+        var q: [UInt8] = [UInt8(id >> 8), UInt8(id & 0xff), 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]
+        for label in name.split(separator: ".") { q.append(UInt8(label.utf8.count)); q += Array(label.utf8) }
+        q += [0, 0, 1, 0, 1]
+        var addr = sockaddr_in(); addr.sin_family = sa_family_t(AF_INET); addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let sent = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            sendto(fd, q, q.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+        guard sent == q.count else { return false }
+        var buf = [UInt8](repeating: 0, count: 1500)
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let n = recv(fd, &buf, buf.count, 0)
+            if n < 0 && errno == EINTR { continue }
+            guard n >= 12 else { return false }
+            if buf[0] == UInt8(id >> 8) && buf[1] == UInt8(id & 0xff) && buf[2] & 0x80 != 0 {
+                let rcode = buf[3] & 0x0f
+                return rcode == 0 || rcode == 3
+            }
+        }
+        return false
+    }
+
+    func watchdogTick() {
+        // Probe outside the lock: a real query to the local resolver (the server object can be "running" and still
+        // never answer, which left an installed Mac without DNS and broke iMessage).
+        let port: UInt16? = { lock.lock(); defer { lock.unlock() }; return server.map { _ in UInt16(runtime.dnsPort) } }()
+        let answers = port.map { Self.probeResolver(port: $0) } ?? true
+        lock.lock(); defer { lock.unlock() }
+        guard let s = server else { return }
+        failedProbes = answers ? 0 : failedProbes + 1
+        let healthy = s.isRunning && s.upstreamHealthy && failedProbes < 2
+        if !healthy, let sw = switcher {
+            _ = sw.restore(); switcher = nil; suspendedForHealth = true
+            logWarn("DNS restored: filter unhealthy (\(!s.isRunning ? "filter stopped" : failedProbes >= 2 ? "local resolver not answering test queries" : "encrypted DNS upstream unreachable"))")
+        } else if healthy, suspendedForHealth, mayTouchSystemDNS {
+            let sw = DNSSwitcher(snapshotURL: snapshotURL, dryRun: false)
+            do { _ = try sw.apply(); switcher = sw; suspendedForHealth = false; logInfo("DNS filter healthy again: re-applied") }
+            catch { logWarn("DNS re-apply failed: \(error)") }
+        }
+    }
+
+    private func pinFailed(host: String, detail: String) {
+        lock.lock()
+        let recent = Date().timeIntervalSince(lastPinAlert[host] ?? .distantPast) < 3600
+        if !recent { lastPinAlert[host] = Date() }
+        lock.unlock()
+        guard !recent else { return }
+        let h = LogRedact.clean(host, max: 120)
+        logWarn("DoH key pin mismatch for \(h): \(LogRedact.clean(detail, max: 300))")
+        let ev = Evidence(source: .network, title: "Encrypted DNS was intercepted",
+                          detail: "The encrypted DNS server \(h) presented a key RamPart has not seen before. Something on this network may be intercepting secure connections. RamPart stopped using that server.",
+                          score: 75)
+        onDetection?(Detection(path: nil, name: "Encrypted DNS was intercepted (\(h))", category: .suspicious,
+                               severity: .high, confidence: 75, evidence: [ev]))
     }
 
     func reloadBlocklist() {
@@ -317,7 +434,10 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
             }
         } else {
             for a in e.answers where a.contains(".") || a.contains(":") {
-                if a.first?.isNumber == true || a.contains(":") { ipToHost[a] = e.name }
+                if a.first?.isNumber == true || a.contains(":") {
+                    ipToHost[a] = e.name
+                    Integrations.onDNSAnswer?(a, e.name)   // b5x TC5: DNSAnswerCache for SocketSource remote_host (daemon wiring)
+                }
             }
             if ipToHost.count > 20000 { ipToHost.removeAll() }
         }

@@ -24,6 +24,7 @@ struct AuthenticatorView: View {
             }
         }
         .navigationTitle("Authenticator")
+        .protectedFromCapture(model.phase == .unlocked)
         .overlay(alignment: .bottom) {
             if let t = model.toast {
                 Label(t, systemImage: "checkmark.circle.fill").font(.callout.weight(.medium))
@@ -244,6 +245,7 @@ struct SetupQRSheet: View {
             Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
         }
         .padding(Spacing.xl).frame(width: 420)
+        .protectedFromCapture()
     }
 }
 
@@ -272,7 +274,9 @@ struct AddAccountSheet: View {
         return t
     }
 
-    var body: some View {
+    var body: some View { secretContent.protectedFromCapture() }
+
+    @ViewBuilder private var secretContent: some View {
         VStack(alignment: .leading, spacing: Spacing.m) {
             Text("Add a two-factor account").font(.title2.weight(.semibold))
             HStack {
@@ -332,7 +336,9 @@ struct ImportLinksSheet: View {
     @Environment(\.dismiss) private var dismiss
     @StateVar private var text = ""
 
-    var body: some View {
+    var body: some View { secretContent.protectedFromCapture() }
+
+    @ViewBuilder private var secretContent: some View {
         let parsed = Authenticator.parse(text)
         let (kept, dup) = Authenticator.dedupe(parsed.accounts, against: model.items.compactMap(\.totp))
         VStack(alignment: .leading, spacing: Spacing.m) {
@@ -405,6 +411,7 @@ struct AuthenticatorBackupSheet: View {
             HStack { Spacer(); Button("Done") { links = nil; dismiss() }.keyboardShortcut(.defaultAction) }
         }
         .padding(Spacing.xl).frame(width: 600)
+        .protectedFromCapture()
         .onDisappear { links = nil; master = "" }
     }
 

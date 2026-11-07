@@ -15,6 +15,8 @@ struct PasswordsView: View {
             }
         }
         .navigationTitle("Passwords")
+        // Keep the window out of screenshots / screen sharing while decrypted items are on screen.
+        .protectedFromCapture(model.phase == .unlocked)
         .overlay(alignment: .bottom) {
             if let t = model.toast {
                 Label(t, systemImage: "checkmark.circle.fill")
@@ -154,6 +156,7 @@ struct VaultLockScreen: View {
             .padding(Spacing.xl)
         }
         .sheet(isPresented: $showProtection) { VaultProtectionSheet() }
+        .protectedFromCapture(reveal)
         .onAppear {
             // Load the vault and Touch ID enrolment state before the button is drawn (first screen after launch).
             model.refreshPhase()
@@ -194,6 +197,10 @@ struct VaultLockScreen: View {
             if let e = model.error {
                 StatusLabel(text: e, symbol: "exclamationmark.triangle.fill", tint: .orange).font(.callout)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if !creating && model.rollbackPending {
+                Toggle("Open this older copy anyway (I restored it myself)", isOn: $model.acceptRollback)
+                    .toggleStyle(.checkbox).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
             }
             Button(action: submit) {
                 HStack {

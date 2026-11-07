@@ -14,6 +14,9 @@ public enum UndoStep: Codable, Hashable, Sendable {
 
 public enum JournalPhase: String, Codable, Sendable {
     case pending, done, failed, undone, undoFailed, interrupted
+    /// Written before an undo runs (hx3): a crash mid-undo leaves this, and the action is never undone a second time
+    /// automatically (replaying e.g. an old crontab over newer edits would be data loss).
+    case undoPending
 }
 
 /// One append-only line. The latest line per `actionID` gives the action's state.
@@ -124,7 +127,7 @@ public final class ActionJournal: @unchecked Sendable {
     /// re-verify the system state (e.g. does the file still exist? is the job still loaded?).
     @discardableResult
     public func recoverInterrupted() -> [JournalActionState] {
-        let stuck = states().filter { $0.phase == .pending }
+        let stuck = states().filter { $0.phase == .pending || $0.phase == .undoPending }
         for s in stuck {
             try? append(JournalRecord(actionID: s.actionID, transactionID: s.transactionID, seq: s.seq, date: Date(), phase: .interrupted,
                                       action: s.action, beforeState: [:], undo: nil, message: "recovered after crash; verify state"))

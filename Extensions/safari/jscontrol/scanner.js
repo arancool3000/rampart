@@ -2,9 +2,13 @@
 // Apple Events). Runs via `do JavaScript` and RETURNS a JSON string: {url, signals, tamper}. The app
 // feeds it to WebVerdictService as a checkPage request. Idempotent: installs its tamper observer once
 // and drains observations on each call. Must not depend on extension APIs.
+// hx6: page-world code can't be made tamper-proof. The app treats this script's reply as untrusted
+// (verdict URL comes from Safari, reply size-capped). The state lives under a per-session random name,
+// non-enumerable and non-writable, so a page can't simply pre-plant a fake one by a known name.
 (function () {
   const W = window;
-  if (!W.__rampartTamper) {
+  const KEY = "__rampartTamper___RAMPART_NONCE__";
+  if (!Object.prototype.hasOwnProperty.call(W, KEY)) {
     const findings = [], seen = new Set();
     const note = (s) => { if (findings.length < 40 && !seen.has(s)) { seen.add(s); findings.push(s); } };
     const isNative = (f) => { try { return typeof f === "function" && /\{\s*\[native code\]\s*\}/.test(Function.prototype.toString.call(f)); } catch { return false; } };
@@ -37,7 +41,7 @@
     });
     mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ["onsubmit", "onkeydown", "onkeyup", "onkeypress", "oninput"] });
     setInterval(recheck, 5000);
-    W.__rampartTamper = { drain: () => findings.splice(0) };
+    Object.defineProperty(W, KEY, { value: Object.freeze({ drain: () => findings.splice(0) }), enumerable: false, writable: false, configurable: false });
   }
   const forms = Array.from(document.forms).slice(0, 20).map((f) => {
     const inputs = Array.from(f.querySelectorAll("input"));
@@ -63,5 +67,5 @@
     scriptSnippets: scripts, imageAlts: Array.from(document.images).slice(0, 40).map((i) => (i.alt || "") + " " + (i.src || "").split("/").pop()).filter(Boolean),
     externalScriptHosts: Array.from(new Set(Array.from(document.scripts).map((s) => { try { return s.src ? new URL(s.src).hostname : null; } catch { return null; } }).filter(Boolean))).slice(0, 30),
     hasWalletConnect, isTopFrame: W.top === W, isHTTPS: location.protocol === "https:" };
-  return JSON.stringify({ url: location.href, signals, tamper: W.__rampartTamper.drain() });
+  return JSON.stringify({ url: location.href, signals, tamper: W[KEY].drain() });
 })();

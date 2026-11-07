@@ -27,6 +27,7 @@ let package = Package(
         .target(name: "RampartWeb", dependencies: ["RampartShared"]),
         .target(name: "RampartVault", dependencies: ["RampartShared"]),
         .target(name: "RampartAI", dependencies: ["RampartShared"]),
+        .target(name: "RampartRefresh", dependencies: ["RampartShared"]),
         .executableTarget(name: "rampart-nmh", dependencies: ["RampartShared", "RampartWeb"]),
         .executableTarget(name: "RampartBrowser", dependencies: ["RampartShared", "RampartWeb"],
                           exclude: ["README.md"],
@@ -38,11 +39,11 @@ let package = Package(
         .executableTarget(name: "rampart", dependencies: [
             "RampartShared", "RampartEngine", "RampartYara", "RampartSigning", "RampartRemediation",
             "RampartPosture", "RampartNetwork", "RampartBehaviour", "RampartGuard", "RampartWeb"]),
-        .executableTarget(name: "RampartApp", dependencies: ["RampartShared", "RampartVault", "RampartAI", "RampartWeb", "RampartNetwork", "RampartBehaviour", "RampartGuard"]),
+        .executableTarget(name: "RampartApp", dependencies: ["RampartShared", "RampartVault", "RampartAI", "RampartWeb", "RampartNetwork", "RampartBehaviour", "RampartGuard", "RampartRefresh"]),
         .executableTarget(name: "rampart-selftest", dependencies: [
             "RampartShared", "RampartEngine", "RampartYara", "RampartSigning", "RampartTelemetry",
             "RampartBehaviour", "RampartRemediation", "RampartNetwork", "RampartPosture",
-            "RampartGuard", "RampartWeb", "RampartVault", "RampartAI"]),
+            "RampartGuard", "RampartWeb", "RampartVault", "RampartAI", "RampartRefresh"]),
     ],
     swiftLanguageModes: [.v5]
 )

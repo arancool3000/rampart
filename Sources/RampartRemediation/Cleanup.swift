@@ -42,16 +42,35 @@ enum BackupIO {
         return FileBackup(originalPath: path, backupPath: dest, moved: false)
     }
     /// Puts a backup back. Moved items are refused if something now sits at the original path.
+    /// hx3: the original folder is pinned (no symlink in any component, checked with F_GETPATH) and the final
+    /// rename is relative to that descriptor, so swapping a folder for a link to e.g. /Library/LaunchDaemons
+    /// before an undo can't make root drop the backup there.
     static func restore(_ b: FileBackup) throws {
         let fm = FileManager.default
+        let original = normalizePath(b.originalPath)
+        let parent = (original as NSString).deletingLastPathComponent
+        let name = (original as NSString).lastPathComponent
+        guard SafeFS.isPlainName(name), original.hasPrefix("/") else { throw RemediationError.ioError("bad original path \(b.originalPath)") }
+        if ProtectedPaths.isProtected(original) { throw RemediationError.protectedPath(original) }
+        if !fm.fileExists(atPath: parent) { try fm.createDirectory(atPath: parent, withIntermediateDirectories: true) }
+        let dir = try SafeFS.pin(parent)
+        if ProtectedPaths.isProtected((dir.realPath as NSString).appendingPathComponent(name)) { throw RemediationError.protectedPath(original) }
         if b.moved {
-            if fm.fileExists(atPath: b.originalPath) { throw RemediationError.destinationExists(b.originalPath) }
-            try fm.createDirectory(atPath: (b.originalPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-            try fm.moveItem(atPath: b.backupPath, toPath: b.originalPath)
+            guard renameatx_np(AT_FDCWD, b.backupPath, dir.fd, name, UInt32(RENAME_EXCL)) == 0 else {
+                throw errno == EEXIST ? RemediationError.destinationExists(b.originalPath)
+                                      : RemediationError.ioError("move back \(b.originalPath): \(String(cString: strerror(errno)))")
+            }
         } else {
-            let tmp = b.originalPath + ".rampart-undo-\(UUID().uuidString)"
-            try fm.copyItem(atPath: b.backupPath, toPath: tmp)
-            guard rename(tmp, b.originalPath) == 0 else { try? fm.removeItem(atPath: tmp); throw RemediationError.ioError("replace \(b.originalPath)") }
+            guard let data = fm.contents(atPath: b.backupPath) else { throw RemediationError.notFound(b.backupPath) }
+            var old = stat()
+            let had = fstatat(dir.fd, name, &old, AT_SYMLINK_NOFOLLOW) == 0
+            if had, old.st_mode & S_IFMT != S_IFREG { throw RemediationError.ioError("\(b.originalPath) is no longer a regular file") }
+            let tmp = ".rampart-undo-\(UUID().uuidString)"
+            try SafeFS.createFile(in: dir, name: tmp, data: data, mode: had ? old.st_mode : 0o600,
+                                  owner: had ? (old.st_uid, old.st_gid) : nil)
+            guard renameat(dir.fd, tmp, dir.fd, name) == 0 else {
+                unlinkat(dir.fd, tmp, 0); throw RemediationError.ioError("replace \(b.originalPath)")
+            }
         }
     }
 }

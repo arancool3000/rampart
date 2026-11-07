@@ -14,7 +14,9 @@ struct PasswordCheckerView: View {
     /// Automatic when breach monitoring is on (defaults to on when no vault is unlocked).
     private var autoCheck: Bool { model.phase == .unlocked ? model.meta.settings.breachCheckEnabled : true }
 
-    var body: some View {
+    var body: some View { secretContent.protectedFromCapture(reveal) }
+
+    @ViewBuilder private var secretContent: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Spacing.l) {
                 SectionHeader("Password checker")

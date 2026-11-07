@@ -14,7 +14,7 @@ struct RemoteAccessView: View {
             VStack(alignment: .leading, spacing: Spacing.xl) {
                 hero
                 if screen.unsupported { unsupportedCard }
-                if let e = screen.error { Text(e).foregroundStyle(Color.statusAction).card(tint: .statusAction) }
+                if let e = screen.error { Text(SafeText.line(e, max: 240)).foregroundStyle(Color.statusAction).card(tint: .statusAction) }
                 if let r = screen.report {
                     toolsSection("Remote-control apps", r.findings.filter { !$0.isAppleService }, report: r)
                     toolsSection("macOS sharing services", r.findings.filter { $0.isAppleService }, report: r)
@@ -104,10 +104,10 @@ struct RemoteAccessView: View {
                     SectionHeader("Active sessions and listeners")
                     VStack(alignment: .leading, spacing: Spacing.s) {
                         ForEach(r.inbound) { c in
-                            StatusLabel(text: "\(c.processName) has an inbound session from \(c.remoteAddress) on port \(c.localPort)", symbol: "arrow.down.left.circle", tint: .statusAction)
+                            StatusLabel(text: "\(SafeText.line(c.processName, max: 64)) has an inbound session from \(SafeText.line(c.remoteAddress, max: 64)) on port \(c.localPort)", symbol: "arrow.down.left.circle", tint: .statusAction)
                         }
                         ForEach(r.unknownListeners, id: \.self) { l in
-                            StatusLabel(text: "\(l.process.isEmpty ? "An unidentified process" : l.process) is listening on remote-access port \(l.port)", symbol: "questionmark.circle", tint: .statusAttention)
+                            StatusLabel(text: "\(l.process.isEmpty ? "An unidentified process" : SafeText.line(l.process, max: 64)) is listening on remote-access port \(l.port)", symbol: "questionmark.circle", tint: .statusAttention)
                         }
                     }
                     .card()
@@ -187,7 +187,7 @@ struct RemoteToolRow: View {
             if let u = finding.allowedUntil { return "Allowed until \(u.formatted(date: .omitted, time: .shortened))" }
             return "Allowed"
         }
-        if finding.scamContext { return "Blocked: " + finding.scamReason }
+        if finding.scamContext { return "Blocked: " + SafeText.line(finding.scamReason, max: 200) }
         return finding.isAppleService ? "Turned off by \(Product.name)" : "Blocked (suspended)"
     }
 
@@ -196,14 +196,14 @@ struct RemoteToolRow: View {
             Image(systemName: symbol).foregroundStyle(tint).symbolRenderingMode(.hierarchical).font(.title3).frame(width: 24)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: Spacing.s) {
-                    Text(finding.name).font(.headline)
+                    Text(SafeText.line(finding.name, max: 64)).font(.headline)
                     if finding.scamContext { Badge(text: "Scam pattern", tint: .statusAction) }
                     if finding.inboundSessions > 0 { Badge(text: "\(finding.inboundSessions) active session\(finding.inboundSessions == 1 ? "" : "s")", tint: .statusAction) }
                 }
                 Text(stateText).font(.callout).foregroundStyle(.secondary)
                 if !finding.matchedBy.isEmpty || !finding.listeningPorts.isEmpty {
-                    Text(([finding.matchedBy.joined(separator: ", ")] + (finding.listeningPorts.isEmpty ? [] : ["listening on " + finding.listeningPorts.map(String.init).joined(separator: ", ")]))
-                        .filter { !$0.isEmpty }.joined(separator: " · "))
+                    Text(SafeText.line(([finding.matchedBy.joined(separator: ", ")] + (finding.listeningPorts.isEmpty ? [] : ["listening on " + finding.listeningPorts.map(String.init).joined(separator: ", ")]))
+                        .filter { !$0.isEmpty }.joined(separator: " · "), max: 240))
                         .font(.caption).foregroundStyle(.tertiary)
                 }
             }
@@ -223,6 +223,6 @@ struct RemoteToolRow: View {
         }
         .padding(.vertical, Spacing.s).padding(.horizontal, Spacing.s)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(finding.name): \(stateText)")
+        .accessibilityLabel("\(SafeText.line(finding.name, max: 64)): \(stateText)")
     }
 }

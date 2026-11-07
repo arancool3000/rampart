@@ -24,8 +24,16 @@ final class PasteGuardHost {
     private var pending: [SecurityEvent] = []
     private var flushScheduled = false
 
+    /// hx8: the clipboard is read only in a real, interactive session: never in headless/test runs, never with
+    /// RAMPART_NO_PRIVILEGED_TOOLS=1, and not when the user switched PasteGuard off ("pasteGuard.enabled").
+    /// PasteGuard itself honours macOS's "Paste from Other Apps" setting and skips concealed/password types.
+    static var allowed: Bool {
+        !Headless.active && ProcessInfo.processInfo.environment["RAMPART_NO_PRIVILEGED_TOOLS"] != "1"
+            && (UserDefaults.standard.object(forKey: "pasteGuard.enabled") as? Bool ?? true)
+    }
+
     func start() {
-        guard !Headless.active, guardian == nil else { return }
+        guard Self.allowed, guardian == nil else { return }
         let g = PasteGuard(ai: GeminiPasteAssessor(analyzer: PasteCommandAnalyzer(service: AIChatModel.shared.service)))
         g.onStatusChange = { s in
             Task { @MainActor in PasteGuardStatusBox.shared.status = PasteGuardHost.map(s) }
@@ -48,8 +56,12 @@ final class PasteGuardHost {
 
     func stop() { guardian?.stop(); guardian = nil }
 
+    /// hx8: bounded so a flood of clipboard changes can't grow memory while the daemon is away.
+    static let maxPending = 200
+
     private func enqueue(_ ev: SecurityEvent) {
         pending.append(ev)
+        if pending.count > Self.maxPending { pending.removeFirst(pending.count - Self.maxPending) }
         guard !flushScheduled else { return }
         flushScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {

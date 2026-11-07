@@ -48,7 +48,8 @@ final class BrowserDaemonClient: @unchecked Sendable {
             }
             let len = socklen_t(MemoryLayout<sockaddr_un>.size)
             let rc = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, len) } }
-            if rc == 0 { return fd }
+            // hx8: only a socket owned by root/us whose peer is RamPart's daemon (RampartShared.DaemonPeerPolicy).
+            if rc == 0 && DaemonPeerPolicy.connectedPeerProblem(fd: fd, path: path) == nil { return fd }
             close(fd)
         }
         return nil

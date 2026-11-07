@@ -2,6 +2,11 @@ import Foundation
 
 /// Length-prefixed JSON framing over a Unix domain socket.
 public enum IPC {
+    /// Wire contract version. Reported in `ProtectionStatus.ipcVersion` / `HealthReport.ipcVersion`; a daemon that
+    /// reports nothing (or less) is older than the app and may not understand newer requests.
+    /// 6: emergency lockdown, checkURLChain, scanProgress walk/timeout fields.
+    /// 7: Cat & Mouse (deception) requests.
+    public static let version = 7
     public static let socketPath = "/var/run/rampart.sock"
     public static let userSocketPath = NSHomeDirectory() + "/Library/Application Support/Rampart/rampart.sock"
 

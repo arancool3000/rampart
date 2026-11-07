@@ -42,7 +42,7 @@ final class Scheduler {
         let cfg = p.runtime.config, st = p.state.value
         if cfg.scheduledQuickScan, !busy.contains("quickScan"), !p.isScanning,
            Date().timeIntervalSince(started) > 600, Self.dailyDue(hour: cfg.scheduledScanHour, last: st.lastQuickScan) {
-            run("quickScan") { [p] in _ = p.scan(paths: [], quick: true, progress: { _, _, _ in }) }
+            run("quickScan") { [p] in _ = p.scan(paths: [], quick: true, actor: .schedule, progress: { _, _, _, _ in }) }
         }
         // Definitions: soon after the first start (never updated yet), then at least daily. Network
         // failures are quiet: logged, retried within the hour, never shown as an alert.
@@ -50,7 +50,7 @@ final class Scheduler {
         if allowNetworkUpdates, cfg.autoUpdate, updateEvery > 0,
            due("update", every: updateEvery, last: st.lastUpdate, initialDelay: st.lastUpdate == nil ? 45 : 120) {
             run("update") { [weak self, p] in
-                let summary = p.updateSignatures()
+                let summary = p.updateSignatures(actor: .schedule)
                 if Self.updateFailed(summary) {
                     logInfo("definitions update incomplete (network?); retrying within the hour")
                     self?.q.async { self?.lastRun["update"] = Date().addingTimeInterval(min(3600, updateEvery) - updateEvery) }

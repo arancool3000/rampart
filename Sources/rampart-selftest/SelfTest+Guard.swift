@@ -79,7 +79,9 @@ extension SelfTest {
         check(det.inspect(ev(.exec, pid: 906, args: ["/usr/bin/tccutil", "reset", "SystemPolicyAllFiles", "app.rampart.daemon"])).count == 1, "tccutil reset detected")
         check(det.inspect(ev(.exec, pid: 907, args: ["/bin/rm", "-rf", "/Users/x/Downloads/junk"])).isEmpty, "rm elsewhere ignored")
         check(det.inspect(ev(.exec, pid: 4242, args: ["/bin/launchctl", "bootout", "system/app.rampart.daemon"])).isEmpty, "own pid exempt")
-        check(det.inspect(ev(.exec, pid: 908, args: ["/bin/launchctl", "bootout", "system/app.rampart.daemon"], signingID: "app.rampart.installer")).isEmpty, "own signing id exempt")
+        // hx5 #1: an ad-hoc signing ID alone is not trusted; a child of our own pid is (fresh detector: no dedupe help).
+        let ownChild = ProcessInfoLite(pid: 908, ppid: 4242, path: "/bin/launchctl", args: ["/bin/launchctl", "bootout", "system/app.rampart.daemon"], uid: 0, signingID: "app.rampart.installer")
+        check(TamperDetector(paths: paths, ownPIDs: { [4242] }).inspect(SecurityEvent(date: Date(), kind: .exec, process: ownChild, detail: [:], source: "test")).isEmpty, "own child (installer) exempt")
         check(det.inspect(ev(.fileDelete, pid: 909, path: paths.daemonPlist)).first?.severity == .critical, "unlink of plist (eslogger) critical")
         check(det.inspect(ev(.fileRename, pid: 910, path: "/tmp/x.plist", dest: paths.agentPlist)).count == 1, "rename onto plist detected")
         check(det.inspect(ev(.fileWrite, pid: 911, path: paths.supportRoot + "/DB/hashes.sqlite")).first?.severity == .high, "write under support root high")

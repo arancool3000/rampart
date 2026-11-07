@@ -45,11 +45,16 @@ public final class SigningCache<Value>: @unchecked Sendable {
     }
 
     /// Returns the cached value for `path` or computes and stores it. Uncacheable paths are computed each time.
+    ///
+    /// Anti-TOCTOU: the identity key is re-read AFTER computing the verdict, and the result is cached only
+    /// when the file is byte-for-byte identical (inode + size + mtime + ctime) before and after. If an
+    /// attacker swaps or rewrites the file while it is being inspected, the key changes and we refuse to
+    /// cache a verdict that may describe neither the old nor the new file — the next lookup recomputes.
     public func value(for path: String, compute: () -> Value) -> Value {
         guard let k = Self.key(for: path) else { return compute() }
         if let v = get(k) { return v }
         let v = compute()
-        set(k, v)
+        if let k2 = Self.key(for: path), k2 == k { set(k, v) }
         return v
     }
 

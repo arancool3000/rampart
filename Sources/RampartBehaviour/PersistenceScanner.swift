@@ -325,6 +325,9 @@ public final class PersistenceScanner: @unchecked Sendable {
         (#"\bosascript\b.*-e"#, "runs inline AppleScript at shell start"),
         (#"\b(nc|ncat|socat)\b.*\s-e\s"#, "opens a reverse shell"),
         (#"/dev/tcp/"#, "opens a raw TCP connection"),
+        (#"\b(urlopen|urlretrieve|requests\.get|NSURL|dataWithContentsOfURL|http\.client)\b[\s\S]*\b(exec|eval)\b|\b(exec|eval)\s*\([\s\S]*\b(urlopen|NSURL|dataWithContentsOfURL|requests\.get)\b"#, "runs code it downloads inline"),
+        (#"\b(exec|eval)\s*\(\s*(base64\.b64decode|codecs\.decode|zlib\.decompress|bytes\.fromhex|__import__)"#, "runs an encoded payload inline"),
+        (#"-l\s+JavaScript\b.*(dataWithContentsOfURL|doShellScript|NSTask)"#, "runs inline JXA that downloads or spawns code"),
     ]
 
     /// Lines that fetch, decode, exec from hidden/temp paths, export DYLD_*, or alias sudo/ssh.

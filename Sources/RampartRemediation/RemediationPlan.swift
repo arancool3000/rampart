@@ -229,6 +229,17 @@ public final class RemediationExecutor: @unchecked Sendable {
 
     public func undoAction(_ s: JournalActionState) -> StepResult {
         guard let u = s.undo else { return StepResult(actionID: s.actionID, action: s.action, success: false, message: "no undo recorded", undo: nil) }
+        // hx3: undo only what the journal says is done right now (a stale state passed in twice is refused), and mark it
+        // in progress first so a crash can't lead to a second replay.
+        guard let current = journal.states().first(where: { $0.actionID == s.actionID }), current.phase == .done else {
+            return StepResult(actionID: s.actionID, action: s.action, success: false, message: "already undone or not complete", undo: nil)
+        }
+        do {
+            try journal.append(JournalRecord(actionID: s.actionID, transactionID: s.transactionID, seq: s.seq, date: Date(), phase: .undoPending,
+                                             action: s.action, beforeState: [:], undo: nil, message: nil))
+        } catch {
+            return StepResult(actionID: s.actionID, action: s.action, success: false, message: "journal not writable: \(error)", undo: nil)
+        }
         do {
             let msg = try perform(u)
             try? journal.append(JournalRecord(actionID: s.actionID, transactionID: s.transactionID, seq: s.seq, date: Date(), phase: .undone,

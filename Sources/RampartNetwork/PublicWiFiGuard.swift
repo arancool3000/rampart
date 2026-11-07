@@ -204,7 +204,7 @@ public struct PublicWiFiAssessment: Codable, Sendable {
         if security.isInsecure || !gatewayRiskyPorts.isEmpty || dnsVerdicts.contains(where: { $0.status == .unknown }) { return .low }
         return .info
     }
-    public var networkName: String { ssid ?? "this Wi-Fi network" }
+    public var networkName: String { PublicWiFiGuard.displaySSID(ssid) ?? "this Wi-Fi network" }
 
     /// One-line summary for notifications / logs (no BSSID, no addresses).
     public var summary: String {
@@ -294,6 +294,8 @@ public final class PublicWiFiGuard: @unchecked Sendable {
     /// Network currently joined + its gateway MAC at join time (for in-session spoof detection).
     private var current: (key: String, gatewayMAC: String?)?
     private var lastAssessment: PublicWiFiAssessment?
+    /// Recent automatic disconnects per network key (rate limit; in-memory only).
+    private var disconnectHistory: [String: [Date]] = [:]
 
     public init(store: KnownWiFiNetworkStore = KnownWiFiNetworkStore(), settings: PublicWiFiSettings = PublicWiFiSettings(),
                 disassociator: WiFiDisassociating = CoreWLANDisassociator()) {
@@ -303,6 +305,36 @@ public final class PublicWiFiGuard: @unchecked Sendable {
     public var latest: PublicWiFiAssessment? { lock.lock(); defer { lock.unlock() }; return lastAssessment }
 
     // MARK: Pure logic
+
+    /// SSIDs are attacker-chosen (up to 32 arbitrary bytes). For display they are stripped of control,
+    /// bidi-override and zero-width characters, collapsed to one line, capped and quoted, so a network named
+    /// e.g. "RamPart: this network is safe" reads as a quoted name, never as RamPart's own words. (hx4)
+    public static func displaySSID(_ ssid: String?) -> String? {
+        guard let ssid else { return nil }
+        let banned: Set<UInt32> = [0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2028, 0x2029, 0x2060, 0xFEFF,
+                                   0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069, 0x061C]
+        var out = String.UnicodeScalarView()
+        for u in ssid.unicodeScalars {
+            if u.value < 0x20 || (0x7F...0x9F).contains(u.value) { out.append(" "); continue }
+            if banned.contains(u.value) { continue }
+            out.append(u)
+        }
+        var t = String(out).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        t = t.replacingOccurrences(of: "\u{201C}", with: "\"").replacingOccurrences(of: "\u{201D}", with: "\"")
+        if t.count > 32 { t = String(t.prefix(32)) + "…" }
+        guard !t.isEmpty else { return nil }
+        return "\u{201C}\(t)\u{201D}"
+    }
+
+    /// Automatic disconnects allowed per network per hour. Beyond this a spoofed or flapping network could keep
+    /// knocking the Mac off Wi-Fi forever (an attacker on the LAN can fake ARP evidence at will); after the
+    /// budget is used RamPart only alerts. (hx4)
+    public static let maxAutoDisconnectsPerHour = 2
+
+    /// Pure rate-limit decision (fixture-testable).
+    public static func disconnectBudgetExhausted(_ history: [Date], now: Date = Date()) -> Bool {
+        history.filter { now.timeIntervalSince($0) < 3600 }.count >= maxAutoDisconnectsPerHour
+    }
 
     /// Stable network identity. SSID when available, else the gateway MAC, else gateway IP + security.
     public static func networkKey(ssid: String?, gatewayMAC: String?, gateway: String?, security: WiFiSecurityClass) -> String {
@@ -367,7 +399,7 @@ public final class PublicWiFiGuard: @unchecked Sendable {
 
         var ev: [Evidence] = []
         switch s.security {
-        case .open: ev.append(Evidence(source: .network, title: "Open Wi-Fi", detail: "\(s.ssid ?? "This network") has no password. Anyone nearby can see unencrypted traffic.", score: 45))
+        case .open: ev.append(Evidence(source: .network, title: "Open Wi-Fi", detail: "\(displaySSID(s.ssid).map { "The network \($0)" } ?? "This network") has no password. Anyone nearby can see unencrypted traffic.", score: 45))
         case .wep: ev.append(Evidence(source: .network, title: "WEP Wi-Fi", detail: "WEP encryption can be broken in minutes.", score: 55))
         case .wpa1: ev.append(Evidence(source: .network, title: "Legacy WPA Wi-Fi", detail: "WPA (TKIP) is outdated and weak.", score: 30))
         default: break
@@ -540,6 +572,11 @@ public final class PublicWiFiGuard: @unchecked Sendable {
     func scheduleDisconnect(key: String, name: String, reason: String, interface: String?, grace: Double) {
         lock.lock()
         if pending?.key == key { lock.unlock(); return }
+        if Self.disconnectBudgetExhausted(disconnectHistory[key] ?? []) {
+            lock.unlock()
+            onEvent?(.disconnectSkipped(networkKey: key, why: "Already disconnected from this network recently; alerting only so a spoofed network can't keep knocking you offline."))
+            return
+        }
         pending?.item.cancel()
         let item = DispatchWorkItem { [weak self] in self?.fireDisconnect(key: key, reason: reason, interface: interface) }
         pending = (key, reason, interface, item)
@@ -577,7 +614,10 @@ public final class PublicWiFiGuard: @unchecked Sendable {
         if !settings.disconnectInsecureWiFi { onEvent?(.disconnectSkipped(networkKey: key, why: "Disconnecting is turned off.")); return }
         if !stillHere { onEvent?(.disconnectSkipped(networkKey: key, why: "Already on a different network.")); return }
         if disassociator.disassociate(interface: interface) {
-            lock.lock(); current = nil; lock.unlock()
+            lock.lock(); current = nil
+            disconnectHistory[key, default: []].append(Date())
+            disconnectHistory[key] = disconnectHistory[key]!.filter { Date().timeIntervalSince($0) < 3600 }
+            lock.unlock()
             onEvent?(.disconnected(networkKey: key, reason: reason))
         } else {
             onEvent?(.disconnectSkipped(networkKey: key, why: "This process can't disconnect Wi-Fi (dev mode or no permission)."))

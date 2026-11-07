@@ -29,8 +29,27 @@ public enum PostureFixer {
 
     public static func canFix(_ checkID: String) -> Bool { fixableCheckIDs.contains(checkID) }
 
+    /// The only programs a fix may run (hx10). Executors must refuse any fix for which `isSafe` is false.
+    public static let allowedExecutables: Set<String> = [socketfilterfw, sysadminctl, systemsetup, defaults]
+
+    /// True if every command is an argument array (never a shell) for an allow-listed absolute executable, and every
+    /// argument is short printable ASCII with no option smuggled through spaces, NULs or line breaks.
+    public static func isSafe(_ f: PostureFix) -> Bool {
+        guard canFix(f.checkID), !f.commands.isEmpty, f.commands.count <= 16 else { return false }
+        for cmd in f.commands + (f.revertCommands ?? []) {
+            guard let exe = cmd.first, allowedExecutables.contains(exe), cmd.count <= 12 else { return false }
+            for a in cmd.dropFirst() {
+                guard !a.isEmpty, a.utf8.count <= 128,
+                      a.unicodeScalars.allSatisfy({ $0.value > 0x20 && $0.value < 0x7f && $0 != "`" && $0 != "$" && $0 != ";" && $0 != "|" && $0 != "&" })
+                else { return false }
+            }
+        }
+        return true
+    }
+
     /// The fix for a check, or nil if it isn't a safe one-click toggle. `dryRun` defaults to true.
     public static func fix(for checkID: String, dryRun: Bool = true) -> PostureFix? {
+        guard canFix(checkID) else { return nil }   // exact match on a fixed set: caller text never reaches a command
         switch checkID {
         case "firewall":
             return PostureFix(checkID: checkID, title: "Turn on the macOS firewall",

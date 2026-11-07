@@ -38,6 +38,10 @@ struct VaultSettingsView: View {
                 }
             }
             .font(.caption).foregroundStyle(.secondary)
+            if model.touchIDCompatSuggested {
+                Button("Use Compatibility Mode (weaker)") { model.useTouchIDCompatibilityMode() }
+                    .help("Stores the vault key in your login keychain behind a Touch ID check enforced by RamPart, not by hardware.")
+            }
         }
         .card()
     }
@@ -66,7 +70,7 @@ struct VaultSettingsView: View {
             Picker("Clear copied passwords after", selection: Binding(get: { s.clipboardClearSeconds }, set: { v in model.updateSettings { $0.clipboardClearSeconds = v } })) {
                 Text("15 seconds").tag(15); Text("30 seconds").tag(30); Text("90 seconds").tag(90)
             }
-            Text("The vault file is always encrypted; locking also wipes the key and decrypted items from memory. Copied secrets are marked as concealed so clipboard managers that respect it skip them.")
+            Text("The vault file is always encrypted; locking also wipes the key and decrypted items from memory (Swift can leave short-lived copies we can't scrub). Copied secrets are marked as concealed so clipboard managers that respect it skip them, and are kept off Universal Clipboard. After 5 wrong master passwords in a row, each new try has to wait longer (up to 5 minutes); this slows guessing in the app, but a copy of the vault file can only be protected by a strong master password.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .card()

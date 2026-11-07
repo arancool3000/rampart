@@ -30,6 +30,8 @@ final class SafariSetupModel {
     @ObservationIgnored private var launchObserver: NSObjectProtocol? = nil
 
     let extensionName = "RamPart"
+    /// hx6: exact titles Safari may give RamPart's row (manifest name, or the containing app's name).
+    let extensionNames: Set<String> = ["RamPart", "RamPart Web Protection"]
     var accessibilityGranted: Bool { SafariAXDriver.isTrusted }
 
     init() { if autoReenable { startLaunchWatcher() } ; if jsControlEnabled { jsControl.start(model: self) } }
@@ -97,7 +99,8 @@ final class SafariSetupModel {
             overlay?.update(title: "Setting up Safari", detail: "Don't touch the mouse or keyboard for a few seconds.", countdown: 10)
         case .pressExtensionCheckbox:
             try await openSettingsPane("Extensions", pid: pid, matcher: matcher)
-            let box = try await SafariAXDriver.wait(pid: pid, seconds: 8, what: "the RamPart extension in Settings › Extensions") { matcher.extensionCheckbox(in: $0, nameContains: self.extensionName) }
+            let names = self.extensionNames
+            let box = try await SafariAXDriver.wait(pid: pid, seconds: 8, what: "the RamPart extension in Settings › Extensions") { SafariAXDriver.exactExtensionCheckbox(in: $0, names: names) }
             try SafariAXDriver.press(box, name: step.target)
         case .openSettingsPane:
             try await openSettingsPane(step.target, pid: pid, matcher: matcher)
@@ -154,8 +157,17 @@ final class SafariSetupModel {
     func turnOffJSFromAppleEvents() async {
         guard SafariAXDriver.isTrusted, let app = SafariAXDriver.runningSafari() else { jsControl.lastGuardMessage = "Turn off Safari › Develop › Allow JavaScript from Apple Events yourself: RamPart can't reach Safari's menu right now."; return }
         let m = AXTreeMatcher()
-        if let item = m.menuItem(in: SafariAXDriver.snapshot(pid: app.processIdentifier), menu: "Develop", title: "Allow JavaScript from Apple Events"), item.value == "1" {
-            do { try SafariAXDriver.press(item, name: "Allow JavaScript from Apple Events") } catch { jsControl.lastGuardMessage = "Couldn't turn the Develop setting off automatically. Turn off Safari › Develop › Allow JavaScript from Apple Events now." }
+        let pid = app.processIdentifier
+        guard let item = m.menuItem(in: SafariAXDriver.snapshot(pid: pid), menu: "Develop", title: "Allow JavaScript from Apple Events") else {
+            jsControl.lastGuardMessage = "RamPart couldn't find Safari › Develop › Allow JavaScript from Apple Events. If it is ticked, untick it yourself."
+            return
+        }
+        guard item.value == "1" else { return }
+        do { try SafariAXDriver.press(item, name: "Allow JavaScript from Apple Events") } catch { jsControl.lastGuardMessage = "Couldn't turn the Develop setting off automatically. Turn off Safari › Develop › Allow JavaScript from Apple Events now."; return }
+        // hx6: verify instead of assuming; the guard message only claims what actually happened.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        if m.menuItem(in: SafariAXDriver.snapshot(pid: pid), menu: "Develop", title: "Allow JavaScript from Apple Events")?.value == "1" {
+            jsControl.lastGuardMessage = "Safari still allows JavaScript from Apple Events. Turn off Safari › Develop › Allow JavaScript from Apple Events now."
         }
     }
 }
@@ -240,10 +252,15 @@ final class SafariJSControl {
         logProcess?.terminate(); logProcess = nil
     }
 
+    @ObservationIgnored private var lastScan = Date.distantPast
+    /// hx6: per-session name for the scanner's page-world state, so a page can't pre-plant a fake
+    /// `__rampartTamper` that swallows tamper findings (it can still find it by enumerating window).
+    @ObservationIgnored private let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+
     // Apple Events to Safari: only while the user has turned this mode on.
+    // hx6: built by SafariJSControlScript (escaped literal, 5 s timeout, Safari's own tab URL returned).
     private func doJavaScript(_ js: String) -> String? {
-        let escaped = js.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        let src = "tell application \"Safari\"\n if (count of windows) is 0 then return \"\"\n return do JavaScript \"\(escaped)\" in current tab of front window\nend tell"
+        let src = SafariJSControlScript.doJavaScriptSource(js)
         var err: NSDictionary?
         let result = NSAppleScript(source: src)?.executeAndReturnError(&err)
         if let err { lastGuardMessage = "Safari scripting failed: \(err[NSAppleScript.errorMessage] ?? "unknown"). Check Develop › Allow JavaScript from Apple Events and the Automation permission."; return nil }
@@ -252,19 +269,25 @@ final class SafariJSControl {
 
     private func scanFrontTab() {
         guard running, !scannerJS.isEmpty, SafariAXDriver.runningSafari() != nil else { return }
-        guard let json = doJavaScript(scannerJS), let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let url = obj["url"] as? String else { return }
-        guard url != lastURL else { return }
-        lastURL = url; pagesScanned += 1
+        guard let raw = doJavaScript(scannerJS.replacingOccurrences(of: "__RAMPART_NONCE__", with: nonce)),
+              let reply = SafariJSControlScript.parseScanReply(raw) else { return }
+        // hx6: the verdict is for the URL Safari reports, never the one the page's script returned.
+        let url = reply.safariURL
+        // Same URL: rescan every 30 s so content injected after load (SPA, delayed ClickFix) is still seen.
+        guard url != lastURL || Date().timeIntervalSince(lastScan) > 30 else { return }
+        lastURL = url; lastScan = Date(); pagesScanned += 1
+        let obj = reply.object
         let sigData = try? JSONSerialization.data(withJSONObject: obj["signals"] ?? [:])
         let signals = sigData.flatMap { try? JSONDecoder().decode(PageSignals.self, from: $0) }
-        let tamper = obj["tamper"] as? [String]
-        let resp = service.handle(NMRequest(type: .checkPage, url: url, signals: signals, tamper: tamper))
+        var tamper = ((obj["tamper"] as? [Any]) ?? []).prefix(40).compactMap { $0 as? String }.map { String($0.prefix(300)) }
+        if SafariJSControlScript.reportMismatch(safariURL: url, reported: reply.reportedURL) { tamper.insert("the page altered RamPart's scanner report", at: 0) }
+        let resp = service.handle(NMRequest(type: .checkPage, url: url, signals: signals, tamper: tamper.isEmpty ? nil : tamper))
         lastVerdict = "\(resp.verdict?.title ?? "?") · \(URL(string: url)?.host ?? url)"
-        if let action = resp.action, action != .allow, !bannerJS.isEmpty {
-            let reasons = (try? JSONSerialization.data(withJSONObject: (resp.reasons ?? []).map { ["title": $0.title, "detail": $0.detail] })).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
-            let headline = (try? JSONSerialization.data(withJSONObject: [resp.headline ?? ""])).flatMap { String(data: $0, encoding: .utf8) }.map { String($0.dropFirst().dropLast()) } ?? "\"\""
-            _ = doJavaScript(bannerJS.replacingOccurrences(of: "\"__LEVEL__\"", with: "\"\(action.rawValue)\"").replacingOccurrences(of: "__HEADLINE__", with: headline).replacingOccurrences(of: "__REASONS__", with: reasons))
+        if let action = resp.action, action != .allow, !bannerJS.isEmpty,
+           let js = SafariJSControlScript.fillBanner(bannerJS, level: action.rawValue, headline: resp.headline ?? "",
+                                                     reasons: (resp.reasons ?? []).map { ["title": $0.title, "detail": $0.detail] }, expectedURL: url) {
+            // banner.js draws only if the front tab is still on `url` (the user may have switched tabs).
+            _ = doJavaScript(js)
         }
     }
 
@@ -274,7 +297,9 @@ final class SafariJSControl {
         let key = f.detail
         guard seenFindings.insert(key).inserted else { return }
         findings.insert(GuardFinding(date: Date(), finding: f), at: 0)
-        lastGuardMessage = "Another app can script Safari pages: \(f.bundleID ?? f.processPath ?? "unknown"). RamPart turned the lower-security mode off."
+        // hx6: the name is attacker-chosen; show it as a bare identifier, and don't claim Safari's setting is
+        // off until turnOffJSFromAppleEvents() has checked (it overwrites this message if it isn't).
+        lastGuardMessage = "Another app can script Safari pages: \(SafariJSControlScript.displayIdentifier(f.bundleID ?? f.processPath)). RamPart stopped JavaScript control mode and is turning off Safari's Develop setting."
         // Switch the mode off immediately.
         model?.jsControlEnabled = false
         stop()
@@ -293,7 +318,9 @@ final class SafariJSControl {
         defer { sqlite3_finalize(stmt) }
         var rows: [SafariScriptGuard.TCCRow] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let s = String(cString: sqlite3_column_text(stmt, 0)), c = String(cString: sqlite3_column_text(stmt, 1))
+            // hx6: NULL columns used to crash String(cString:).
+            guard let sp = sqlite3_column_text(stmt, 0), let cp = sqlite3_column_text(stmt, 1) else { continue }
+            let s = String(cString: sp), c = String(cString: cp)
             let v = Int(sqlite3_column_int(stmt, 2))
             let io = sqlite3_column_text(stmt, 3).map { String(cString: $0) }
             rows.append(.init(service: s, client: c, authValue: v, indirectObject: io))
@@ -337,7 +364,7 @@ final class SafariJSControl {
 
     /// Runs `tccutil reset AppleEvents <bundle-id>` on the user's explicit click.
     func revoke(_ gf: GuardFinding) {
-        guard let id = gf.finding.bundleID else { return }
+        guard let id = gf.finding.bundleID, SafariJSControlScript.isBundleID(id) else { return }
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil"); p.arguments = ["reset", "AppleEvents", id]
         try? p.run(); p.waitUntilExit()
         if let i = findings.firstIndex(of: gf) { findings[i].revoked = p.terminationStatus == 0 }

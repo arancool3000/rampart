@@ -259,7 +259,7 @@ struct ItemDetail: View {
 
     private func saveAttachment(_ a: Attachment) {
         let p = NSSavePanel(); p.nameFieldStringValue = a.name
-        if p.runModal() == .OK, let u = p.url { try? a.data.write(to: u, options: .atomic) }
+        if p.runModal() == .OK, let u = p.url { try? PasswordsModel.writePrivate(a.data, to: u) }
     }
 }
 
@@ -398,6 +398,8 @@ struct ItemEditor: View {
                     } else {
                         Toggle("Require Touch ID to view", isOn: $requireUnlock)
                     }
+                    Text("Touch ID, your Mac's login password or your master password can show it. This hides the item on screen while the vault is open; it is not a second layer of encryption.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 .formStyle(.grouped)
                 .scrollContentBackground(.hidden)

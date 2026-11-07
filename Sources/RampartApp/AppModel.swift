@@ -7,10 +7,14 @@ import RampartShared
 enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
     case dashboard, scan, threats, activity, network, posture, rules, settings
     // Tools (owned by feature agents; their screens live in Features/<Name>/). One case per feature.
-    case scamCheck, passwords, authenticator, passwordChecker, networkScan, aiAssistant, remoteAccess
+    case scamCheck, passwords, authenticator, passwordChecker, networkScan, aiAssistant, remoteAccess, refresh, emergency, catAndMouse
+    // Refresh mode (its own sidebar): one destination per former RefreshView tab / category.
+    case refreshSmart, refreshStorage, refreshMap, refreshSpeed, refreshStartup, refreshLargeOld, refreshDuplicates, refreshLeftovers, refreshSettings
 
     static let core: [SidebarItem] = [.dashboard, .scan, .threats, .activity, .network, .posture, .rules, .settings]
-    static let tools: [SidebarItem] = [.scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess]
+    static let tools: [SidebarItem] = [.emergency, .catAndMouse, .scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess]
+    static let refreshItems: [SidebarItem] = [.refreshSmart, .refreshStorage, .refreshMap, .refreshSpeed, .refreshStartup, .refreshLargeOld, .refreshDuplicates, .refreshLeftovers, .refreshSettings]
+    var isRefresh: Bool { self == .refresh || Self.refreshItems.contains(self) }
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -29,6 +33,18 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .networkScan: return "Network Scan"
         case .aiAssistant: return "AI Assistant"
         case .remoteAccess: return "Remote Access"
+        case .refresh: return "Refresh"
+        case .emergency: return "Emergency"
+        case .catAndMouse: return "Cat & Mouse"
+        case .refreshSmart: return "Smart Refresh"
+        case .refreshStorage: return "Storage Cleanup"
+        case .refreshMap: return "Disk Map"
+        case .refreshSpeed: return "Speed & Memory"
+        case .refreshStartup: return "Startup Items"
+        case .refreshLargeOld: return "Large & Old Files"
+        case .refreshDuplicates: return "Duplicates"
+        case .refreshLeftovers: return "App Leftovers"
+        case .refreshSettings: return "Refresh Settings"
         }
     }
     var symbol: String {
@@ -48,8 +64,31 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .networkScan: return "wifi.router"
         case .aiAssistant: return "sparkles"
         case .remoteAccess: return "rectangle.connected.to.line.below"
+        case .refresh: return "sparkles.rectangle.stack"
+        case .emergency: return "exclamationmark.octagon"
+        case .catAndMouse: return "cat"
+        case .refreshSmart: return "sparkles"
+        case .refreshStorage: return "internaldrive"
+        case .refreshMap: return "square.grid.3x3.square"
+        case .refreshSpeed: return "gauge.with.dots.needle.67percent"
+        case .refreshStartup: return "power"
+        case .refreshLargeOld: return "doc.badge.clock"
+        case .refreshDuplicates: return "doc.on.doc"
+        case .refreshLeftovers: return "shippingbox"
+        case .refreshSettings: return "slider.horizontal.3"
         }
     }
+}
+
+/// The two sidebar modes (segmented control at the top of the sidebar). Remembered across launches.
+enum SidebarMode: String, CaseIterable, Identifiable {
+    case protection, refresh
+    var id: String { rawValue }
+    var title: String { self == .protection ? "Protection" : "Refresh" }
+    /// Destinations ⌘1–⌘9 select in this mode.
+    var shortcutItems: [SidebarItem] { self == .protection ? SidebarItem.core : SidebarItem.refreshItems }
+    var home: SidebarItem { self == .protection ? .dashboard : .refreshSmart }
+    static let storageKey = "sidebar.mode"
 }
 
 enum ScanKind: String, CaseIterable, Identifiable {
@@ -75,9 +114,15 @@ struct ScanProgress: Equatable {
     var found: Int
     var paused: Bool
     /// True once the file walker has finished discovering files, so `total` is final.
-    /// The daemon's IPC `scanProgress` carries no walk flag yet, so this is inferred: the walker
-    /// discovers files while scanning, and `total` stops growing once it is done.
+    /// Reported by the daemon (`scanProgress.walkFinished`); older daemons are covered by inference
+    /// (`total` stops growing once the walk is done).
     var walkFinished = false
+    /// Files abandoned at the per-file time limit so far.
+    var timedOut = 0
+    /// Seconds since the scanner last finished any file; large means one big file is being checked.
+    var secondsSinceLastCompletion: Double = 0
+    /// True when no file has finished for a while (a large file is being checked): the ETA is hidden.
+    var stalled: Bool { secondsSinceLastCompletion >= 3 }
     var lastTotalChange = Date()
     /// Smoothed scan rate in files per second (exponential moving average).
     var rate: Double = 0
@@ -95,7 +140,7 @@ struct ScanProgress: Equatable {
     }
     /// Shown only after walking finishes, at least 5 % is done and the smoothed rate is meaningful.
     var etaSeconds: Double? {
-        guard let f = fraction, f >= 0.05, f < 1, rate > 0.5 else { return nil }
+        guard !stalled, let f = fraction, f >= 0.05, f < 1, rate > 0.5 else { return nil }
         let left = Double(max(0, total - scanned)) / rate
         return left.isFinite ? max(1, left) : nil
     }
@@ -165,7 +210,16 @@ struct ActivityItem: Identifiable, Hashable {
     var kind: Kind
     var title: String
     var outcome: String
+
+    /// hx8: titles and outcomes carry file names, process names and daemon text. Shown as one plain line.
+    init(date: Date, kind: Kind, title: String, outcome: String) {
+        self.date = date; self.kind = kind
+        self.title = SafeText.line(title, max: 160)
+        self.outcome = SafeText.line(outcome, max: 80)
+    }
 }
+
+// SafeText lives in RampartShared/SafeText.swift (hx8: shared with the CLI, the browser and rampart-selftest).
 
 struct AppConnections: Identifiable, Hashable {
     struct Destination: Hashable, Identifiable {
@@ -237,6 +291,25 @@ final class AppModel {
 
     var mode: ConnectionMode = .connecting
     var selection: SidebarItem? = .dashboard
+    /// The connected background service speaks an older IPC version (shown as a calm update banner).
+    var daemonOutdated = false
+    /// Sidebar mode; switching shows that mode's own sidebar and remembers the last destination per mode.
+    var sidebarMode: SidebarMode = SidebarMode(rawValue: UserDefaults.standard.string(forKey: SidebarMode.storageKey) ?? "") ?? .protection {
+        didSet { UserDefaults.standard.set(sidebarMode.rawValue, forKey: SidebarMode.storageKey) }
+    }
+    @ObservationIgnored private var lastSelection: [SidebarMode: SidebarItem] = [:]
+    func switchMode(_ m: SidebarMode) {
+        guard m != sidebarMode else { return }
+        if let s = selection { lastSelection[sidebarMode] = s }
+        sidebarMode = m
+        selection = lastSelection[m] ?? m.home
+    }
+    /// ⌘1–⌘9 within the current mode.
+    func selectShortcut(_ i: Int) {
+        let items = sidebarMode.shortcutItems
+        guard items.indices.contains(i) else { return }
+        selection = items[i]
+    }
     var status = ProtectionStatus()
     var detections: [Detection] = [] { didSet { syncChrome() } }
     var quarantine: [QuarantineRecord] = []
@@ -383,7 +456,8 @@ final class AppModel {
             // No sample data: show the honest "service isn't running" state with a Retry button.
             if mode == .live || mode == .demo { clearDemo() }
             mode = .offline
-            if DaemonLauncher.shared.helperMissing { lastError = DaemonLauncher.shared.missingHelperMessage }
+            if client.lastRejection != nil { lastError = DaemonClient.ClientError.untrusted.errorDescription }
+            else if DaemonLauncher.shared.helperMissing { lastError = DaemonLauncher.shared.missingHelperMessage }
             else if case .failed(let why) = launchState { lastError = why }
             else if DaemonLauncher.shared.helperURL == nil { lastError = DaemonLauncher.shared.missingHelperMessage }
         }
@@ -397,13 +471,21 @@ final class AppModel {
 
     /// Light refresh (every 15 s): status, detections, quarantine, activity, network stats, settings.
     /// Heavy refresh adds posture and startup items (on connect, on demand, every 10 minutes).
+    /// Error text for the UI: decoding failures become the "older background service" notice, never raw text.
+    nonisolated static func userFacing(_ error: Error) -> String {
+        if error is DecodingError { DaemonClient.daemonOutdated = true; return DaemonClient.outdatedMessage }
+        let m = error.localizedDescription
+        if DaemonClient.isDecodeFailureText(m) { DaemonClient.daemonOutdated = true; return DaemonClient.outdatedMessage }
+        return m
+    }
+
     func refresh(heavy: Bool = true) async {
         guard mode == .live else { return }
         do {
-            if case .status(let s) = try await client.request(.status) { status = s }
+            if case .status(let s) = try await client.request(.status) { status = s; daemonOutdated = (s.ipcVersion ?? 0) < IPC.version }
             lastError = nil
         } catch {
-            lastError = error.localizedDescription
+            lastError = AppModel.userFacing(error)
             return
         }
         // Each v2 request is optional: an older daemon answers .error and that screen keeps its empty state.
@@ -487,6 +569,9 @@ final class AppModel {
             case .update: kind = .update
             case .posture, .settings: kind = .settings
             case .persistence, .system: kind = .protection
+            case .pasteGuard: kind = .threat
+            case .wifi, .networkScan: kind = .network
+            default: kind = .protection
             }
             return ActivityItem(date: e.date, kind: kind, title: e.title, outcome: e.outcome.isEmpty ? e.detail : e.outcome)
         }
@@ -598,13 +683,14 @@ final class AppModel {
             scanHandle = client.stream(.scan(paths: targets, quick: kind == .quick), onMessage: { resp in
                 let m = AppModel.shared
                 switch resp {
-                case .scanProgress(let scanned, let total, let current):
+                case .scanProgress(let scanned, let total, let current, let walkDone, let timedOut, let sinceLast):
                     if Headless.active && scanned <= 1 { HeadlessRunner.log("headless-check: scan progress \(scanned)/\(total) \(current)") }
                     guard case .running(var p) = m.scanPhase else { return true }
                     let now = Date()
                     if now.timeIntervalSince(lastUI) < 0.1 { return true }   // throttle to 10 Hz
                     lastUI = now
-                    p.update(scanned: scanned, total: total, now: now); p.current = current
+                    p.update(scanned: scanned, total: total, walkDone: walkDone, now: now); p.current = current
+                    p.timedOut = timedOut ?? 0; p.secondsSinceLastCompletion = sinceLast ?? 0
                     m.scanPhase = .running(p)
                     m.noteScanPath(current)
                     return true
@@ -621,7 +707,7 @@ final class AppModel {
             }, onEnd: { err in
                 let m = AppModel.shared
                 if Headless.active { HeadlessRunner.log("headless-check: scan stream ended \(err.map { "with error: \($0.localizedDescription)" } ?? "cleanly")") }
-                if let err, m.isScanning { m.lastError = err.localizedDescription; m.scanPhase = .idle }
+                if let err, m.isScanning { m.lastError = AppModel.userFacing(err); m.scanPhase = .idle }
             })
         } else {
             DemoData.runScan(self, kind: kind, paths: paths)
@@ -647,7 +733,7 @@ final class AppModel {
         scanPhase = .running(p)
         if mode == .live {
             let paused = p.paused
-            Task { do { _ = try await client.request(.pauseScan(paused: paused)) } catch { lastError = error.localizedDescription } }
+            Task { do { _ = try await client.request(.pauseScan(paused: paused)) } catch { lastError = AppModel.userFacing(error) } }
         }
     }
 
@@ -665,7 +751,7 @@ final class AppModel {
 
     func quarantine(_ d: Detection) async {
         if mode == .live {
-            do { _ = try await client.request(.quarantine(detectionID: d.id)); await refresh() } catch { lastError = error.localizedDescription }
+            do { _ = try await client.request(.quarantine(detectionID: d.id)); await refresh() } catch { lastError = AppModel.userFacing(error) }
         } else {
             mark(d.id, resolved: true)
             if let p = d.path {
@@ -677,7 +763,7 @@ final class AppModel {
 
     func restore(_ r: QuarantineRecord, allow: Bool) async {
         if mode == .live {
-            do { _ = try await client.request(.restore(id: r.id, allow: allow)); await refresh() } catch { lastError = error.localizedDescription; return }
+            do { _ = try await client.request(.restore(id: r.id, allow: allow)); await refresh() } catch { lastError = AppModel.userFacing(error); return }
         } else {
             quarantine.removeAll { $0.id == r.id }
         }
@@ -689,7 +775,7 @@ final class AppModel {
 
     func delete(_ r: QuarantineRecord) async {
         if mode == .live {
-            do { _ = try await client.request(.deleteQuarantined(id: r.id)); await refresh() } catch { lastError = error.localizedDescription; return }
+            do { _ = try await client.request(.deleteQuarantined(id: r.id)); await refresh() } catch { lastError = AppModel.userFacing(error); return }
         } else {
             quarantine.removeAll { $0.id == r.id }
         }
@@ -713,7 +799,7 @@ final class AppModel {
     @discardableResult
     func addAllowRule(_ rule: AllowRuleSpec) async -> Bool {
         if mode == .live {
-            do { _ = try await client.request(.addAllowRule(rule)) } catch { lastError = error.localizedDescription; return false }
+            do { _ = try await client.request(.addAllowRule(rule)) } catch { lastError = AppModel.userFacing(error); return false }
             if case .allowRules(let r)? = try? await client.request(.listAllowRules) { allowRules = r.sorted { $0.created > $1.created } }
         } else {
             allowRules.insert(rule, at: 0)
@@ -724,7 +810,7 @@ final class AppModel {
 
     func removeAllowRule(_ rule: AllowRuleSpec) async {
         if mode == .live {
-            do { _ = try await client.request(.removeAllowRule(id: rule.id)) } catch { lastError = error.localizedDescription; return }
+            do { _ = try await client.request(.removeAllowRule(id: rule.id)) } catch { lastError = AppModel.userFacing(error); return }
             if case .allowRules(let r)? = try? await client.request(.listAllowRules) { allowRules = r.sorted { $0.created > $1.created } }
         } else {
             allowRules.removeAll { $0.id == rule.id }
@@ -748,7 +834,7 @@ final class AppModel {
                 if case .settings(let confirmed) = resp { self.settings = confirmed }
             } catch {
                 self.settings = previous
-                self.lastError = error.localizedDescription
+                self.lastError = AppModel.userFacing(error)
             }
         }
     }
@@ -798,7 +884,7 @@ final class AppModel {
         fixingChecks.insert(c.id)
         defer { fixingChecks.remove(c.id) }
         if mode == .live {
-            do { _ = try await client.request(.fixPosture(checkID: c.id), timeout: 60); await refresh() } catch { lastError = error.localizedDescription; return }
+            do { _ = try await client.request(.fixPosture(checkID: c.id), timeout: 60); await refresh() } catch { lastError = AppModel.userFacing(error); return }
         } else {
             try? await Task.sleep(nanoseconds: 700_000_000)
             if let i = posture.firstIndex(where: { $0.id == c.id }) { posture[i].state = .pass; posture[i].detail = "Turned on by \(Product.name) just now." }
@@ -809,7 +895,7 @@ final class AppModel {
     func setWebProtection(_ on: Bool) async {
         if mode == .live {
             guard webProtectionAvailable else { lastError = "Web protection needs the full system service."; return }
-            do { _ = try await client.request(.setWebProtection(on: on)); await refresh() } catch { lastError = error.localizedDescription; return }
+            do { _ = try await client.request(.setWebProtection(on: on)); await refresh() } catch { lastError = AppModel.userFacing(error); return }
         } else { status.webProtectionOn = on }
         activity.insert(ActivityItem(date: Date(), kind: .settings, title: "Web protection turned \(on ? "on" : "off")", outcome: "Changed"), at: 0)
     }
@@ -821,7 +907,7 @@ final class AppModel {
         settings.realtimeOn = effectiveOn
         if mode == .live {
             Task {
-                do { _ = try await client.request(.setRealtime(on: effectiveOn)); await self.refresh() } catch { self.lastError = error.localizedDescription }
+                do { _ = try await client.request(.setRealtime(on: effectiveOn)); await self.refresh() } catch { self.lastError = AppModel.userFacing(error) }
             }
             if let minutes {
                 pauseTimer?.invalidate()
@@ -841,7 +927,7 @@ final class AppModel {
         isUpdatingDefinitions = true
         defer { isUpdatingDefinitions = false }
         if mode == .live {
-            do { _ = try await client.request(.updateSignatures, timeout: 120); await refresh() } catch { lastError = error.localizedDescription; return }
+            do { _ = try await client.request(.updateSignatures, timeout: 120); await refresh() } catch { lastError = AppModel.userFacing(error); return }
         } else {
             try? await Task.sleep(nanoseconds: 1_200_000_000)
         }
@@ -867,3 +953,4 @@ enum FDAProbe {
 extension Array where Element: Hashable {
     func uniqued() -> [Element] { var seen = Set<Element>(); return filter { seen.insert($0).inserted } }
 }
+

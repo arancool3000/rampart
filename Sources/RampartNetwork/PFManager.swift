@@ -17,8 +17,53 @@ public final class PFManager: @unchecked Sendable {
     public init(anchor: String = "com.apple/250.Rampart", table: String = "rampart_block",
                 directory: URL = Paths.effectiveRoot.appendingPathComponent("pf"),
                 dryRun: Bool = true, forceLocalDNS: Bool = false, blockDoT: Bool = false) {
-        self.anchor = anchor; self.table = table; self.directory = directory; self.dryRun = dryRun
+        // Hardening (hx4): names and paths are interpolated into pf.conf syntax and pfctl arguments, so anything
+        // that could break out of a rule (newline, quote, brace, space) falls back to the safe defaults.
+        self.anchor = Self.isSafeAnchor(anchor) ? anchor : "com.apple/250.Rampart"
+        self.table = Self.isSafeTable(table) ? table : "rampart_block"
+        self.directory = Self.isSafePath(directory.path) ? directory
+            : Paths.effectiveRoot.appendingPathComponent("pf")
+        self.dryRun = dryRun
         self.forceLocalDNS = forceLocalDNS; self.blockDoT = blockDoT
+    }
+
+    public static func isSafeAnchor(_ s: String) -> Bool {
+        !s.isEmpty && s.count <= 64 && !s.hasPrefix("/") && !s.hasPrefix("-") && !s.contains("..")
+            && s.unicodeScalars.allSatisfy { CharacterSet.alphanumerics.contains($0) && $0.isASCII || "._/-".unicodeScalars.contains($0) }
+    }
+    public static func isSafeTable(_ s: String) -> Bool {
+        guard let f = s.unicodeScalars.first, f.isASCII, CharacterSet.letters.contains(f) || f == "_" else { return false }
+        return s.count <= 31 && s.unicodeScalars.allSatisfy { $0.isASCII && (CharacterSet.alphanumerics.contains($0) || $0 == "_") }
+    }
+    public static func isSafePath(_ s: String) -> Bool {
+        s.hasPrefix("/") && !s.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F || "\"'{}<>$`\\".unicodeScalars.contains($0) }
+    }
+
+    /// Never block these: the DoH upstreams (a bad feed must not take DNS down with it).
+    public static let protectedAddresses: [String] = DoHClient.bootstrapAddresses.values.flatMap { $0 }
+
+    /// Ranges a feed may never cover (in whole or part): this-network, RFC 1918, loopback, link-local, CGNAT,
+    /// multicast/reserved, and the IPv6 equivalents including IPv4-mapped space.
+    static let reservedRanges: [([UInt8], Int)] = [
+        ([0, 0, 0, 0], 8), ([10, 0, 0, 0], 8), ([127, 0, 0, 0], 8), ([169, 254, 0, 0], 16), ([172, 16, 0, 0], 12),
+        ([192, 168, 0, 0], 16), ([100, 64, 0, 0], 10), ([224, 0, 0, 0], 3),
+        ([UInt8](repeating: 0, count: 16), 128), ([UInt8](repeating: 0, count: 15) + [1], 128),
+        ([UInt8](repeating: 0, count: 10) + [0xFF, 0xFF, 0, 0, 0, 0], 96), ([UInt8](repeating: 0, count: 16), 96),
+        ([0xFC] + [UInt8](repeating: 0, count: 15), 7), ([0xFE, 0x80] + [UInt8](repeating: 0, count: 14), 10),
+        ([0xFF] + [UInt8](repeating: 0, count: 15), 8),
+    ]
+
+    /// Two prefixes overlap iff they agree on the first min(prefix) bits.
+    static func overlaps(_ a: [UInt8], _ pa: Int, _ b: [UInt8], _ pb: Int) -> Bool {
+        guard a.count == b.count else { return false }
+        let bits = min(pa, pb)
+        for i in 0..<a.count {
+            let take = max(0, min(8, bits - i * 8))
+            if take == 0 { break }
+            let mask: UInt8 = take == 8 ? 0xFF : ~(0xFF >> UInt8(take))
+            if a[i] & mask != b[i] & mask { return false }
+        }
+        return true
     }
 
     public var anchorURL: URL { directory.appendingPathComponent("rampart.anchor") }
@@ -47,25 +92,31 @@ public final class PFManager: @unchecked Sendable {
     /// unspecified and default routes so a feed can never cut off the LAN.
     public static func sanitize(_ raw: String) -> String? {
         let s = raw.trimmingCharacters(in: .whitespaces)
-        let parts = s.split(separator: "/", maxSplits: 1)
-        guard let first = parts.first, let bytes = DNSWire.addressBytes(String(first)) else { return nil }
+        guard s.count <= 64 else { return nil }
+        let parts = s.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let first = parts.first, var bytes = DNSWire.addressBytes(String(first)) else { return nil }
+        let full = bytes.count * 8
+        var prefix = full
         if parts.count == 2 {
-            guard let p = Int(parts[1]) else { return nil }
+            // Digits only (Int() would accept "+24").
+            guard !parts[1].isEmpty, parts[1].count <= 3, parts[1].allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let p = Int(parts[1]) else { return nil }
             let minPrefix = bytes.count == 4 ? 8 : 16
-            guard p >= minPrefix, p <= bytes.count * 8 else { return nil }
+            guard p >= minPrefix, p <= full else { return nil }
+            prefix = p
         }
-        if bytes.count == 4 {
-            let (a, b) = (bytes[0], bytes[1])
-            if a == 0 || a == 10 || a == 127 || a >= 224 { return nil }
-            if a == 169 && b == 254 { return nil }
-            if a == 172 && (16...31).contains(b) { return nil }
-            if a == 192 && b == 168 { return nil }
-            if a == 100 && (64...127).contains(b) { return nil }   // CGNAT
-        } else {
-            if bytes.allSatisfy({ $0 == 0 }) || bytes == [UInt8](repeating: 0, count: 15) + [1] { return nil }
-            if bytes[0] == 0xFF || bytes[0] & 0xFE == 0xFC || (bytes[0] == 0xFE && bytes[1] & 0xC0 == 0x80) { return nil }
+        // Canonicalise: clear host bits.
+        for i in 0..<bytes.count {
+            let keep = max(0, min(8, prefix - i * 8))
+            bytes[i] &= keep == 8 ? 0xFF : (keep == 0 ? 0 : ~(0xFF >> UInt8(keep)))
         }
-        return s
+        for (net, p) in reservedRanges where overlaps(bytes, prefix, net, p) { return nil }
+        for a in protectedAddresses {
+            if let pb = DNSWire.addressBytes(a), overlaps(bytes, prefix, pb, pb.count * 8) { return nil }
+        }
+        let text = DNSWire.addressString(bytes)
+        guard !text.isEmpty else { return nil }
+        return prefix == full ? text : "\(text)/\(prefix)"
     }
 
     /// Parses Feodo/FireHOL style text (one IP/CIDR per line, `#`/`;` comments) and Spamhaus DROP JSON lines

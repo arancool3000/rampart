@@ -75,7 +75,11 @@ public struct URLDecisionPolicy: Sendable {
     /// subject to the blocklist and scheme checks; the content rule list handles trackers.
     public func decide(url: URL, facts: URLFacts, isMainFrame: Bool = true, httpUpgradeFailed: Bool = false) -> NavigationDecision {
         let scheme = (url.scheme ?? "").lowercased()
-        if Self.localSchemes.contains(scheme) { return .allow }
+        // hx6: only the two inert about: documents are local. `about:anything-else` and `rampart:` have no
+        // handler here, and letting a page commit them would put page-chosen text next to RamPart's
+        // "RamPart page" identity in the address bar.
+        if scheme == "about" { return Self.isInertAbout(url, isMainFrame: isMainFrame) ? .allow : .block([.dangerousScheme], score: 100) }
+        if scheme == "rampart" { return .block([.dangerousScheme], score: 100) }
         if Self.dangerousSchemes.contains(scheme) || scheme.isEmpty {
             return .block([.dangerousScheme], score: 100)
         }
@@ -94,6 +98,8 @@ public struct URLDecisionPolicy: Sendable {
             }
             if facts.brandMatch != nil, isMainFrame, !risks.contains(.likelyScam) { risks.append(.lookalikeDomain); score = max(score, 70) }
             if isMainFrame, Self.isRawIP(host) { risks.append(.rawIPHost); score = max(score, 40) }
+            // hx6: "https://paypal.com@evil.test/" puts a trusted name where people read the host.
+            if isMainFrame, url.user != nil || url.password != nil, !risks.contains(.suspiciousURL) { risks.append(.suspiciousURL); score = max(score, 50) }
         }
 
         // HTTPS-only: upgrade first, warn only if the upgrade already failed.
@@ -113,21 +119,36 @@ public struct URLDecisionPolicy: Sendable {
         return blocking ? .block(risks, score: score) : .warn(risks, score: score)
     }
 
+    /// about:blank in any frame, about:srcdoc only inside a frame. Query and fragment are ignored by WebKit
+    /// for these documents, so `about:blank#text` is still blank.
+    public static func isInertAbout(_ url: URL, isMainFrame: Bool) -> Bool {
+        var rest = url.absoluteString.dropFirst("about:".count)
+        if let cut = rest.firstIndex(where: { $0 == "#" || $0 == "?" }) { rest = rest[..<cut] }
+        let r = rest.lowercased()
+        return r == "blank" || (r == "srcdoc" && !isMainFrame)
+    }
+
     public static func isRawIP(_ host: String) -> Bool {
-        if host.hasPrefix("[") { return true }                       // IPv6 literal
-        let parts = host.split(separator: ".")
-        guard parts.count == 4 else { return false }
-        return parts.allSatisfy { p in p.allSatisfy(\.isNumber) && Int(p).map { $0 <= 255 } == true }
+        if host.hasPrefix("[") || host.contains(":") { return true }  // IPv6 literal
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        if parts.count == 4, parts.allSatisfy({ p in !p.isEmpty && p.allSatisfy(\.isASCII) && p.allSatisfy(\.isNumber) && Int(p).map { $0 <= 255 } == true }) { return true }
+        // hx6: WebKit also accepts hex / octal / short forms ("0x7f.1", "2130706433"); treat any all-numeric host as an IP.
+        let labels = host.split(separator: ".")
+        let anyHex = labels.contains { $0.lowercased().hasPrefix("0x") }
+        if !host.isEmpty, labels.count != 4 || anyHex, labels.allSatisfy({ p in
+            let l = p.lowercased(); return !l.isEmpty && (l.allSatisfy { $0.isASCII && $0.isNumber } || (l.hasPrefix("0x") && l.dropFirst(2).allSatisfy { $0.isHexDigit }))
+        }) { return true }
+        return false
     }
     public static func isLoopback(_ host: String) -> Bool {
-        host == "localhost" || host.hasPrefix("127.") || host == "::1" || host == "[::1]"
+        host == "localhost" || (host.hasPrefix("127.") && isRawIP(host)) || host == "::1" || host == "[::1]"
     }
 
     /// Turn what the user typed into something navigable. Search goes to DuckDuckGo (no tracking).
     public static func resolveTyped(_ input: String) -> URL? {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        if text == "about:blank" || text.hasPrefix("rampart:") { return URL(string: text) }
+        if text == "about:blank" { return URL(string: text) }
         if let u = URL(string: text), let s = u.scheme?.lowercased(), !s.isEmpty, u.host != nil || s == "about" {
             return u
         }

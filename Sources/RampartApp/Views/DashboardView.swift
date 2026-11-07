@@ -24,6 +24,7 @@ struct DashboardView: View {
                     if !model.recommendations.isEmpty { recommendations }
                     recentActivity
                 }
+                if model.mode == .live { ProtectEverythingView() }
             }
             .contentColumn()
         }
@@ -70,8 +71,8 @@ struct DashboardView: View {
             return .init(symbol: "shield.slash", tint: .statusAction, title: "Real-time protection is off",
                          detail: "Files aren't being checked as they open.", button: "Turn On", prominent: true)
         case .limited:
-            return .init(symbol: "exclamationmark.shield.fill", tint: .statusAttention, title: "Protection is limited",
-                         detail: "\(Product.name) can't check some folders without Full Disk Access.", button: "Grant Access…", prominent: true)
+            return .init(symbol: "exclamationmark.shield.fill", tint: .statusAttention, title: "Limited scanning",
+                         detail: "\(Product.name) needs Full Disk Access to scan everything, including inside apps and your Library. Turn on the switch next to \(Product.name).", button: "Grant Full Disk Access…", prominent: true)
         case .starting:
             return .init(symbol: "shield.lefthalf.filled", tint: .rampartTeal, title: "Starting protection…",
                          detail: "\(Product.name) is starting its background checker. This takes a moment.", button: "Retry", prominent: false)

@@ -150,6 +150,29 @@ private struct PermissionGuideView: View {
 /// (with a tick) as soon as RamPart has access. macOS does not allow any app to grant itself Full Disk Access;
 /// this gets the user to the single switch they need to turn on.
 @MainActor
+/// First launch (and later launches while Full Disk Access is still missing, at most once a day): open the
+/// System Settings pane with the floating guide. Never in headless/test runs, never with RAMPART_NO_PRIVILEGED_TOOLS,
+/// and only for a copy installed in /Applications (development builds never open System Settings by themselves).
+enum FDAAutoPrompt {
+    static let lastKey = "fda.autoPrompt.last"
+    static func shouldPrompt(now: Date = Date(), last: Date?, hasAccess: Bool, headless: Bool, noPrivileged: Bool, installed: Bool) -> Bool {
+        guard !hasAccess, !headless, !noPrivileged, installed else { return false }
+        guard let last else { return true }
+        return now.timeIntervalSince(last) >= 24 * 3600 || now < last
+    }
+    static func runIfNeeded() {
+        let d = UserDefaults.standard
+        let last = d.object(forKey: lastKey) as? Date
+        guard shouldPrompt(last: last, hasAccess: FDAProbe.check(), headless: Headless.active,
+                           noPrivileged: ProcessInfo.processInfo.environment["RAMPART_NO_PRIVILEGED_TOOLS"] == "1",
+                           installed: Bundle.main.bundlePath.hasPrefix("/Applications/") && !CommandLine.arguments.contains("--demo")) else { return }
+        d.set(Date(), forKey: lastKey)
+        // Give the main window a moment to appear first, so the guide sits next to it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { FullDiskAccessRequest.start() }
+    }
+}
+
+@MainActor
 enum FullDiskAccessRequest {
     private static var timer: Timer?
     static func start() {

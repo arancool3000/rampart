@@ -126,9 +126,11 @@ enum RemoteAccessCopy {
         "\(Product.name) treats a remote tool that starts while a browser is in front, or just after a scam page, as critical."
     static let limit = "How far this goes: \(Product.name) stops unapproved tools after they start, disables their launch items and " +
         "drops inbound connections on their ports with the macOS firewall. Without Apple's Endpoint Security entitlement it cannot " +
-        "prevent a launch before it happens, and a person with your administrator password can always re-enable sharing in System Settings."
+        "prevent a launch before it happens, and a person with your administrator password can always re-enable sharing in System Settings. " +
+        "It recognises tools by their signature, name and usual ports: a tool that is renamed, re-signed and moved to another port may not be " +
+        "recognised, so unsigned programs accepting outside connections are listed separately. Timed approvals end early if the clock is turned back."
     static let tamper = "Scripts and malware running as your user can't turn \(Product.name) off: protection can only be paused or removed " +
-        "with your administrator password through \(Product.name) itself. Attempts to stop, unload, delete or edit it, even by admin-level " +
-        "scripts, are detected, undone from sealed backups, and reported to you. No antivirus can stop a person who deliberately restarts " +
-        "into Recovery Mode and removes it."
+        "with your administrator password through \(Product.name) itself. Attempts to stop, unload, delete or edit it that \(Product.name) can see " +
+        "are detected, undone from sealed backups where possible, and reported to you. A program running as root (with your administrator " +
+        "password) can still stop it, and no antivirus can stop a person who deliberately restarts into Recovery Mode and removes it."
 }

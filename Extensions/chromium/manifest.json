@@ -4,14 +4,83 @@
   "version": "0.1.0",
   "description": "Checks every page as it loads for scams, look-alike domains, fake CAPTCHAs (ClickFix), clipboard hijacks and wallet drainers. Verdicts come from RamPart on your Mac; nothing is sent to the cloud.",
   "minimum_chrome_version": "116",
-  "permissions": ["nativeMessaging", "webNavigation", "storage", "tabs", "scripting"],
-  "host_permissions": ["http://*/*", "https://*/*"],
-  "background": { "service_worker": "background.js" },
-  "content_scripts": [
-    { "matches": ["http://*/*", "https://*/*"], "js": ["shared/clipboard-main.js"], "run_at": "document_start", "world": "MAIN", "all_frames": false },
-    { "matches": ["http://*/*", "https://*/*"], "js": ["shared/heuristics.js", "shared/tamper.js", "content.js"], "css": ["content.css"], "run_at": "document_idle", "all_frames": false }
+  "permissions": [
+    "nativeMessaging",
+    "webNavigation",
+    "storage",
+    "tabs",
+    "scripting"
   ],
-  "action": { "default_title": "RamPart Web Protection", "default_popup": "popup.html" },
-  "web_accessible_resources": [{ "resources": ["interstitial.html", "interstitial.css"], "matches": ["<all_urls>"] }],
-  "icons": { "128": "icons/icon128.png", "48": "icons/icon48.png", "16": "icons/icon16.png" }
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "shared/clipboard-bridge.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "shared/clipboard-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "shared/heuristics.js",
+        "shared/tamper.js",
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "RamPart Web Protection",
+    "default_popup": "popup.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "interstitial.html"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "use_dynamic_url": true
+    }
+  ],
+  "icons": {
+    "128": "icons/icon128.png",
+    "48": "icons/icon48.png",
+    "16": "icons/icon16.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  }
 }

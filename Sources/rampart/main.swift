@@ -46,7 +46,7 @@ commands:
   scam <text|url> [--kind K]          scam check of a message, email or URL
   web-lookup <host>                   is this host on the daemon's blocklists?
   install --gui-auth [--app PATH]     "Enable full protection": one admin password dialog installs the
-                                      root daemon (without --gui-auth or with --dry-run: print the command)
+          [--allow-downgrade]         root daemon (without --gui-auth or with --dry-run: print the command)
   uninstall --gui-auth [--keep-data]  remove everything (one admin dialog), verified clean
   version
 
@@ -105,44 +105,167 @@ func locateApp(_ explicit: String?) -> String? {
     return nil
 }
 
+/// Builds and checks the privileged install/uninstall script. Pure string/stat logic; nothing here runs as root.
+enum InstallPlan {
+    static let bundleID = "app.rampart.app"
+    static let stagePrefix = "/private/tmp/app.rampart.stage"
+
+    static func canonical(_ p: String) -> String {
+        let abs = p.hasPrefix("/") ? p : FileManager.default.currentDirectoryPath + "/" + p
+        return URL(fileURLWithPath: abs).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// Control characters (newline, NUL, ESC, ...) never reach the shell or AppleScript; nor do relative paths.
+    static func unsafePathReason(_ p: String) -> String? {
+        if p.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7f || (0x80...0x9f).contains($0.value) || $0.properties.generalCategory == .format || $0.properties.generalCategory == .lineSeparator || $0.properties.generalCategory == .paragraphSeparator }) {
+            return "a path with control characters"
+        }
+        guard p.hasPrefix("/"), p.lowercased().hasSuffix(".app"), p.utf8.count < 1024 else { return "\(p): not an absolute path to an .app bundle" }
+        return nil
+    }
+
+    static func infoPlist(_ app: String) -> [String: Any]? {
+        guard let d = FileManager.default.contents(atPath: app + "/Contents/Info.plist") else { return nil }
+        return (try? PropertyListSerialization.propertyList(from: d, format: nil)) as? [String: Any]
+    }
+
+    /// Identity and permissions of the source, checked before the prompt (root re-verifies the staged copy).
+    static func preflight(source: String) -> String? {
+        var st = stat()
+        guard lstat(source, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else { return "\(source) is not a bundle folder" }
+        guard (infoPlist(source)?["CFBundleIdentifier"] as? String) == bundleID else { return "\(source) is not \(Product.name) (bundle id must be \(bundleID))" }
+        if let bad = worldWritable(source) { return "refusing \(source): \(bad) can be changed by every user on this Mac" }
+        guard run("/usr/bin/codesign", ["--verify", "--strict", "--deep", "-R=identifier \"\(bundleID)\"", source]).status == 0 else {
+            return "\(source) fails code signature verification"
+        }
+        return nil
+    }
+
+    /// First world-writable file or folder in the bundle (symlinks are skipped: their mode is meaningless).
+    static func worldWritable(_ root: String) -> String? {
+        var st = stat()
+        if lstat(root, &st) == 0, st.st_mode & S_IWOTH != 0 { return root }
+        guard let e = FileManager.default.enumerator(atPath: root) else { return root }
+        var n = 0
+        while let rel = e.nextObject() as? String {
+            n += 1; if n > 200_000 { return root + " (too many files)" }
+            let p = root + "/" + rel
+            if lstat(p, &st) == 0, (st.st_mode & S_IFMT) != S_IFLNK, st.st_mode & S_IWOTH != 0 { return p }
+        }
+        return nil
+    }
+
+    /// Dot-separated numeric compare; nil when either side isn't a plain version.
+    static func compareVersions(_ a: String, _ b: String) -> Int? {
+        func parts(_ s: String) -> [Int]? {
+            let c = s.split(separator: ".", omittingEmptySubsequences: false)
+            guard !c.isEmpty, c.count <= 6 else { return nil }
+            var out: [Int] = []
+            for x in c { guard !x.isEmpty, x.count <= 15, x.allSatisfy({ $0.isASCII && $0.isNumber }), let v = Int(x) else { return nil }; out.append(v) }
+            return out
+        }
+        guard let x = parts(a), let y = parts(b) else { return nil }
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p < q ? -1 : 1 }
+        }
+        return 0
+    }
+
+    /// Refuses replacing a newer installed copy (or something that isn't ours) unless --allow-downgrade.
+    static func downgradeReason(source: String, dest: String, allow: Bool) -> String? {
+        var st = stat()
+        guard lstat(dest, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else { return nil }
+        guard let old = infoPlist(dest), (old["CFBundleIdentifier"] as? String) == bundleID else {
+            return "\(dest) exists and is not \(Product.name); refusing to replace it"
+        }
+        if allow { return nil }
+        let new = infoPlist(source) ?? [:]
+        let s = compareVersions(new["CFBundleShortVersionString"] as? String ?? "", old["CFBundleShortVersionString"] as? String ?? "")
+        var c = s
+        if s == 0 { c = compareVersions(new["CFBundleVersion"] as? String ?? "", old["CFBundleVersion"] as? String ?? "") }
+        guard let r = c else { return "can't compare versions with \(dest); pass --allow-downgrade to replace it anyway" }
+        return r < 0 ? "\(dest) is newer than \(source); refusing to downgrade (pass --allow-downgrade to force)" : nil
+    }
+
+    /// Same format as rampart-setup.sh cdhash_of: "arch=cdhash,..." for every slice of the main executable.
+    static func cdhash(_ app: String) -> String? {
+        let exe = app + "/Contents/MacOS/" + ((infoPlist(app)?["CFBundleExecutable"] as? String) ?? "Rampart")
+        let archs = run("/usr/bin/lipo", ["-archs", exe]).out.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init)
+        guard !archs.isEmpty, archs.count <= 8 else { return nil }
+        var out: [String] = []
+        for a in archs {
+            guard a.range(of: "^[a-z0-9_.]{1,16}$", options: .regularExpression) != nil else { return nil }
+            let r = run("/usr/bin/codesign", ["-dvvv", "--arch", a, app])
+            guard let line = r.out.split(separator: "\n").first(where: { $0.hasPrefix("CDHash=") }) else { return nil }
+            let h = line.dropFirst("CDHash=".count).lowercased()
+            guard h.range(of: "^[0-9a-f]{40}$", options: .regularExpression) != nil else { return nil }
+            out.append("\(a)=\(h)")
+        }
+        return out.joined(separator: ",")
+    }
+
+    static func run(_ exe: String, _ args: [String]) -> (status: Int32, out: String) {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: exe); p.arguments = args
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+        do { try p.run() } catch { return (-1, "") }
+        let d = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+        return (p.terminationStatus, String(data: d, encoding: .utf8) ?? "")
+    }
+
+    /// The /bin/sh script run once as root. The staged copy is verified inline BEFORE any of its code runs.
+    static func rootScript(command: String, source: String, dest: String, pin: String, keepData: Bool, allowDowngrade: Bool) -> String {
+        let app = "\"$S/Rampart.app\""
+        var s = "set -eu; umask 022; "
+        s += "S=$(/usr/bin/mktemp -d \(stagePrefix).XXXXXX); trap '/bin/rm -rf \"$S\"' EXIT; "
+        s += "/usr/bin/ditto \(shq(source)) \(app); /usr/sbin/chown -R root:wheel \(app); /bin/chmod -R go-w \(app); "
+        s += "/usr/bin/xattr -dr com.apple.quarantine \(app) 2>/dev/null || true; "
+        s += "/usr/bin/codesign --verify --strict --deep -R='identifier \"\(bundleID)\"' \(app) || { echo 'The copy failed signature verification; nothing was changed.' >&2; exit 65; }; "
+        s += "H=''; for A in $(/usr/bin/lipo -archs \"$S/Rampart.app/Contents/MacOS/Rampart\"); do "
+        s += "C=$(/usr/bin/codesign -dvvv --arch \"$A\" \(app) 2>&1 | /usr/bin/sed -n 's/^CDHash=//p' | /usr/bin/head -1 | /usr/bin/tr A-F a-f); H=\"${H:+$H,}$A=$C\"; done; "
+        s += "[ \"$H\" = \(shq(pin)) ] || { echo 'The app changed after you approved it; nothing was changed.' >&2; exit 65; }; "
+        let setup = "\"$S/Rampart.app/Contents/Resources/rampart-setup.sh\""
+        if command == "install" {
+            s += "/bin/bash \(setup) place-staged \"$S\" \(shq(dest)) --expect-cdhash \(shq(pin))\(allowDowngrade ? " --allow-downgrade" : "")"
+        } else {
+            s += "RAMPART_APP=\(shq(dest)) /bin/bash \(setup) uninstall\(keepData ? " --keep-data" : "")"
+        }
+        return s
+    }
+}
+
 // Commands that don't need a transport.
 switch command {
 case "install", "uninstall":
     // One administrator authorization; afterwards the root daemon does every privileged task without prompts.
+    // Security (docs/security/harden-hx7.md): the bundle the user approved is pinned by cdhash here; the root
+    // script copies it into a root-only staging folder, verifies the COPY (strict codesign + same cdhash) and
+    // only then runs the copy's rampart-setup.sh. Editing the source during or after the prompt can't change
+    // what runs as root. Paths with control characters are refused; everything else is quoted twice
+    // (shell single quotes inside an AppleScript string literal).
     let guiAuth = flag("--gui-auth"), dry = flag("--dry-run"), keepData = flag("--keep-data")
+    let allowDowngrade = flag("--allow-downgrade")
+    // First, before anything else can go wrong: never show an administrator dialog in dev/test runs.
+    if !dry && guiAuth && Privileged.noPrivilegedTools { fail("refusing to show an administrator dialog (RAMPART_NO_PRIVILEGED_TOOLS=1); use --dry-run") }
     let appArg = option("--app")
-    guard let src = locateApp(appArg) else { fail("can't find Rampart.app (pass --app /path/to/Rampart.app)") }
-    // Destination: if the source is already in /Applications, install in place (never delete it).
-    // Names are compared by real file identity, because APFS is case-insensitive ("RamPart.app" == "Rampart.app").
-    func realPath(_ p: String) -> String { (p as NSString).resolvingSymlinksInPath.lowercased() }
-    func sameFile(_ a: String, _ b: String) -> Bool {
-        var sa = stat(), sb = stat()
-        guard stat(a, &sa) == 0, stat(b, &sb) == 0 else { return false }
-        return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino
-    }
-    let preferred = "/Applications/\(Product.name).app"
-    let srcInApplications = realPath(src).hasPrefix("/applications/")
-    let dest = srcInApplications ? src : preferred
-    var script: String
-    if command == "install" {
-        script = ""
-        if !srcInApplications && !sameFile(src, dest) && realPath(src) != realPath(dest) {
-            // Copy to a temporary name first, then swap, so a failed copy never leaves the user without the app.
-            let tmp = "/Applications/.\(Product.name)-installing.app"
-            script += "/bin/launchctl bootout system/app.rampart.daemon 2>/dev/null; /bin/rm -rf \(shq(tmp)) && /usr/bin/ditto \(shq(src)) \(shq(tmp)) && /bin/rm -rf \(shq(dest)) && /bin/mv \(shq(tmp)) \(shq(dest)) && /usr/sbin/chown -R root:wheel \(shq(dest)) && /usr/bin/xattr -dr com.apple.quarantine \(shq(dest)) 2>/dev/null; "
-        }
-        script += "RAMPART_APP=\(shq(dest)) /bin/bash \(shq(dest + "/Contents/Resources/rampart-setup.sh")) install"
-    } else {
-        let setup = src + "/Contents/Resources/rampart-setup.sh"
-        script = "/bin/bash \(shq(setup)) uninstall\(keepData ? " --keep-data" : "")"
-    }
+    guard let located = locateApp(appArg) else { fail("can't find Rampart.app (pass --app /path/to/Rampart.app)") }
+    let src = InstallPlan.canonical(located)
+    if let why = InstallPlan.unsafePathReason(src) { fail("refusing \(why)") }
+    // Always the canonical name; APFS is case-insensitive, so this is also "/Applications/RamPart.app".
+    var dest = "/Applications/Rampart.app"
+    if dry, let t = ProcessInfo.processInfo.environment["RAMPART_TEST_INSTALL_DEST"], !t.isEmpty { dest = t }  // dry runs only
+    if let why = InstallPlan.unsafePathReason(dest) { fail("refusing destination \(why)") }
+    if let why = InstallPlan.preflight(source: src) { fail(why) }
+    if command == "install", let why = InstallPlan.downgradeReason(source: src, dest: dest, allow: allowDowngrade) { fail(why) }
+    guard let pin = InstallPlan.cdhash(src) else { fail("can't read the code signature of \(src)") }
+    let script = InstallPlan.rootScript(command: command, source: src, dest: dest, pin: pin,
+                                        keepData: keepData, allowDowngrade: allowDowngrade)
     let prompt = command == "install"
         ? "\(Product.name) needs your permission once to install its protection service."
         : "\(Product.name) needs your permission to remove its protection service."
     let apple = "do shell script \"\(asq(script))\" with administrator privileges with prompt \"\(asq(prompt))\""
-    if !dry && guiAuth && Privileged.noPrivilegedTools { fail("refusing to show an administrator dialog (RAMPART_NO_PRIVILEGED_TOOLS=1); use --dry-run") }
     if dry || !guiAuth {
-        if json { emitJSON(["shell": script, "osascript": apple]); exit(0) }
+        if json { emitJSON(["shell": script, "osascript": apple, "cdhash": pin, "source": src, "destination": dest]); exit(0) }
         print(guiAuth ? "Would run (one administrator prompt):" : "Run this with sudo, or pass --gui-auth for a password dialog:")
         print(guiAuth ? "  /usr/bin/osascript -e \(shq(apple))" : "  sudo /bin/sh -c \(shq(script))")
         exit(0)
@@ -156,7 +279,7 @@ case "install", "uninstall":
     let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     if p.terminationStatus != 0 {
         if errText.contains("-128") { fail("cancelled", code: 3) }
-        fail("\(command) failed: \(errText.trimmingCharacters(in: .whitespacesAndNewlines))")
+        fail("\(command) failed: \(String(errText.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400)))")
     }
     if json { emitJSON(["ok": true]) } else { print(command == "install" ? "\(Product.name) system protection is installed." : "\(Product.name) was removed.") }
     exit(0)
@@ -185,6 +308,20 @@ if local {
 
 /// Runs a request and returns the terminal response.
 func call(_ r: IPCRequest, progress: ((IPCResponse) -> Void)? = nil) -> IPCResponse {
+    var final = rawCall(r, progress: progress)
+    // hx10: protection-weakening calls from the CLI need an administrator-confirmed settings session opened by this
+    // same process. Run the admin flow once (interactive terminals only), then retry.
+    if case .error(let m) = final, CLISettingsSession.isSessionDenial(m) {
+        switch CLISettingsSession.open(call: { rawCall($0) }) {
+        case .success: final = rawCall(r, progress: progress)
+        case .failure(let why): final = .error("\(m)\n\(why)")
+        }
+    }
+    if case .error(let m) = final { if json { emitJSON(["error": m]) }; fail(m) }
+    return final
+}
+
+func rawCall(_ r: IPCRequest, progress: ((IPCResponse) -> Void)? = nil) -> IPCResponse {
     var final: IPCResponse = .error("no response")
     do {
         try transport.request(r) { resp in
@@ -192,7 +329,6 @@ func call(_ r: IPCRequest, progress: ((IPCResponse) -> Void)? = nil) -> IPCRespo
             progress?(resp); return true
         }
     } catch { fail(error.localizedDescription) }
-    if case .error(let m) = final { if json { emitJSON(["error": m]) }; fail(m) }
     return final
 }
 
@@ -241,7 +377,7 @@ case "scan":
         return e.hasPrefix("/") ? e : FileManager.default.currentDirectoryPath + "/" + e
     }
     let r = call(.scan(paths: paths, quick: quick)) { resp in
-        if !json, isTTY, case .scanProgress(let n, let total, let cur) = resp {
+        if !json, isTTY, case .scanProgress(let n, let total, let cur, _, _, _) = resp {
             err("\r\u{1B}[K  scanned \(n)/\(total)  \(String(cur.suffix(60)))")
         }
     }

@@ -28,6 +28,8 @@ final class SocketTransport: Transport {
     let path: String
     init(path: String) { self.path = path }
 
+    static func trustedPeer(uid: uid_t, me: uid_t = getuid()) -> Bool { uid == 0 || uid == me }
+
     static func resolve(explicit: String?, user: Bool) throws -> SocketTransport {
         if let e = explicit { return SocketTransport(path: e) }
         if user { return SocketTransport(path: IPC.userSocketPath) }
@@ -51,6 +53,16 @@ final class SocketTransport: Transport {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
         if rc != 0 { let e = String(cString: strerror(errno)); close(fd); throw ClientError.connect(path, e) }
+        // Only trust a daemon run by root or by us: another local user can't pose as rampartd (fake "clean"
+        // verdicts, attacker text shown as RamPart's voice) by squatting a socket path.
+        var peerUID: uid_t = 0, peerGID: gid_t = 0
+        guard getpeereid(fd, &peerUID, &peerGID) == 0, SocketTransport.trustedPeer(uid: peerUID) else {
+            close(fd); throw ClientError.connect(path, "the process on this socket isn't rampartd (owned by another user)")
+        }
+        // hx8: same socket-file and peer-signature policy as the app (RampartShared.DaemonPeerPolicy).
+        if let why = DaemonPeerPolicy.connectedPeerProblem(fd: fd, path: path) {
+            close(fd); throw ClientError.connect(path, "the process on this socket isn't rampartd (\(why))")
+        }
         return fd
     }
 

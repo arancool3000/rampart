@@ -39,6 +39,15 @@ public final class DomainBlocklist: @unchecked Sendable {
         "localhost", "localhost.localdomain", "local", "broadcasthost", "ip6-localhost", "ip6-loopback",
         "ip6-localnet", "ip6-mcastprefix", "ip6-allnodes", "ip6-allrouters", "ip6-allhosts", "0.0.0.0",
     ]
+    /// Common two-label public suffixes (hx4): a feed entry like `co.uk` would block a whole country.
+    static let publicSuffixes: Set<String> = [
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "com.au", "net.au", "org.au",
+        "edu.au", "gov.au", "co.nz", "org.nz", "co.jp", "ne.jp", "or.jp", "ac.jp", "co.kr", "co.in", "co.za",
+        "com.br", "com.cn", "com.mx", "com.ar", "com.tr", "com.tw", "com.hk", "com.sg", "co.il", "com.ua", "com.pl",
+        "co.id", "com.my", "com.ph", "com.vn", "com.co", "com.pe", "com.sa", "com.eg", "github.io", "gitlab.io",
+        "pages.dev", "workers.dev", "netlify.app", "vercel.app", "herokuapp.com", "azurewebsites.net",
+        "cloudfront.net", "amazonaws.com", "appspot.com", "web.app", "firebaseapp.com", "blogspot.com",
+    ]
 
     /// Lowercases, strips `*.`/leading/trailing dots and validates the hostname charset (ASCII / punycode only).
     public static func normalizeDomain(_ raw: Substring) -> String? {
@@ -46,7 +55,7 @@ public final class DomainBlocklist: @unchecked Sendable {
         if s.hasPrefix("*.") { s.removeFirst(2) }
         while s.hasPrefix(".") { s.removeFirst() }
         while s.hasSuffix(".") { s.removeLast() }
-        guard !s.isEmpty, s.count <= 253, s.contains("."), !ignoredNames.contains(s) else { return nil }
+        guard !s.isEmpty, s.count <= 253, s.contains("."), !ignoredNames.contains(s), !publicSuffixes.contains(s) else { return nil }
         for c in s.utf8 {
             let ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 46 || c == 95
             if !ok { return nil }
@@ -79,7 +88,7 @@ public final class DomainBlocklist: @unchecked Sendable {
 
     /// Parses list text. `auto` detects per line: hosts (`0.0.0.0 x`), adblock (`||x^`, `@@||x^` = allow), plain (`x`, `*.x`).
     @discardableResult
-    public func load(text: String, format: Format = .auto, source: String) -> ParseStats {
+    public func load(text: String, format: Format = .auto, source: String, acceptAllowRules: Bool = true) -> ParseStats {
         var stats = ParseStats()
         var blob: [UInt8] = [], offsets: [UInt32] = [0], allows: [String] = []
         text.enumerateLines { line, _ in
@@ -87,7 +96,7 @@ public final class DomainBlocklist: @unchecked Sendable {
             switch Self.parseLine(Substring(line), format: format) {
             case .block(let d):
                 blob += SuffixTable.reversedKey(d); offsets.append(UInt32(blob.count))
-            case .allow(let d): allows.append(d)
+            case .allow(let d): if acceptAllowRules { allows.append(d) } else { stats.skipped += 1 }
             case .skip: stats.skipped += 1
             case .ignore: break
             }

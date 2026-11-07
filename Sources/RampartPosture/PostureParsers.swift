@@ -53,6 +53,20 @@ public enum PostureParsers {
         return .unknown()
     }
 
+    // MARK: 2b Signed System Volume — `csrutil authenticated-root status`
+    /// Apple's built-in apps (Music, Safari's system parts, ...) live on a sealed, read-only system volume.
+    public static func ssv(_ s: String) -> ParseOutcome {
+        let l = lower(s)
+        guard l.contains("authenticated root") else { return .unknown() }
+        if l.contains("status: enabled") {
+            return .init(.pass, "The system volume is sealed. Apple's built-in apps like Music live on this sealed, read-only volume; RamPart checks the seal and their signatures.")
+        }
+        if l.contains("status: disabled") {
+            return .init(.fail, "The sealed system volume check is turned off, so changes to macOS system files and Apple's built-in apps would not be detected by macOS.")
+        }
+        return .unknown()
+    }
+
     // MARK: 3 Gatekeeper — `spctl --status`
     public static func gatekeeper(_ s: String) -> ParseOutcome {
         let l = lower(s)

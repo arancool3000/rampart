@@ -58,6 +58,13 @@ final class BrowserTab: Identifiable {
     @ObservationIgnored private var observations: [NSKeyValueObservation] = []
     @ObservationIgnored private var delegate: TabDelegate!
     @ObservationIgnored var policy = URLDecisionPolicy()
+    /// hx6: facts for every main-frame hop since the last user-initiated navigation (redirects, JS
+    /// location changes), so a download at the end of a chain is judged by the whole chain.
+    @ObservationIgnored var chainFacts: [URLFacts] = []
+    @ObservationIgnored var chainHops = 0
+    /// hx6: JS dialogs shown since the last navigation; past the limit they are answered silently.
+    @ObservationIgnored var dialogCount = 0
+    static let dialogLimit = 3
 
     init(model: BrowserModel, configuration: WKWebViewConfiguration) {
         self.model = model
@@ -97,6 +104,7 @@ final class BrowserTab: Identifiable {
 
     func load(_ u: URL) {
         interstitial = nil; blockedURL = nil; loadError = nil; pageVerdict = .clean
+        chainFacts = []; chainHops = 0; dialogCount = 0
         webView.load(URLRequest(url: u, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 30))
     }
     func loadTyped(_ text: String) { if let u = URLDecisionPolicy.resolveTyped(text) { load(u) } }
@@ -110,7 +118,9 @@ final class BrowserTab: Identifiable {
         guard let u = blockedURL else { return }
         let host = (u.host ?? "").lowercased()
         if let d = blockedDecision, d.risks.contains(.plainHTTP) { policy.httpAllowedHosts.insert(host) }
-        else { WebEngineAdapter.shared.allow(host: host) }
+        // hx6: "Continue anyway" lasts for this app session only (it used to write the shared, persistent
+        // allowlist, silently trusting the host and all its subdomains in Safari and future sessions too).
+        else { WebEngineAdapter.shared.allowForSession(host: host) }
         load(u)
     }
 
@@ -129,6 +139,10 @@ final class BrowserTab: Identifiable {
         let f = WebEngineAdapter.shared.facts(for: u)
         let host = (u.host ?? "").lowercased()
         let decision = policy.decide(url: u, facts: f, isMainFrame: main, httpUpgradeFailed: upgradeFailedHosts.contains(host))
+        if main {
+            if action.navigationType != .other { chainFacts = []; chainHops = 0 } else { chainHops += 1 }
+            if chainFacts.count < 32 { chainFacts.append(f) }
+        }
         switch decision {
         case .allow:
             if action.shouldPerformDownload { return .download }
@@ -196,6 +210,14 @@ final class BrowserTab: Identifiable {
         if !findings.isEmpty { findingsArrived(findings) }
     }
 
+    /// hx6: dialog-loop guard. A page gets `dialogLimit` dialogs per navigation; later ones (and any
+    /// that arrive while one is showing, or over an interstitial) are answered as "Cancel" without UI.
+    func admitDialog() -> Bool {
+        guard dialog == nil, interstitial == nil, dialogCount < Self.dialogLimit else { return false }
+        dialogCount += 1
+        return true
+    }
+
     func updateIdentity(_ trust: SecTrust?) {
         guard let u = url, let host = u.host else { identity = nil; return }
         guard let trust else { identity = IdentitySummary(host: host, encrypted: u.scheme == "https"); return }
@@ -231,11 +253,18 @@ final class TabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
         let u = response?.url ?? request?.url
         let host = (u?.host ?? "").lowercased()
         let name = response?.suggestedFilename ?? u?.lastPathComponent ?? "download"
-        let risky = tab.facts.scamVerdict != .likelySafe || tab.facts.blocklistHit != nil
+        // hx6: judge the source by the page, every hop that led here, and the download URL itself.
+        let here = u.map { WebEngineAdapter.shared.facts(for: $0) } ?? URLFacts()
+        let risky = DownloadPolicy.isRiskySource(hops: [tab.facts] + tab.chainFacts + [here], redirectCount: tab.chainHops)
         _ = DownloadManager.shared.begin(download, suggestedFilename: name, mimeType: response?.mimeType, sourceHost: host, risky: risky, bankingMode: tab.model.bankingMode)
         tab.model.showDownloads = true
     }
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { tab?.loadError = nil; tab?.pageVerdict = .clean; tab?.findMatches = nil }
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        tab?.dialogCount = 0
+        // hx6: a pending camera/mic prompt belongs to the page that asked; a new page never inherits it.
+        if let p = tab?.permissionPrompt { tab?.permissionPrompt = nil; p.decide(false) }
+    }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         tab?.provisionalFailed(error, url: (error as NSError).userInfo[NSURLErrorFailingURLErrorKey] as? URL)
     }
@@ -259,20 +288,28 @@ final class TabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptM
     }
     func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin, initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType, decisionHandler: @escaping (WKPermissionDecision) -> Void) {
         let kind: PermissionPrompt.Kind = type == .camera ? .camera : type == .microphone ? .microphone : .cameraAndMicrophone
-        guard let tab, frame.isMainFrame else { decisionHandler(.deny); return }
-        tab.permissionPrompt = PermissionPrompt(kind: kind, origin: origin.host) { decisionHandler($0 ? .grant : .deny) }
+        guard let tab, frame.isMainFrame, tab.interstitial == nil else { decisionHandler(.deny); return }
+        // hx6: only http(s) origins may ask, and only one prompt at a time: a second request while one is
+        // showing is denied (it used to replace the first, swapping the origin under the user's click and
+        // dropping the earlier completion handler).
+        guard ["https", "http"].contains(origin.protocol.lowercased()), tab.permissionPrompt == nil else { decisionHandler(.deny); return }
+        var answered = false
+        tab.permissionPrompt = PermissionPrompt(kind: kind, origin: PromptText.origin(origin.host)) { ok in
+            guard !answered else { return }; answered = true
+            decisionHandler(ok ? .grant : .deny)
+        }
     }
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
-        guard let tab else { completionHandler(); return }
-        tab.dialog = PageDialog(kind: .alert, origin: frame.securityOrigin.host, message: message) { _, _ in completionHandler() }
+        guard let tab, tab.admitDialog() else { completionHandler(); return }
+        tab.dialog = PageDialog(kind: .alert, origin: PromptText.origin(frame.securityOrigin.host), message: PromptText.message(message)) { _, _ in completionHandler() }
     }
     func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
-        guard let tab else { completionHandler(false); return }
-        tab.dialog = PageDialog(kind: .confirm, origin: frame.securityOrigin.host, message: message) { ok, _ in completionHandler(ok) }
+        guard let tab, tab.admitDialog() else { completionHandler(false); return }
+        tab.dialog = PageDialog(kind: .confirm, origin: PromptText.origin(frame.securityOrigin.host), message: PromptText.message(message)) { ok, _ in completionHandler(ok) }
     }
     func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
-        guard let tab else { completionHandler(nil); return }
-        tab.dialog = PageDialog(kind: .prompt(defaultText: defaultText ?? ""), origin: frame.securityOrigin.host, message: prompt) { ok, text in completionHandler(ok ? text : nil) }
+        guard let tab, tab.admitDialog() else { completionHandler(nil); return }
+        tab.dialog = PageDialog(kind: .prompt(defaultText: String((defaultText ?? "").prefix(1000))), origin: PromptText.origin(frame.securityOrigin.host), message: PromptText.message(prompt)) { ok, text in completionHandler(ok ? text : nil) }
     }
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
         // File uploads are allowed but always through the system panel, which the page cannot pre-fill.

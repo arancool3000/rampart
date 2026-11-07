@@ -197,11 +197,41 @@ public final class SocketSource: EventSource, CPUReporting {
             if t.localIP == "0.0.0.0" || t.localIP == "::" || t.localIP.isEmpty { detail["local_ip"] = t.localIP.isEmpty ? "*" : t.localIP }
         } else {
             detail["remote_ip"] = t.remoteIP; detail["remote_port"] = String(t.remotePort)
+            if let host = DNSAnswerCache.shared.host(for: t.remoteIP) { detail["remote_host"] = host }
         }
         if !t.state.isEmpty { detail["state"] = t.state }
         if let id = entry.identity { detail["signing"] = id.tier }
         if existing { detail["existing"] = "1" }
         emitted += 1
         handler?(SecurityEvent(kind: .networkConnect, process: proc, path: entry.path, detail: detail, source: name))
+    }
+}
+
+/// IP → hostname map fed from DNS answers (EventHub records `dnsQuery` events that carry `answers`; the DNS
+/// filter can call `record` directly), so `SocketSource` can label a connection with `remote_host`.
+/// Bounded (LRU-ish, 4096 entries, 1 h TTL). Honest limit: a host resolved through DoH or a hard-coded IP never
+/// appears here.
+public final class DNSAnswerCache: @unchecked Sendable {
+    public static let shared = DNSAnswerCache()
+    public var capacity = 4096
+    public var ttl: TimeInterval = 3600
+    private var map: [String: (host: String, at: Date)] = [:]
+    private let lock = NSLock()
+    public init() {}
+
+    public func record(ip: String, host: String, at: Date = Date()) {
+        let h = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        guard !ip.isEmpty, !h.isEmpty, h.count <= 253, ip.count <= 45 else { return }
+        lock.lock(); defer { lock.unlock() }
+        map[ip] = (h, at)
+        if map.count > capacity {
+            let cutoff = map.values.map(\.at).sorted()[map.count / 4]
+            map = map.filter { $0.value.at > cutoff }
+        }
+    }
+    public func host(for ip: String, now: Date = Date()) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        guard let e = map[ip], now.timeIntervalSince(e.at) <= ttl else { return nil }
+        return e.host
     }
 }

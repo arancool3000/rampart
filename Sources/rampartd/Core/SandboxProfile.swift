@@ -79,11 +79,50 @@ enum SandboxProfile {
         return "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 
-    /// Strict profile: no network, writes only inside `workDir`, sensitive reads denied, exec only `allowedExec`,
-    /// no fork. Later rules win in SBPL, so the denies come last.
+    /// Real interpreter binary for a mapped interpreter. /usr/bin/python3 is an xcode-select shim that can run xcrun
+    /// (writes caches, may offer to install tools), so it is resolved to the Command Line Tools binary or refused.
+    static func resolvedInterpreter(_ interp: String, isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }) -> String? {
+        if interp == "/usr/bin/python3" {
+            let clt = "/Library/Developer/CommandLineTools/usr/bin/python3"
+            return isExecutable(clt) ? clt : nil
+        }
+        return isExecutable(interp) ? interp : nil
+    }
+
+    /// Flags that stop interpreters loading code from outside the item: python -I (no user site-packages, no PYTHON*
+    /// variables, script folder not on sys.path) and -B (no .pyc writes); zsh -f (no rc files); ruby without gems.
+    static func interpreterArguments(_ interp: String) -> [String] {
+        if interp.hasSuffix("/python3") || interp.contains("Python3.framework") { return ["-I", "-B"] }
+        switch (interp as NSString).lastPathComponent {
+        case "zsh": return ["-f"]
+        case "bash": return ["--noprofile", "--norc"]
+        case "ruby": return ["--disable-gems"]
+        default: return []
+        }
+    }
+
+    /// The only places the item may read file contents from (besides its own folder): the OS, the interpreters,
+    /// time zone data and a few devices. Everything else, including every home folder, other users' temp
+    /// folders, /usr/local and external volumes, is unreadable. Metadata (stat) stays allowed outside /Users and
+    /// /Volumes because path resolution needs it.
+    static let readableRoots = ["/System", "/usr/lib", "/usr/share", "/usr/libexec", "/usr/bin", "/bin", "/sbin",
+                                "/Library/Developer/CommandLineTools", "/private/var/db/timezone"]
+    static let readableLiterals = ["/", "/dev/null", "/dev/zero", "/dev/random", "/dev/urandom", "/private/etc/localtime",
+                                   "/private/var/select/sh", "/private/var/select/developer_dir"]
+    /// Always unreadable, even as metadata (later rules win in SBPL).
+    static let unreadableRoots = ["/Users", "/Volumes", "/usr/local", "/private/var/root", "/Library/Keychains"]
+
+    static let diskLimitBytes: UInt64 = 256 << 20
+    static let diskLimitEntries = 20_000
+
+    /// Strict profile (hx3 review): deny by default; no network, fork, mach-lookup, IOKit, IPC or file-write outside
+    /// `workDir`; exec only `allowedExec`; file contents readable only from the OS roots above and `workDir`.
+    /// Later rules win in SBPL, so the denies come last.
     static func generate(workDir: String, allowedExec: [String], home: String) -> String? {
         guard workDir.hasPrefix("/"), workDir.count > 8, home.hasPrefix("/"), !allowedExec.isEmpty,
-              let w = quote(workDir) else { return nil }
+              !workDir.contains("/../"), !workDir.hasSuffix("/.."), let w = quote(workDir) else { return nil }
+        // The work folder must not sit inside a place the profile makes unreadable (it would also unlock it).
+        for r in unreadableRoots + [home] where workDir == r || workDir.hasPrefix(r + "/") { return nil }
         var execs: [String] = []
         for e in allowedExec {
             guard e.hasPrefix("/"), let q = quote(e) else { return nil }
@@ -93,18 +132,23 @@ enum SandboxProfile {
         if allowedExec.contains("/bin/sh") {
             for x in ["/bin/bash", "/bin/zsh", "/bin/dash"] where !allowedExec.contains(x) { execs.append("(literal \"\(x)\")") }
         }
-        // The CLT python3 shim re-execs the real interpreter.
-        if allowedExec.contains("/usr/bin/python3") {
+        // The CLT python3 (or the shim) re-execs the framework interpreter.
+        if allowedExec.contains(where: { $0 == "/usr/bin/python3" || $0.hasPrefix("/Library/Developer/CommandLineTools/") }) {
             execs.append("(regex #\"^/Library/Developer/CommandLineTools/usr/bin/python3(\\.[0-9]+)?$\")")
             execs.append("(regex #\"^/Library/Developer/CommandLineTools/Library/Frameworks/Python3\\.framework/\")")
         }
+        if allowedExec.contains("/usr/bin/perl") { execs.append("(regex #\"^/usr/bin/perl5\\.[0-9]+$\")") }
         var denied: [String] = []
         for f in deniedHomeFolders {
             guard let q = quote((home as NSString).appendingPathComponent(f)) else { return nil }
             denied.append("(subpath \(q))")
         }
         for f in deniedSystemFolders { denied.append("(subpath \(quote(f)!))") }
-        var p = """
+        guard let hq = quote(home) else { return nil }
+        let readable = (readableLiterals.map { "(literal \(quote($0)!))" } + readableRoots.map { "(subpath \(quote($0)!))" }
+                        + ["(subpath \(w))"]).joined(separator: " ")
+        let unreadable = (unreadableRoots.map { "(subpath \(quote($0)!))" } + ["(subpath \(hq))"]).joined(separator: " ")
+        let p = """
         ;; \(Product.name) quarantine sandbox (best effort; sandbox-exec is deprecated by Apple and is not a VM)
         (version 1)
         (deny default)
@@ -113,18 +157,88 @@ enum SandboxProfile {
         (allow process-info* (target self))
         (allow sysctl-read)
         (allow file-read*)
-        (allow file-map-executable)
+        (deny file-read-data file-read-xattr (require-not (require-any \(readable))))
+        (allow file-map-executable (subpath "/System") (subpath "/usr/lib") (subpath "/Library/Developer/CommandLineTools") (subpath \(w)))
         (allow file-read* file-write* (subpath \(w)))
         (allow file-write-data (literal "/dev/null") (literal "/dev/zero"))
-        (allow mach-lookup (global-name "com.apple.system.logger") (global-name "com.apple.system.notification_center")
-                           (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.logd"))
-        (allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))
         (deny network*)
         (deny process-fork)
+        (deny mach-lookup)
+        (deny iokit-open)
+        (deny file-write-flags file-write-owner file-link)
+        (deny file-read* file-read-metadata \(unreadable))
         (deny file-read* \(denied.joined(separator: "\n                 ")))
 
         """
         return p
+    }
+
+    /// Removes symlinks under `root` that resolve outside it or nowhere (lstat walk, never following links), so
+    /// nothing inside the item can lead to a path outside the sandbox folder. Returns the removed paths.
+    @discardableResult
+    static func removeEscapingLinks(under root: String) -> [String] {
+        guard let rr = realpath(root, nil) else { return [] }
+        let realRoot = String(cString: rr); free(rr)
+        var removed: [String] = []
+        var stack = [root]; var visited = 0
+        while let dir = stack.popLast(), visited < 100_000 {
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
+            for n in names {
+                visited += 1
+                let path = (dir as NSString).appendingPathComponent(n)
+                var st = stat()
+                guard lstat(path, &st) == 0 else { continue }
+                switch st.st_mode & S_IFMT {
+                case S_IFLNK:
+                    var ok = false
+                    if let r = realpath(path, nil) {
+                        let t = String(cString: r); free(r)
+                        ok = t == realRoot || t.hasPrefix(realRoot + "/")
+                    }
+                    if !ok, unlink(path) == 0 { removed.append(path) }
+                case S_IFDIR: stack.append(path)
+                default: break
+                }
+            }
+        }
+        return removed
+    }
+
+    /// True once the files under `paths` add up to more than `diskLimitBytes` or `diskLimitEntries` entries.
+    static func diskUsageExceeded(_ paths: [String], limitBytes: UInt64 = diskLimitBytes, limitEntries: Int = diskLimitEntries) -> Bool {
+        var total: UInt64 = 0, entries = 0
+        var stack = paths
+        while let p = stack.popLast() {
+            var st = stat()
+            guard lstat(p, &st) == 0 else { continue }
+            entries += 1
+            total += UInt64(max(0, st.st_blocks)) * 512
+            if total > limitBytes || entries > limitEntries { return true }
+            if st.st_mode & S_IFMT == S_IFDIR, let names = try? FileManager.default.contentsOfDirectory(atPath: p) {
+                stack += names.map { (p as NSString).appendingPathComponent($0) }
+            }
+        }
+        return false
+    }
+
+    /// Item output shown in the app: strips terminal escapes, control characters and bidirectional overrides so it
+    /// can't redraw the window text or reverse a file name. Keeps newlines and tabs.
+    static func sanitizeOutput(_ s: String) -> String {
+        var out = String.UnicodeScalarView()
+        var it = s.unicodeScalars.makeIterator()
+        while let c = it.next() {
+            if c == "\u{1B}" {   // ESC [ ... final byte, or ESC + one char
+                if let n = it.next(), n == "[" { while let m = it.next(), !(0x40...0x7E).contains(m.value) {} }
+                continue
+            }
+            switch c.value {
+            case 0x0A, 0x09: out.append(c)
+            case 0x00...0x1F, 0x7F...0x9F: continue
+            case 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069, 0x061C: continue
+            default: out.append(c)
+            }
+        }
+        return String(out)
     }
 
     /// Parses Sandbox violation lines ("Sandbox: name(123) deny(1) file-read-data /path") for the given pids.
@@ -138,8 +252,8 @@ enum SandboxProfile {
             guard let r = re.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)),
                   let pid = Int32(ns.substring(with: r.range(at: 2))), pids.contains(pid) else { continue }
             let target = r.range(at: 4).location == NSNotFound ? "" : ns.substring(with: r.range(at: 4))
-            let v = SandboxReport.Violation(process: ns.substring(with: r.range(at: 1)), pid: pid,
-                                            operation: ns.substring(with: r.range(at: 3)), target: String(target.prefix(1024)))
+            let v = SandboxReport.Violation(process: sanitizeOutput(ns.substring(with: r.range(at: 1))), pid: pid,
+                                            operation: ns.substring(with: r.range(at: 3)), target: sanitizeOutput(String(target.prefix(1024))))
             if seen.insert(v).inserted { out.append(v) }
             if out.count >= 2000 { break }
         }

@@ -14,10 +14,21 @@ public final class EventHub {
         public var perSourceBurst: Double = 5000
         /// Max undelivered events. When full, low-priority (file) events are dropped first.
         public var bufferCapacity: Int = 20_000
+        /// Hard safety cap for the critical-event queue (xprotect/persistence/tcc/xattr-delete). These are
+        /// never shed by normal backpressure; only a pathological flood past this much larger cap sheds them.
+        public var critBufferCapacity: Int = 200_000
         public var mute: MutePolicy = .standard
         /// Feed clipboard events received from another process (session agent) into `clipboardMemory`.
         /// Leave false when the ClipboardSource runs in this process with the same memory.
         public var ingestRemoteClipboard = false
+        /// How often the health monitor checks that every started source is still alive.
+        public var healthCheckInterval: TimeInterval = 15
+        /// If > 0, a started source that has delivered events but then goes silent for this long is treated
+        /// as blinded (off by default: many sources are legitimately quiet).
+        public var sourceSilence: TimeInterval = 0
+        /// Paths where RamPart's own helpers legitimately live (for impostor detection). The daemon adds its
+        /// real/development binary path so it never flags itself.
+        public var rampartInstallPaths: [String] = RampartService.installPrefixes
         public init() {}
     }
 
@@ -43,7 +54,23 @@ public final class EventHub {
         "/usr/bin/codesign", "/usr/bin/nc", "/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/zip", "/usr/bin/unzip",
         "/usr/bin/tar", "/usr/bin/funzip", "/usr/bin/pbpaste", "/usr/bin/pbcopy", "/usr/bin/sudo",
         "/usr/bin/env", "/usr/bin/open", "/usr/bin/chflags", "/bin/chmod", "/usr/sbin/chown", "/bin/cp", "/bin/mv",
+        // Writers seen in persistence / trust tampering (X6 T-X6-2); low exec volume.
+        "/usr/bin/tee", "/usr/libexec/PlistBuddy", "/usr/bin/plutil", "/usr/bin/defaults", "/usr/bin/at", "/usr/bin/sed",
+        "/usr/sbin/sysadminctl", "/usr/sbin/dseditgroup", "/usr/libexec/ApplicationFirewall/socketfilterfw", "/sbin/pfctl",
+        "/usr/bin/log", "/usr/sbin/scutil", "/usr/sbin/networksetup", "/usr/bin/profiles", "/usr/bin/lldb", "/usr/bin/vmmap",
+        "/usr/bin/leaks", "/usr/bin/sample", "/usr/bin/rsync", "/usr/bin/sftp", "/bin/rm", "/bin/dd",
+        "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart",
     ]
+
+    /// File events on these persistence- or trust-critical paths are never muted, whoever writes them (T-X6-2).
+    public static let criticalPathPrefixes = ["/private/etc/", "/etc/", "/Library/LaunchAgents/", "/Library/LaunchDaemons/",
+        "/usr/lib/cron/", "/private/var/at/", "/Library/Security/SecurityAgentPlugins/", "/usr/local/lib/pam/",
+        "/Library/Preferences/SystemConfiguration/", "/Library/Managed Preferences/", "/Library/DirectoryServices/PlugIns/"]
+    public static let criticalPathInfixes = ["/Library/LaunchAgents/", "/.ssh/", "/External Extensions/", "/NativeMessagingHosts/"]
+
+    static func isCriticalPath(_ path: String) -> Bool {
+        criticalPathPrefixes.contains(where: path.hasPrefix) || criticalPathInfixes.contains(where: path.contains)
+    }
 
     public struct Stats: Codable, Sendable, Equatable {
         public var received = 0
@@ -51,7 +78,11 @@ public final class EventHub {
         public var muted = 0
         public var deduped = 0
         public var rateLimited = 0
+        /// High-priority security events admitted past an exhausted token bucket (never dropped).
+        public var rateLimitExempt = 0
         public var overflowDropped = 0
+        /// Critical security events shed — only ever non-zero under extreme, pathological memory pressure.
+        public var criticalDropped = 0
         public var perSource: [String: Int] = [:]
         public var buffered = 0
     }
@@ -61,14 +92,25 @@ public final class EventHub {
     /// `clipboard_match=1`, `clipboard_exact`, `clipboard_overlap`, `clipboard_class`, `clipboard_reasons`,
     /// `clipboard_source_app`, `clipboard_age` (seconds).
     public var clipboardMemory: ClipboardMemory?
+    /// Called when the hub synthesises a Detection of its own: a telemetry source went blind
+    /// ("lost its event feed") or a process is impersonating a RamPart helper. The daemon routes these to
+    /// the detection store / UI so protection state can flip to "not protected".
+    public var onDetection: ((Detection) -> Void)?
     private let lock = NSLock()
+    private let selfPid = getpid()
+    private var healthTimer: DispatchSourceTimer?
+    private var startedSources: Set<String> = []
+    private var downSources: Set<String> = []
+    private var lastEventAt: [String: TimeInterval] = [:]
+    private let healthQueue = DispatchQueue(label: "app.rampart.telemetry.hub.health", qos: .utility)
     private var sources: [EventSource] = []
     private var running: [String: Bool] = [:]
     private var errors: [String: String] = [:]
     private var handler: ((SecurityEvent) -> Void)?
+    private var crit: [SecurityEvent] = []   // critical security events: never rate-limited, never shed
     private var high: [SecurityEvent] = []   // FIFO via head index
     private var low: [SecurityEvent] = []
-    private var highHead = 0, lowHead = 0
+    private var critHead = 0, highHead = 0, lowHead = 0
     private var draining = false
     private var recent: [DedupeKey: TimeInterval] = [:]
     private var lastPrune: TimeInterval = 0
@@ -94,18 +136,85 @@ public final class EventHub {
             }
             do {
                 try s.start { [weak self] ev in self?.ingest(ev) }
-                lock.withLock { running[s.name] = true; errors[s.name] = nil }
+                lock.withLock { running[s.name] = true; errors[s.name] = nil; startedSources.insert(s.name); downSources.remove(s.name) }
             } catch {
                 lock.withLock { running[s.name] = false; errors[s.name] = String(describing: error) }
                 log.error("source \(s.name, privacy: .public) failed: \(String(describing: error), privacy: .public)")
             }
         }
+        startHealthMonitor()
     }
 
     public func stop() {
         let list = lock.withLock { () -> [EventSource] in sources }
         for s in list { s.stop() }
-        lock.withLock { for k in running.keys { running[k] = false }; handler = nil }
+        healthTimer?.cancel(); healthTimer = nil
+        lock.withLock { for k in running.keys { running[k] = false }; startedSources.removeAll(); downSources.removeAll(); handler = nil }
+    }
+
+    // MARK: - Source health (never go blind silently)
+
+    private func startHealthMonitor() {
+        healthTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: healthQueue)
+        let interval = max(1, config.healthCheckInterval)
+        t.schedule(deadline: .now() + interval, repeating: interval, leeway: .seconds(2))
+        t.setEventHandler { [weak self] in self?.healthTick() }
+        healthTimer = t
+        t.resume()
+    }
+
+    /// Public hook so the daemon (or a test) can force an immediate health evaluation.
+    public func checkHealthNow() { healthTick() }
+
+    private func healthTick() {
+        let list = lock.withLock { sources }
+        let handlerSnapshot = lock.withLock { handler }
+        for s in list {
+            let wasStarted = lock.withLock { startedSources.contains(s.name) }
+            guard wasStarted else { continue }          // never started ⇒ nothing to lose
+            let hr = s as? SourceHealthReporting
+            let avail = s.isAvailable
+            let running = hr?.isRunning ?? lock.withLock { self.running[s.name] ?? false }
+            var healthy = avail && running
+            if healthy, config.sourceSilence > 0, let last = lock.withLock({ lastEventAt[s.name] }),
+               ProcessInfo.processInfo.systemUptime - last > config.sourceSilence {
+                healthy = false
+            }
+            let wasDown = lock.withLock { downSources.contains(s.name) }
+            if !healthy && !wasDown {
+                lock.withLock { _ = downSources.insert(s.name); self.running[s.name] = false; errors[s.name] = hr?.lastError ?? "stopped" }
+                log.error("telemetry source \(s.name, privacy: .public) is down — real-time protection is blind")
+                onDetection?(Self.feedLostDetection(name: s.name, lastError: hr?.lastError))
+            } else if healthy && wasDown {
+                lock.withLock { downSources.remove(s.name); self.running[s.name] = true; errors[s.name] = nil }
+                log.notice("telemetry source \(s.name, privacy: .public) recovered")
+            }
+            // Keep retrying a down-but-available source instead of staying blind forever.
+            if !healthy, avail, let h = handlerSnapshot {
+                try? s.start { [weak self] ev in self?.ingest(ev) }
+                let backUp = (s as? SourceHealthReporting)?.isRunning ?? true
+                if backUp { lock.withLock { self.running[s.name] = true; downSources.remove(s.name) } }
+                _ = h
+            }
+        }
+    }
+
+    static func feedLostDetection(name: String, lastError: String?) -> Detection {
+        Detection(name: "\(Product.name) lost its real-time event feed",
+                  category: .suspicious, severity: .high, confidence: 85,
+                  evidence: [Evidence(source: .behaviour,
+                                      title: "Telemetry source '\(name)' is down",
+                                      detail: lastError ?? "source stopped; real-time protection is blind until it restarts",
+                                      score: 85)])
+    }
+
+    static func impostorDetection(path: String?, pid: Int32?, reason: String) -> Detection {
+        Detection(path: path, pid: pid, name: "Process impersonating \(Product.name)",
+                  category: .suspicious, severity: .medium, confidence: 45,
+                  evidence: [Evidence(source: .behaviour,
+                                      title: "A process is pretending to be \(Product.name)",
+                                      detail: reason, score: 45)])
     }
 
     /// Source name → running, for `ProtectionStatus.sources`.
@@ -118,12 +227,22 @@ public final class EventHub {
         for s in list { if let r = s as? CPUReporting { out[s.name] = r.cpu.cpuSeconds } }
         return out
     }
-    public var currentStats: Stats { lock.withLock { var s = stats; s.buffered = (high.count - highHead) + (low.count - lowHead); return s } }
+    public var currentStats: Stats { lock.withLock { var s = stats; s.buffered = (crit.count - critHead) + (high.count - highHead) + (low.count - lowHead); return s } }
 
     static func isHighPriority(_ k: SecurityEventKind) -> Bool {
         switch k {
         case .fileCreate, .fileWrite, .fileClose, .fileRename, .fileDelete, .other: return false
         default: return true
+        }
+    }
+
+    /// Security-defining events that must never be dropped by rate limiting or buffer backpressure.
+    /// An attacker floods cheaper events (short-lived execs, file churn) to exhaust limits and hide one
+    /// of these; they get their own reserved, delivery-first queue.
+    static func isCritical(_ k: SecurityEventKind) -> Bool {
+        switch k {
+        case .xprotectDetection, .persistenceAdded, .persistenceRemoved, .tccRequest, .xattrDelete: return true
+        default: return false
         }
     }
 
@@ -138,8 +257,13 @@ public final class EventHub {
         case .none: return false
         case .allPlatform: return true
         case .standard:
+            if isFileEvent(ev.kind), let path = ev.destPath ?? ev.path, isCriticalPath(path) || (ev.path.map(isCriticalPath) ?? false) {
+                return false
+            }
             if isFileEvent(ev.kind) || ev.kind == .networkConnect { return true }
             if ev.kind == .exec {
+                // GUI app bundles (Terminal, Script Editor, Finder…) anchor lineage for ClickFix rules (T-X6-1).
+                if p.path.contains(".app/Contents/MacOS/") { return false }
                 let daemonDir = p.path.hasPrefix("/System/") || p.path.hasPrefix("/usr/libexec/") || p.path.hasPrefix("/usr/sbin/")
                 return daemonDir && p.ppid == 1
             }
@@ -164,6 +288,12 @@ public final class EventHub {
     /// Entry point for every source. Cheap; never calls the consumer synchronously.
     public func ingest(_ incoming: SecurityEvent) {
         var ev = incoming
+        if ev.kind == .dnsQuery, let name = ev.detail["name"] ?? ev.detail["query"], let answers = ev.detail["answers"] {
+            for ip in answers.split(separator: ",").prefix(16) { DNSAnswerCache.shared.record(ip: String(ip).trimmingCharacters(in: .whitespaces), host: name, at: ev.date) }
+        }
+        if ev.kind == .networkConnect, ev.detail["remote_host"] == nil, let ip = ev.detail["remote_ip"], let h = DNSAnswerCache.shared.host(for: ip, now: ev.date) {
+            ev.detail["remote_host"] = h
+        }
         if let mem = clipboardMemory {
             if ev.kind == .exec, let args = ev.process?.args, args.count > 0, let m = mem.match(args: args) {
                 ev.detail["clipboard_match"] = "1"
@@ -177,9 +307,19 @@ public final class EventHub {
                 mem.ingest(ev)
             }
         }
+        // Impostor check: a process named like a RamPart helper that isn't an installed, RamPart-signed binary.
+        if ev.kind == .exec, let p = ev.process, p.pid != selfPid,
+           RampartService.names.contains((p.path as NSString).lastPathComponent),
+           let reason = RampartService.impostorReason(name: (p.path as NSString).lastPathComponent, path: p.path,
+                                                       signingID: p.signingID, installPaths: config.rampartInstallPaths) {
+            ev.detail["impostor_rampart"] = "1"
+            ev.detail["impostor_reason"] = reason
+            onDetection?(Self.impostorDetection(path: ev.path, pid: p.pid, reason: reason))
+        }
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         stats.received += 1
+        lastEventAt[ev.source] = now
         if Self.shouldMute(ev, policy: config.mute) { stats.muted += 1; lock.unlock(); return }
         // Dedupe (cross-source: eslogger exec + procsweep exec of the same pid collapse).
         let extra = Self.dedupeExtra(ev)
@@ -190,18 +330,36 @@ public final class EventHub {
             recent = recent.filter { now - $0.value < config.dedupeWindow }
             lastPrune = now
         }
-        // Per-source token bucket.
+        // Per-source token bucket. High-priority security events are NEVER dropped by rate limiting: a
+        // flood of cheap events (short-lived execs, file churn) must not drain the bucket and silently
+        // hide a real detection. Low-priority events still shed when the bucket is empty.
         var b = buckets[ev.source] ?? (config.perSourceBurst, now)
         b.tokens = min(config.perSourceBurst, b.tokens + (now - b.at) * config.perSourceRate); b.at = now
-        if b.tokens < 1 { buckets[ev.source] = b; stats.rateLimited += 1; lock.unlock(); return }
-        b.tokens -= 1; buckets[ev.source] = b
-        stats.perSource[ev.source, default: 0] += 1
-        // Backpressure: bounded buffer, shed low priority first, then oldest high.
-        if Self.isHighPriority(ev.kind) { high.append(ev) } else { low.append(ev) }
-        while (high.count - highHead) + (low.count - lowHead) > config.bufferCapacity {
-            if low.count > lowHead { lowHead += 1 } else { highHead += 1 }
-            stats.overflowDropped += 1
+        let highPri = Self.isHighPriority(ev.kind)
+        if b.tokens < 1 {
+            if highPri {
+                buckets[ev.source] = b            // bucket stays empty; admit the event anyway
+                stats.rateLimitExempt += 1
+            } else {
+                buckets[ev.source] = b; stats.rateLimited += 1; lock.unlock(); return
+            }
+        } else {
+            b.tokens -= 1; buckets[ev.source] = b
         }
+        stats.perSource[ev.source, default: 0] += 1
+        // Backpressure: bounded buffer. Critical events get a reserved queue that normal overflow never
+        // sheds; otherwise shed low priority first, then oldest non-critical high.
+        func buffered() -> Int { (crit.count - critHead) + (high.count - highHead) + (low.count - lowHead) }
+        if Self.isCritical(ev.kind) { crit.append(ev) }
+        else if highPri { high.append(ev) } else { low.append(ev) }
+        while buffered() > config.bufferCapacity {
+            if low.count > lowHead { lowHead += 1; stats.overflowDropped += 1 }
+            else if high.count > highHead { highHead += 1; stats.overflowDropped += 1 }
+            else { break }   // only critical events remain: keep them unless the hard cap below trips
+        }
+        // Absolute safety valve: critical events alone must blow past a much larger hard cap before any
+        // are shed (keeps a flood of real detections from unbounded memory growth).
+        while (crit.count - critHead) > config.critBufferCapacity { critHead += 1; stats.criticalDropped += 1 }
         let kick = !draining
         draining = true
         lock.unlock()
@@ -212,13 +370,15 @@ public final class EventHub {
         while true {
             lock.lock()
             let ev: SecurityEvent
-            if highHead < high.count { ev = high[highHead]; highHead += 1 }
+            if critHead < crit.count { ev = crit[critHead]; critHead += 1 }   // critical first
+            else if highHead < high.count { ev = high[highHead]; highHead += 1 }
             else if lowHead < low.count { ev = low[lowHead]; lowHead += 1 }
             else {
-                high.removeAll(keepingCapacity: true); low.removeAll(keepingCapacity: true)
-                highHead = 0; lowHead = 0; draining = false
+                crit.removeAll(keepingCapacity: true); high.removeAll(keepingCapacity: true); low.removeAll(keepingCapacity: true)
+                critHead = 0; highHead = 0; lowHead = 0; draining = false
                 lock.unlock(); return
             }
+            if critHead > 4096 && critHead * 2 > crit.count { crit.removeFirst(critHead); critHead = 0 }
             if highHead > 4096 && highHead * 2 > high.count { high.removeFirst(highHead); highHead = 0 }
             if lowHead > 4096 && lowHead * 2 > low.count { low.removeFirst(lowHead); lowHead = 0 }
             let h = handler

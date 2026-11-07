@@ -22,7 +22,7 @@ public final class EsloggerSource: EventSource, CPUReporting {
     public static let binary = "/usr/bin/eslogger"
     /// Default subscription: everything the behaviour engine and scan-on-write consume.
     public static let defaultEvents = [
-        "exec", "fork", "exit", "create", "rename", "close", "unlink", "deleteextattr",
+        "exec", "fork", "exit", "open", "create", "rename", "close", "unlink", "deleteextattr",
         "btm_launch_item_add", "btm_launch_item_remove", "xp_malware_detected", "xp_malware_remediated",
         "tcc_modify", "gatekeeper_user_override", "profile_add",
     ]

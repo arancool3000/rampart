@@ -1,4 +1,6 @@
 import Foundation
+import CryptoKit
+import Security
 import RampartShared
 
 /// Path -> signing facts. Injected so this module does not depend on RampartSigning.
@@ -100,19 +102,26 @@ public enum PathClass: String, Codable, Sendable, CaseIterable {
 /// Privacy-preserving clipboard fingerprint shared by the session agent (producer) and the engine (consumer).
 ///
 /// Format of `detail["clip_tokens"]`: comma-separated list of `hash(token)`, where
-/// `hash(t) = first 8 lowercase hex chars of SHA-256(salt + t)` and `salt` = `bootSalt` (the kernel boot
-/// session UUID, so hashes are only comparable within one boot). Tokens come from `tokens(_:)`.
+/// `hash(t) = first 16 lowercase hex chars (64 bits) of HMAC-SHA256(key: salt, t)` and `salt` = `bootSalt`.
+/// Hardening (X6/HX9): `bootSalt` is no longer the world-readable `kern.bootsessionuuid`; it is a private random
+/// 256-bit key per process (shared in-process with `RampartTelemetry.ClipFingerprint` through the
+/// `RAMPART_CLIPFP_KEY` environment variable, which also lets a launcher hand the same key to the session
+/// agent and the daemon). Without that key a reader of `clip_tokens` can't dictionary-attack the tokens.
+/// Tokens come from `tokens(_:)`.
 public enum ClipboardFingerprint {
-    /// Per-boot salt: `sysctl kern.bootsessionuuid` (falls back to kern.boottime seconds).
+    public static let keyEnv = "RAMPART_CLIPFP_KEY"
+    /// Private random key (hex). Name kept for compatibility; it is not derived from the boot session any more.
     public static let bootSalt: String = {
-        var size = 0
-        if sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 1 {
-            var buf = [CChar](repeating: 0, count: size)
-            if sysctlbyname("kern.bootsessionuuid", &buf, &size, nil, 0) == 0 { return String(cString: buf) }
+        if let v = getenv(keyEnv).map({ String(cString: $0) }), v.count == 64, v.allSatisfy(\.isHexDigit) { return v }
+        var bytes = [UInt8](repeating: 0, count: 32)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
+            bytes = (0..<32).map { _ in UInt8.random(in: 0...255) }
         }
-        var tv = timeval(); var sz = MemoryLayout<timeval>.size
-        if sysctlbyname("kern.boottime", &tv, &sz, nil, 0) == 0 { return "boot-\(tv.tv_sec)" }
-        return "rampart-unsalted"
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        setenv(keyEnv, hex, 0)
+        // Another module may have won the race: always use what the environment holds now.
+        if let v = getenv(keyEnv).map({ String(cString: $0) }), v.count == 64 { return v }
+        return hex
     }()
 
     static let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "|;&<>()`\"'{}$"))
@@ -131,7 +140,8 @@ public enum ClipboardFingerprint {
     }
 
     public static func hash(_ token: String, salt: String = bootSalt) -> String {
-        String(Hashing.sha256(salt + token).prefix(8))
+        HMAC<SHA256>.authenticationCode(for: Data(token.utf8), using: SymmetricKey(data: Data(salt.utf8)))
+            .prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     /// The value telemetry puts in `detail["clip_tokens"]`.

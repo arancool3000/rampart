@@ -39,6 +39,8 @@ fi
 echo "==> resources (shared JS from Extensions/chromium + Safari manifest)"
 SRC="$ROOT/Extensions/chromium"
 cp -R "$SRC/shared" "$SRC/icons" "$APPEX/Contents/Resources/"
+# The clipboard bridge must ship (manifest loads it at document_start, before clipboard-main in the MAIN world).
+[ -f "$APPEX/Contents/Resources/shared/clipboard-bridge.js" ] || cp "$SRC/shared/clipboard-bridge.js" "$APPEX/Contents/Resources/shared/" || { echo "missing shared/clipboard-bridge.js" >&2; exit 1; }
 for f in background.js content.js content.css interstitial.html interstitial.css interstitial.js popup.html popup.js; do cp "$SRC/$f" "$APPEX/Contents/Resources/"; done
 cp "$ROOT/Extensions/safari/manifest.json" "$APPEX/Contents/Resources/manifest.json"
 cp -R "$ROOT/Extensions/safari/_locales" "$APPEX/Contents/Resources/"

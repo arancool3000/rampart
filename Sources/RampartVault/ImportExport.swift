@@ -55,7 +55,11 @@ public enum CSVImporter {
         return .generic
     }
 
+    /// Larger than any real password export; refuses pathological files instead of exhausting memory.
+    public static let maxBytes = 50 * 1_048_576
+
     public static func parse(_ text: String) -> Result {
+        guard text.utf8.count <= maxBytes else { return Result(source: .generic, items: [], folders: [], skipped: 0) }
         var rows = CSV.parse(text)
         guard !rows.isEmpty else { return Result(source: .generic, items: [], folders: [], skipped: 0) }
         let header = rows.removeFirst().map { $0.lowercased().trimmingCharacters(in: .whitespaces) }
@@ -137,7 +141,9 @@ public enum EncryptedExport {
         let version = Int(d[8]) << 8 | Int(d[9])
         guard version == 1 else { throw VaultError.unsupportedVersion(version) }
         let iters = Int(d[10]) << 24 | Int(d[11]) << 16 | Int(d[12]) << 8 | Int(d[13])
-        guard iters >= 1000 else { throw VaultError.badFormat("bad parameters") }
+        // Bounded: an untrusted file with ~4 billion iterations would hang the app for hours.
+        guard (VaultCrypto.floorIterations...VaultCrypto.maximumIterations).contains(iters) else { throw VaultError.badFormat("bad parameters") }
+        guard d.count <= VaultFile.maxFileBytes else { throw VaultError.badFormat("file too large") }
         let head = d.prefix(30), salt = d.subdata(in: 14..<30)
         let key = VaultCrypto.pbkdf2(password: password, salt: salt, iterations: iters)
         defer { key.wipe() }
@@ -145,7 +151,9 @@ public enum EncryptedExport {
         do { plain = try AES.GCM.open(AES.GCM.SealedBox(combined: d.suffix(from: 30)), using: VaultCrypto.symmetric(key), authenticating: head) }
         catch { throw VaultError.wrongPassword }
         defer { secureZero(&plain) }
-        let p = try VaultFile.decoder.decode(Payload.self, from: plain)
+        let p: Payload
+        do { p = try VaultFile.decoder.decode(Payload.self, from: plain) } catch { throw VaultError.badFormat("unreadable export contents") }
+        for i in p.items { for a in i.attachments where a.data.count > Attachment.maxBytes { throw VaultError.attachmentTooLarge } }
         return (p.items, p.folders)
     }
 }

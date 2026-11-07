@@ -179,6 +179,7 @@ public final class FSEventsSource: EventSource, CPUReporting {
         if flags & kFSEventStreamEventFlagItemIsSymlink != 0 { detail["is_symlink"] = "1" }
         if replaying { detail["replay"] = "1" }
         if !exists { detail["exists"] = "0" }
+        if exists, flags & kFSEventStreamEventFlagItemIsDir == 0, let origin = DownloadOrigin.originURL(path) { detail["origin_url"] = origin }
         // FSEvents coalesces flags, so one callback can mean several things. Pick the most specific
         // current-state kind; add xattr info as detail.
         let kind: SecurityEventKind
@@ -218,5 +219,30 @@ public final class FSEventsSource: EventSource, CPUReporting {
         }
         if flags & kFSEventStreamEventFlagItemXattrMod != 0 { detail["xattr_mod"] = "1" }
         handler?(SecurityEvent(kind: kind, path: path, detail: detail, source: name))
+    }
+}
+
+/// Download origin from `com.apple.metadata:kMDItemWhereFroms` (binary plist array of URLs set by browsers and
+/// Mail). Read-only `getxattr`, capped at 8 KiB; only http(s) URLs, credentials and query strings stripped.
+public enum DownloadOrigin {
+    public static let maxXattr = 8 * 1024
+    public static func originURL(_ path: String) -> String? {
+        let name = "com.apple.metadata:kMDItemWhereFroms"
+        let n = getxattr(path, name, nil, 0, 0, XATTR_NOFOLLOW)
+        guard n > 0, n <= maxXattr else { return nil }
+        var buf = [UInt8](repeating: 0, count: n)
+        guard getxattr(path, name, &buf, n, 0, XATTR_NOFOLLOW) == n else { return nil }
+        return parse(Data(buf))
+    }
+    /// First http(s) URL in the WhereFroms plist, as scheme://host/path (no user info, query or fragment).
+    public static func parse(_ data: Data) -> String? {
+        guard let arr = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [Any] else { return nil }
+        for case let s as String in arr {
+            guard s.count <= 4096, var c = URLComponents(string: s), let scheme = c.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https", let host = c.host, !host.isEmpty else { continue }
+            c.user = nil; c.password = nil; c.query = nil; c.fragment = nil
+            return c.string.map { String($0.prefix(512)) }
+        }
+        return nil
     }
 }
