@@ -40,6 +40,7 @@ struct RootView: View {
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
                 detail
+                    .disclosureGroupStyle(FullRowDisclosureStyle())
                     .id(model.selection)
                     .transition(reduceMotion ? .opacity : .blurFade)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

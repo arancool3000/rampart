@@ -10,7 +10,7 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
     case scamCheck, passwords, authenticator, passwordChecker, networkScan, aiAssistant, remoteAccess
 
     static let core: [SidebarItem] = [.dashboard, .scan, .threats, .activity, .network, .posture, .rules, .settings]
-    static let tools: [SidebarItem] = [.scamCheck, .passwords, .networkScan, .aiAssistant, .remoteAccess]
+    static let tools: [SidebarItem] = [.scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess]
     var id: String { rawValue }
     var title: String {
         switch self {

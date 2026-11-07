@@ -102,7 +102,6 @@ struct RampartApp: App {
     private var mainWindow: some Scene {
         Window(Product.name, id: "main") {
             RootView()
-                .disclosureGroupStyle(FullRowDisclosureStyle())
                 .background(HeadlessWindowHider())
                 .environment(model)
                 .tint(.rampartTeal)
