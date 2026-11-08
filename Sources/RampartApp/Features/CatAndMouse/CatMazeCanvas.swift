@@ -24,13 +24,49 @@ struct CatMazeCanvas: View {
     }
 
     static let cols = 9, rows = 5
-    /// Fixed maze walls (bitmask per cell: 1 = right wall, 2 = bottom wall), generated once from a seed.
-    static let walls: [[UInt8]] = {
+    /// A perfect maze (recursive backtracker, fixed seed): walls[r][c] bit 1 = right wall, bit 2 = bottom wall.
+    /// `path` is the depth-first tour of that maze, so every step moves between two cells through an opening:
+    /// the cat and mouse never pass through a wall.
+    static let maze: (walls: [[UInt8]], path: [(Int, Int)]) = {
+        var walls = Array(repeating: Array(repeating: UInt8(3), count: cols), count: rows)
+        var seen = Array(repeating: Array(repeating: false, count: cols), count: rows)
         var s: UInt64 = 0xCA7
-        return (0..<rows).map { _ in (0..<cols).map { _ in s = s &* 6364136223846793005 &+ 1; return UInt8((s >> 40) % 4) } }
+        func rnd(_ n: Int) -> Int { s = s &* 6364136223846793005 &+ 1442695040888963407; return Int((s >> 33) % UInt64(n)) }
+        var stack = [(0, 0)], tour = [(0, 0)]
+        seen[0][0] = true
+        while let top = stack.last {
+            let (c, r) = top
+            var next: [(Int, Int)] = []
+            for (dc, dr) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let nc = c + dc, nr = r + dr
+                if nc >= 0, nc < cols, nr >= 0, nr < rows, !seen[nr][nc] { next.append((nc, nr)) }
+            }
+            if next.isEmpty {
+                stack.removeLast()
+                if let back = stack.last { tour.append(back) }   // walk back through the same opening
+                continue
+            }
+            let (nc, nr) = next[rnd(next.count)]
+            if nc > c { walls[r][c] &= ~1 } else if nc < c { walls[nr][nc] &= ~1 }
+            else if nr > r { walls[r][c] &= ~2 } else { walls[nr][nc] &= ~2 }
+            seen[nr][nc] = true
+            stack.append((nc, nr)); tour.append((nc, nr))
+        }
+        if tour.count > 1, tour.last! == tour.first! { tour.removeLast() }   // the tour ends back at the start: loop seamlessly
+        return (walls, tour)
     }()
-    /// A wandering path through cells for the mouse.
-    static let path: [(Int, Int)] = [(0,0),(1,0),(2,0),(2,1),(3,1),(4,1),(4,2),(3,2),(3,3),(4,3),(5,3),(6,3),(6,2),(7,2),(7,1),(8,1),(8,2),(8,3),(7,3),(7,4),(6,4),(5,4),(4,4),(3,4),(2,4),(2,3),(1,3),(1,2),(0,2),(0,1)]
+    static var walls: [[UInt8]] { maze.walls }
+    static var path: [(Int, Int)] { maze.path }
+
+    /// True if two cells are neighbours with no wall between them (used by the selftest-style check below).
+    static func open(_ a: (Int, Int), _ b: (Int, Int)) -> Bool {
+        let dc = b.0 - a.0, dr = b.1 - a.1
+        guard abs(dc) + abs(dr) == 1 else { return false }
+        if dc == 1 { return walls[a.1][a.0] & 1 == 0 }
+        if dc == -1 { return walls[b.1][b.0] & 1 == 0 }
+        if dr == 1 { return walls[a.1][a.0] & 2 == 0 }
+        return walls[b.1][b.0] & 2 == 0
+    }
 
     static func draw(_ ctx: GraphicsContext, _ size: CGSize, t: Double, deadEnds: Int, caught: Bool) {
         let cw = size.width / CGFloat(cols), ch = size.height / CGFloat(rows)
@@ -61,8 +97,9 @@ struct CatMazeCanvas: View {
             let a = center(path[i]), b = center(path[j])
             return CGPoint(x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k)
         }
-        let mouse = caught ? center(path[path.count / 2]) : along(t * 1.6)
-        let cat = caught ? center(path[path.count / 2 - 1]) : along(t * 1.6 - 3.2)
+        let speed = 2.2
+        let mouse = caught ? center(path[path.count / 2]) : along(t * speed)
+        let cat = caught ? center(path[path.count / 2 - 1]) : along(t * speed - 3)
         let font = Font.system(size: min(cw, ch) * 0.62)
         ctx.draw(Text("🐭").font(font), at: mouse)
         ctx.draw(Text("🐱").font(font), at: cat)
