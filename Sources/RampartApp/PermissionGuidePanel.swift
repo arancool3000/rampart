@@ -54,6 +54,7 @@ final class PermissionGuidePanel {
 
     private func position() {
         guard let panel else { return }
+        if let host = panel.contentView as? NSHostingView<PermissionGuideView> { panel.setContentSize(host.fittingSize) }
         let size = panel.frame.size
         let screen = NSScreen.main ?? NSScreen.screens.first
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
@@ -66,9 +67,15 @@ final class PermissionGuidePanel {
             let flippedY = primaryHeight - y - h       // CG is top-left origin; AppKit is bottom-left
             var px = x + width + 12
             var right = false
-            if let vf = screen?.visibleFrame, px + size.width > vf.maxX { px = x - size.width - 12; right = true }
+            var py = flippedY + h - size.height - 60
+            if let vf = screen?.visibleFrame, px + size.width > vf.maxX {
+                // No room on the right: sit over Settings' own sidebar (left part of its window), level with
+                // the app list, pointing right at it.
+                px = x + 16; right = true
+                py = flippedY + h * 0.45 - size.height / 2
+            }
             state.pointRight = right
-            origin = NSPoint(x: px, y: flippedY + h - size.height - 60)
+            origin = NSPoint(x: px, y: py)
         }
         if origin == nil, let vf = screen?.visibleFrame {
             origin = NSPoint(x: vf.maxX - size.width - 24, y: vf.maxY - size.height - 24)
@@ -82,12 +89,10 @@ private struct PermissionGuideView: View {
     let close: () -> Void
     let reveal: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @StateVar private var nudge = false
     @StateVar private var toggleOn = false
 
     private var guideArrow: some View {
         Image(systemName: state.pointRight ? "arrow.right" : "arrow.left").font(.title2.weight(.bold)).foregroundStyle(Color.rampartTeal)
-            .offset(x: nudge ? (state.pointRight ? 6 : -6) : 0)
             .accessibilityHidden(true)
     }
 
@@ -128,8 +133,7 @@ private struct PermissionGuideView: View {
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: state.done)
         .onAppear {
             guard !reduceMotion else { toggleOn = true; return }
-            // Finite loops only: a few nudges and one toggle animation.
-            withAnimation(.easeInOut(duration: 0.5).repeatCount(6, autoreverses: true)) { nudge = true }
+            // One calm toggle animation; nothing bounces or moves the text.
             withAnimation(.spring(response: 0.4, dampingFraction: 0.7).delay(0.6)) { toggleOn = true }
         }
     }
