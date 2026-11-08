@@ -11,6 +11,11 @@ struct RootView: View {
     var body: some View {
         @Bindable var model = model
         NavigationSplitView {
+            // Brand, mode switch and footer sit OUTSIDE the list (not safe-area insets), so the list can never
+            // scroll up underneath the title bar / window buttons.
+            VStack(spacing: 0) {
+            SidebarBrand()
+            SidebarModePicker()
             List(selection: $model.selection) {
                 if model.sidebarMode == .protection {
                     Section {
@@ -37,10 +42,10 @@ struct RootView: View {
                     }
                 }
             }
-            .safeAreaInset(edge: .top, spacing: 0) { SidebarModePicker() }
+            .clipped()
+            SidebarFooter()
+            }
             .navigationSplitViewColumnWidth(min: 210, ideal: 236, max: 260)
-            .safeAreaInset(edge: .top) { SidebarBrand() }
-            .safeAreaInset(edge: .bottom) { SidebarFooter() }
         } detail: {
             VStack(spacing: 0) {
                 // Emergency lockdown banner (shows only while a lockdown is on; tap opens the Emergency screen).
@@ -437,17 +442,11 @@ struct SidebarRow: View {
     let item: SidebarItem
     @Environment(AppModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// Increments only when this row becomes selected, so only the newly chosen icon bounces.
-    @StateVar private var bounceTick = 0
     var body: some View {
         Label {
             Text(item.title)
         } icon: {
             Image(systemName: item.symbol)
-                .symbolEffect(.bounce, value: bounceTick)
-        }
-        .onChange(of: model.selection) { _, new in
-            if new == item && !reduceMotion { bounceTick += 1 }
         }
         .badge(item == .threats ? model.needsYouCount : 0)
         .help(item == .threats && model.needsYouCount > 0

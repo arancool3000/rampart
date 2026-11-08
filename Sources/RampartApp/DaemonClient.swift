@@ -45,7 +45,12 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     let candidatePaths: [String]
-    private(set) var connectedPath: String?
+    /// Requests run on a concurrent queue: shared state is guarded by `stateLock` (unguarded String writes
+    /// from two threads crashed the app with a double free).
+    private let stateLock = NSLock()
+    private var _connectedPath: String?
+    private var _lastRejection: String?
+    var connectedPath: String? { stateLock.lock(); defer { stateLock.unlock() }; return _connectedPath }
     private let queue = DispatchQueue(label: "app.rampart.ipc", qos: .userInitiated, attributes: .concurrent)
 
     init(paths: [String]? = nil) {
@@ -58,13 +63,14 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     /// Set when a socket answered but failed the peer check (fake daemon). Surfaced as `.untrusted`.
-    private(set) var lastRejection: String?
+    var lastRejection: String? { stateLock.lock(); defer { stateLock.unlock() }; return _lastRejection }
+    private func setRejection(_ why: String?) { stateLock.lock(); _lastRejection = why; stateLock.unlock() }
 
     /// Opens a connected socket to the first path that accepts AND whose peer is the genuine daemon, or nil.
     /// hx8: nothing (pasted text, URLs, settings, authorization data) is written before the peer is verified.
     private func openSocket(timeout: TimeInterval?) -> Int32? {
         for path in candidatePaths where FileManager.default.fileExists(atPath: path) {
-            if let why = DaemonPeerTrust.socketFileProblem(path: path) { lastRejection = why; continue }
+            if let why = DaemonPeerTrust.socketFileProblem(path: path) { setRejection(why); continue }
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
             if fd < 0 { continue }
             var one: Int32 = 1
@@ -89,11 +95,11 @@ final class DaemonClient: @unchecked Sendable {
             }
             if rc == 0 {
                 if let why = DaemonPeerTrust.peerProblem(fd: fd, path: path) {
-                    lastRejection = why
+                    setRejection(why)
                     NSLog("RamPart: refused daemon socket %@: %@", path, why)
                     close(fd); continue
                 }
-                connectedPath = path; lastRejection = nil; return fd
+                stateLock.lock(); _connectedPath = path; _lastRejection = nil; stateLock.unlock(); return fd
             }
             close(fd)
         }
