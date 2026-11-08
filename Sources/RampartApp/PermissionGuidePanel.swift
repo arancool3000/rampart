@@ -186,9 +186,14 @@ enum FDAAutoPrompt {
 @MainActor
 enum FullDiskAccessRequest {
     private static var timer: Timer?
+    /// Done only when BOTH the app and the background service have access (the service is what scans).
+    @MainActor static var bothHaveAccess: Bool {
+        let m = AppModel.shared
+        return FDAProbe.check() && (m.mode != .live || m.status.fullDiskAccess)
+    }
     static func start() {
         guard !Headless.active else { return }
-        if FDAProbe.check() { return }
+        if bothHaveAccess { return }
         NSWorkspace.shared.open(FDAProbe.settingsURL)
         PermissionGuidePanel.shared.show()
         timer?.invalidate()
@@ -196,7 +201,8 @@ enum FullDiskAccessRequest {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { t in
             MainActor.assumeIsolated {
                 ticks += 1
-                if FDAProbe.check() {
+                if ticks % 5 == 0 { Task { await AppModel.shared.refresh(heavy: false) } }
+                if bothHaveAccess {
                     t.invalidate(); timer = nil
                     AppModel.shared.hasFullDiskAccess = true
                     PermissionGuidePanel.shared.finish()
