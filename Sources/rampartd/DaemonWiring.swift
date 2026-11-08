@@ -19,6 +19,7 @@ final class HubFeed: EventFeed {
 enum DaemonWiring {
     static var hub: EventHub?
     static var deception: DeceptionService?
+    static var forwarder: DecoyForwarder?
 
     /// PasteGuard is the one pasteboard reader per session. It runs only in the user's own session
     /// (never as root) and only when macOS lets us read the pasteboard without asking
@@ -81,14 +82,38 @@ enum DaemonWiring {
             if runtime.userMode {
                 let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
                 let app = exe.components(separatedBy: ".app/").first.map { $0 + ".app" } ?? exe
-                if let dec = try? DeceptionService(directory: runtime.root.appendingPathComponent("deception"), home: NSHomeDirectory(), ownPaths: [app, exe]) {
-                    dec.readDetectionAvailable = isRoot   // eslogger (reads) only as root; FSEvents can't see reads
+                // init applies the saved settings: decoy watchers (kqueue + access-time reads) and the lure start now.
+                // Dev only (scripts/catmouse-demo.sh --scratch): RAMPART_DECEPTION_HOME plants into a scratch home, with a
+                // short settle window and a fast lure. Honoured only together with RAMPART_NO_PRIVILEGED_TOOLS=1.
+                let env = ProcessInfo.processInfo.environment
+                var decHome = NSHomeDirectory()
+                var devDemo = false
+                if Privileged.noPrivilegedTools, let h = env["RAMPART_DECEPTION_HOME"], h.hasPrefix("/") {
+                    var st = stat()
+                    if lstat(h, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR, st.st_uid == getuid() { decHome = h; devDemo = true; DeceptionService.tarpitLineDelay = 0.3 }
+                }
+                if let dec = try? DeceptionService(directory: runtime.root.appendingPathComponent("deception"), home: decHome, ownPaths: [app, exe], applyPersisted: false) {
+                    if devDemo { dec.watcher.settleSeconds = 3 }
+                    dec.applyPersistedConfig()
+                    dec.readDetectionAvailable = true   // decoy access times (DecoyWatcher), no eslogger needed
+                    // The system service forwards eslogger events for decoys (DecoyForwarder): then the actor is known.
+                    dec.attributionAvailable = isRoot || DecoyForwarder.systemServicePresent
                     s.deception = dec
                     let prior2 = pipeline.behaviour
                     pipeline.behaviour = { ev in (prior2?(ev) ?? []) + dec.handle(ev) }
                     if let engine = s.scanner as? EngineScanService { engine.extraExclusions = { dec.exclusions } }
                     DaemonWiring.deception = dec
                 }
+            }
+            // System service: eslogger sees who opens a decoy; forward those events to the owning user's session daemon
+            // (which runs Cat & Mouse) so its catches name the program. The session daemon merges them with its own
+            // actor-less touches, so nothing is reported twice.
+            if isRoot {
+                let fwd = DecoyForwarder()
+                fwd.start()
+                let prior3 = pipeline.behaviour
+                pipeline.behaviour = { ev in fwd.consider(ev); return prior3?(ev) ?? [] }
+                DaemonWiring.forwarder = fwd
             }
             s.realtime = pipeline
             s.onDNSEvent = { [weak pipeline] e in pipeline?.inject(e) }

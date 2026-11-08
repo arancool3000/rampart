@@ -382,6 +382,7 @@ extension SelfTest {
         check(FileManager.default.fileExists(atPath: userFile), "deception.removeAll.keepsUserFile")
         check(svc.registry.all.isEmpty && !svc.config.decoysEnabled, "deception.removeAll.registryEmpty")
         check(svc.handle(readEv).isEmpty, "deception.offMeansSilent")
+        deceptionUserModeChecks()
     }
 
     /// Connects to 127.0.0.1:port, sends a line, reads until EOF (≤ 3 s).

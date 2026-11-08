@@ -51,6 +51,8 @@ final class Protection {
     func unsubscribe(_ id: UUID) { subLock.lock(); subscribers[id] = nil; subLock.unlock() }
     /// Pushes a lockdown status to every subscribed app at once (it posts the user notification).
     func broadcastEmergency(_ d: Data) { broadcast(.emergency(d)) }
+    /// Cat & Mouse alert (JSON of RampartGuard.CatMouseAlert) for the app to post as a notification.
+    func broadcastDeceptionAlert(_ d: Data) { broadcast(.deception(d)) }
     var subscriberCount: Int { subLock.lock(); defer { subLock.unlock() }; return subscribers.count }
 
     private func broadcast(_ r: IPCResponse) {

@@ -45,6 +45,16 @@ public final class DeceptionEventLog: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return events.filter { $0.process?.pid == pid && $0.date >= since }
     }
+    /// Events dated in [since, until] (newest last). Used to attribute an actor-less decoy touch.
+    public func recent(since: Date, until: Date = .distantFuture) -> [SecurityEvent] {
+        lock.lock(); defer { lock.unlock() }
+        var out: [SecurityEvent] = []
+        for e in events.reversed() {
+            if e.date < since.addingTimeInterval(-60) { break }   // roughly chronological; small slack for late events
+            if e.date >= since && e.date <= until { out.append(e) }
+        }
+        return out.reversed()
+    }
 }
 
 public enum DeceptionStudy {

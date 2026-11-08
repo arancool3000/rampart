@@ -3,7 +3,15 @@ import RampartShared
 
 /// Turns telemetry events that touch a decoy into catches. Nobody legitimate opens these files, so a touch by
 /// anything other than the Apple indexers / backup / Finder / Quick Look (or RamPart itself) is high confidence.
-public enum DeceptionAccess: String, Codable, Sendable { case read, write, rename, delete, xattr, mazeWalk }
+public enum DeceptionAccess: String, Codable, Sendable { case read, write, rename, delete, xattr, mazeWalk, copy }
+
+/// How RamPart knows which program touched a decoy.
+public enum DeceptionAttribution: String, Codable, Sendable {
+    case eventActor     // the telemetry event named the process (eslogger in the system service, or forwarded by it)
+    case openFile       // found holding the decoy open right after the touch
+    case commandLine    // likely: a program started moments before whose command line named the decoy
+    case unknown        // nothing identified (no Full Disk Access / system service): reported honestly as "something"
+}
 
 public struct DeceptionCatch: Codable, Hashable, Identifiable, Sendable {
     public var id: UUID
@@ -22,6 +30,12 @@ public struct DeceptionCatch: Codable, Hashable, Identifiable, Sendable {
     public var quarantineID: UUID?
     /// The user opened a bait file with a normal app (e.g. TextEdit via Finder). Calm note, no detection.
     public var userOpened: Bool = false
+    /// nil on catches recorded before attribution existed (those always had an actor).
+    public var attribution: DeceptionAttribution? = nil
+    /// Extra fact shown with the catch (e.g. "happened while RamPart wasn't running").
+    public var note: String? = nil
+    /// True when RamPart couldn't tell which program it was.
+    public var isUnattributed: Bool { attribution == .unknown }
     public init(id: UUID = UUID(), date: Date, decoyPath: String, decoyKind: DecoyKind, access: DeceptionAccess, pid: Int32,
                 processPath: String, processName: String, signingID: String?, teamID: String?, destPath: String?,
                 mazeDeadEnds: Int = 0, contained: Bool = false, quarantineID: UUID? = nil) {
@@ -161,6 +175,7 @@ public final class DeceptionDetector: @unchecked Sendable {
                                access: effective, pid: proc.pid, processPath: SafeText.path(proc.path), processName: name.isEmpty ? "unknown" : name,
                                signingID: proc.signingID.map { SafeText.line($0, max: 120) }, teamID: proc.teamID,
                                destPath: e.destPath.map { SafeText.path($0) }, mazeDeadEnds: dead)
+        c.attribution = .eventActor
         if !inMaze, DeceptionUserOpen.isCalm(proc, access: effective, destPath: e.destPath, distinctDecoysByPid: distinct) { c.userOpened = true }
         return c
     }
@@ -177,8 +192,9 @@ public final class DeceptionDetector: @unchecked Sendable {
         case .delete: what = "deleted"
         case .xattr: what = "changed attributes of"
         case .mazeWalk: what = "walked the decoy folder maze (\(c.mazeDeadEnds) dead ends)"
+        case .copy: what = "copied"
         }
-        let exfil = c.access == .rename || c.destPath != nil
+        let exfil = c.access == .rename || c.access == .copy || c.destPath != nil
         let conf = c.access == .mazeWalk ? (c.mazeDeadEnds >= 10 ? 90 : 75) : 96
         var ev = [Evidence(source: .behaviour, title: "Decoy file touched",
                            detail: "\(c.processName) (pid \(c.pid)) \(what) a RamPart decoy at \(c.decoyPath). No legitimate app opens these files.", score: conf)]

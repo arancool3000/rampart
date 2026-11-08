@@ -38,8 +38,11 @@ enum CatAndMouseBridge {
         return .unsupported
     }
     static func setTarpit(client: DaemonClient, on: Bool, port: UInt16, scope: LureScope) async -> Outcome {
-        if case .deception(let d)? = try? await client.request(.deceptionSetTarpit(on: on, port: port, scope: scope.rawValue)) { return decode(d) }
-        return .unsupported
+        switch try? await client.request(.deceptionSetTarpit(on: on, port: port, scope: scope.rawValue)) {
+        case .deception(let d)?: return decode(d)
+        case .error(let e)?: return .error("Couldn't change the network lure: \(e)")
+        default: return .unsupported
+        }
     }
     /// Version-tolerant: a helper built before this request existed can't decode it and answers with an error (or
     /// drops the connection). That is reported as a plain message, not as "Cat & Mouse unsupported".
@@ -70,8 +73,6 @@ final class CatAndMouseModel {
     var error: String?
     var busy = false
     var evidence: [UUID: DeceptionEvidence] = [:]
-    @ObservationIgnored private var notified: Set<UUID> = []
-    @ObservationIgnored private var primed = false
 
     var tone: DeceptionTone {
         status?.config.tone ?? (UserDefaults.standard.bool(forKey: "catMouse.serious") ? .serious : .playful)
@@ -80,6 +81,8 @@ final class CatAndMouseModel {
     var realCatches: [DeceptionCatch] { catches.filter { !$0.userOpened } }
     /// Total maze dead ends hit across catches (drives the visual).
     var deadEnds: Int { status?.catches.map(\.mazeDeadEnds).max() ?? 0 }
+    /// The maze shows "caught" after any real catch in the last 24 hours (or one that was contained).
+    var caughtRecently: Bool { realCatches.contains { $0.contained || Date().timeIntervalSince($0.date) < 86_400 } }
 
     private var client: DaemonClient { AppModel.shared.client }
 
@@ -92,6 +95,12 @@ final class CatAndMouseModel {
     }
 
     func refresh() async { apply(await CatAndMouseBridge.fetch(client: client)) }
+    /// Background check (AppModel's periodic tick): new catches notify even when this screen isn't open.
+    /// Quiet when the helper doesn't run Cat & Mouse.
+    func backgroundPoll() async {
+        let o = await CatAndMouseBridge.fetch(client: client)
+        if case .status = o { apply(o) }
+    }
     func setDecoys(_ on: Bool) async { busy = true; apply(await CatAndMouseBridge.setDecoys(client: client, on: on)); busy = false }
     func setMaze(_ on: Bool) async { busy = true; apply(await CatAndMouseBridge.setMaze(client: client, on: on)); busy = false }
     func removeAll() async { busy = true; apply(await CatAndMouseBridge.removeAll(client: client)); busy = false }
@@ -109,19 +118,59 @@ final class CatAndMouseModel {
         if let e = await CatAndMouseBridge.evidence(client: client, catchID: c.id) { evidence[c.id] = e }
     }
 
-    /// Notifications for catches the user hasn't seen. Uses the threat category (critical), so they are never
-    /// rate-limited away; the regular detection alert from rampartd still fires too.
+    /// Cat & Mouse notifications come from the service as `CatMouseAlert`s (pushed on the event stream and kept in
+    /// the status). Each alert id is posted once; alerts missed while the app wasn't running are posted when it
+    /// starts (up to 15 minutes old). The notification identifier groups a burst into one notification.
+    @ObservationIgnored private var postedAlerts: Set<UUID> = []
+    private var lastAlertDate: Date {
+        get { UserDefaults.standard.object(forKey: "catMouse.lastAlertDate") as? Date ?? .distantPast }
+        set { UserDefaults.standard.set(newValue, forKey: "catMouse.lastAlertDate") }
+    }
+    var notificationsDenied = false
+
+    func receiveAlert(_ data: Data) {
+        guard let a = try? JSONDecoder.rampart.decode(CatMouseAlert.self, from: data) else { return }
+        post([a])
+        Task { await refresh() }   // the screen (if open) shows the catch at once
+    }
+
     private func postNewCatches(_ s: DeceptionStatus) {
-        let fresh = s.catches.filter { !notified.contains($0.id) }
-        notified.formUnion(fresh.map(\.id))
-        guard primed else { primed = true; return }   // don't replay history on first load
-        for c in fresh.suffix(3) {
-            if c.userOpened {   // calm, non-critical note; never an alert
-                let m = DeceptionVoice.userOpened(c, tone: s.config.tone)
-                Notifier.shared.post(.scan, title: m.title, body: m.body, critical: false); continue
-            }
-            let m = c.contained ? DeceptionVoice.contained(c, tone: s.config.tone) : DeceptionVoice.caught(c, tone: s.config.tone)
-            Notifier.shared.post(.threat, title: m.title, body: m.body, critical: m.severity >= .high)
+        post(s.alerts ?? [])
+        askForNotificationsOnce(s)
+    }
+
+    private func post(_ alerts: [CatMouseAlert]) {
+        let cutoff = max(lastAlertDate, Date().addingTimeInterval(-900))
+        for a in alerts where !postedAlerts.contains(a.id) && a.date > cutoff {
+            postedAlerts.insert(a.id)
+            Notifier.shared.catMouse(a)
+            if a.date > lastAlertDate { lastAlertDate = a.date }
+        }
+    }
+
+    /// The first time Cat & Mouse is on, ask macOS once for notification permission (never in headless/dev runs).
+    private func askForNotificationsOnce(_ s: DeceptionStatus) {
+        let on = s.config.decoysEnabled || s.config.mazeEnabled || s.config.tarpitEnabled
+        Task {
+            let st = await Notifier.shared.authorizationStatus()
+            notificationsDenied = on && st == .denied
+            guard on, st == .notDetermined, !Headless.active, !UserDefaults.standard.bool(forKey: "catMouse.notifAsked") else { return }
+            UserDefaults.standard.set(true, forKey: "catMouse.notifAsked")
+            _ = await Notifier.shared.requestAuthorization()
+            notificationsDenied = await Notifier.shared.authorizationStatus() == .denied
+        }
+    }
+
+    func turnOnNotifications() async {
+        _ = await Notifier.shared.allowOrOpenSettings()
+        notificationsDenied = await Notifier.shared.authorizationStatus() == .denied
+    }
+
+    func contain(catchID: UUID) async {
+        switch try? await client.request(.deceptionContain(catchID: catchID)) {
+        case .deception(let d)?: apply(CatAndMouseBridge.decode(d))
+        case .error(let e)?: error = "Couldn't contain it: \(e)"
+        default: error = "This RamPart helper can't contain programs from Cat & Mouse yet."
         }
     }
 

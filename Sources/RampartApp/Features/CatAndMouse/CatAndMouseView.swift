@@ -20,8 +20,24 @@ struct CatAndMouseView: View {
                 header
                 if model.unsupported { unsupportedNote }
                 if let e = model.error { Label(e, systemImage: "exclamationmark.triangle").foregroundStyle(.orange) }
-                CatMazeCanvas(deadEnds: model.deadEnds, caught: model.realCatches.contains { $0.contained })
+                if model.notificationsDenied {
+                    HStack {
+                        Label("Turn on notifications to hear when the cat catches something", systemImage: "bell.slash")
+                        Spacer()
+                        Button("Turn on…") { Task { await model.turnOnNotifications() } }
+                    }
                     .card(padding: Spacing.m)
+                }
+                ZStack(alignment: .topTrailing) {
+                    CatMazeCanvas(deadEnds: model.deadEnds, caught: model.caughtRecently)
+                    if model.caughtRecently {
+                        Text(serious ? "Caught" : "Caught! 🐭")
+                            .font(.caption.weight(.bold)).padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(Color.statusAction.opacity(0.25), in: Capsule())
+                            .accessibilityLabel("A decoy was touched recently")
+                    }
+                }
+                .card(padding: Spacing.m)
                 toggles
                 timeline
                 decoyList
@@ -29,7 +45,13 @@ struct CatAndMouseView: View {
             }
             .contentColumn()
         }
-        .task { await model.refresh() }
+        .task {
+            // Live while the screen is open: catches and lure attempts appear within a few seconds.
+            while !Task.isCancelled {
+                await model.refresh()
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
         .confirmationDialog(serious ? "Remove all decoy files and folders?" : "Send the cat home and remove every decoy?",
                             isPresented: $confirmRemove) {
             Button("Remove all decoys", role: .destructive) { Task { await model.removeAll() } }
@@ -78,6 +100,11 @@ struct CatAndMouseView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
+            if cfg.tarpitEnabled, let err = model.status?.tarpitError {
+                Label(err, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.callout)
+            } else if cfg.tarpitEnabled, model.status?.tarpitListening == true {
+                Label("Listening on port \(cfg.tarpitPort).", systemImage: "dot.radiowaves.left.and.right").font(.callout)
+            }
             if cfg.tarpitEnabled {
                 // Reaching the lure from other devices needs the boxed-in helper (rampart-lure), its packet-filter
                 // anchor and launchd job, which only the RamPart system service may install. That isn't wired up yet,
@@ -121,9 +148,16 @@ struct CatAndMouseView: View {
             ForEach(model.catches.prefix(50)) { c in catchRow(c) }
             ForEach(model.status?.tarpitAttempts.suffix(10).reversed() ?? []) { a in
                 let m = DeceptionVoice.tarpit(a, tone: model.tone)
-                VStack(alignment: .leading) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(m.title).font(.headline)
                     Text(m.body).font(.callout).foregroundStyle(.secondary)
+                    if a.credentialAttempts > 0 {
+                        Text("\(a.credentialAttempts) password guess\(a.credentialAttempts == 1 ? "" : "es") (never stored)").font(.caption)
+                    }
+                    if let r = a.replies, !r.isEmpty {
+                        Text((serious ? "Lure replied: " : "What the cat said: ") + r.suffix(4).joined(separator: " / "))
+                            .font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(3)
+                    }
                 }
             }
         }
@@ -142,11 +176,14 @@ struct CatAndMouseView: View {
                     .background((m.severity >= .critical ? Color.statusAction : m.severity >= .medium ? Color.statusAttention : Color.statusInfo).opacity(0.2), in: Capsule())
             }
             Text(m.body).font(.callout)
-            Text("\(c.processPath) · \(Fmt.dayTime(c.date))").font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-            if !c.userOpened { HStack {
+            Text("\(c.processPath.isEmpty ? "program unknown" : c.processPath) · \(Fmt.dayTime(c.date))").font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            if !c.userOpened && !c.isUnattributed { HStack {
                 Button(expanded == c.id ? "Hide evidence" : "Show evidence") {
                     expanded = expanded == c.id ? nil : c.id
                     if expanded == c.id { Task { await model.loadEvidence(c) } }
+                }
+                if c.pid > 1 && !c.contained && kill(c.pid, 0) == 0 {
+                    Button(serious ? "Stop this program" : "Contain it") { Task { await model.contain(catchID: c.id) } }
                 }
                 if c.quarantineID != nil {
                     Button(serious ? "Study it in the sandbox" : "Study it in the sandbox 🔬") {

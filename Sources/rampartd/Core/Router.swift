@@ -65,6 +65,7 @@ final class Router {
         case .deceptionSetMaze: return "deceptionSetMaze"; case .deceptionRemoveAll: return "deceptionRemoveAll"
         case .deceptionSetTarpit: return "deceptionSetTarpit"; case .deceptionSetTone: return "deceptionSetTone"
         case .deceptionEvidence: return "deceptionEvidence"; case .deceptionSetDecoysVisible: return "deceptionSetDecoysVisible"
+        case .deceptionContain: return "deceptionContain"
         }
     }
 
@@ -395,6 +396,14 @@ final class Router {
                 _ = send(.deception(try JSONEncoder.rampart.encode(d.status())))
             case .deceptionSetTone(let serious):
                 let d = try deception(); d.setTone(serious ? .serious : .playful)
+                _ = send(.deception(try JSONEncoder.rampart.encode(d.status())))
+            case .deceptionContain(let id):
+                let d = try deception()
+                do {
+                    let c = try d.contain(catchID: id)
+                    p.activity.add(.detection, "Cat & Mouse: stopped \(c.processName)", detail: c.processPath, outcome: "contained", severity: .high,
+                                   event: .deceptionEvent, actor: .user, facts: ["decoy": (c.decoyPath as NSString).lastPathComponent])
+                } catch { throw ServiceError.failed("\(error)") }
                 _ = send(.deception(try JSONEncoder.rampart.encode(d.status())))
             case .deceptionEvidence(let id):
                 guard let e = try deception().evidence(catchID: id) else { throw ServiceError.notFound("catch \(id)") }

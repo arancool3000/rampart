@@ -23,7 +23,23 @@ public enum DeceptionVoice {
         }
     }
 
+    /// The exact honest limit, shown whenever RamPart couldn't identify the program.
+    public static let unattributedLimit = "RamPart couldn't see which program without Full Disk Access / the system service"
+
+    static func verb(_ a: DeceptionAccess) -> String {
+        switch a {
+        case .read: return "read"
+        case .write: return "changed"
+        case .rename: return "moved"
+        case .delete: return "deleted"
+        case .xattr: return "changed the attributes of"
+        case .copy: return "copied"
+        case .mazeWalk: return "searched"
+        }
+    }
+
     public static func caught(_ c: DeceptionCatch, tone: DeceptionTone) -> DeceptionMessage {
+        if c.attribution == .unknown || c.attribution == .commandLine { return caughtUnsure(c, tone: tone) }
         let sev: Severity = c.access == .mazeWalk && c.mazeDeadEnds < 10 ? .high : .critical
         let who = q(c.processName)
         switch (tone, c.access) {
@@ -34,12 +50,42 @@ public enum DeceptionVoice {
             return .init(title: "Decoy folders are being searched",
                          body: "\(who) (pid \(c.pid)) has opened \(c.mazeDeadEnds) decoy folders. This looks like automated data theft. Severity: \(sev.label).", severity: sev)
         case (.playful, _):
-            let verb = c.access == .rename ? "tried to run off with" : "sniffed"
+            let verb = c.access == .rename || c.access == .copy ? "tried to run off with" : "sniffed"
             return .init(title: "🐱 The cat caught a mouse",
                          body: "\(who) \(verb) your \(decoyLabel(c.decoyKind)). Severity: \(sev.label).", severity: sev)
         case (.serious, _):
             return .init(title: "Decoy file accessed",
                          body: "\(who) (pid \(c.pid)) accessed a RamPart \(decoyLabel(c.decoyKind)). No legitimate app does this. Severity: \(sev.label).", severity: sev)
+        }
+    }
+
+    /// No actor (user mode without the system service), or only a likely one from a command line. Same facts in
+    /// both tones; severity High (it is still a real touch of a file nobody legitimate opens).
+    static func caughtUnsure(_ c: DeceptionCatch, tone: DeceptionTone) -> DeceptionMessage {
+        let sev: Severity = .high
+        let file = q((c.decoyPath as NSString).lastPathComponent)
+        let what = c.access == .mazeWalk ? "searched the decoy folder maze (\(c.mazeDeadEnds) folder\(c.mazeDeadEnds == 1 ? "" : "s") so far)"
+            : "\(verb(c.access)) your \(decoyLabel(c.decoyKind)) \(file)"
+        let dest = c.destPath.map { " It ended up at \(q(($0 as NSString).lastPathComponent))." } ?? ""
+        let when = c.note.map { " (\($0))" } ?? ""
+        if c.attribution == .commandLine {
+            let who = q(c.processName)
+            switch tone {
+            case .playful:
+                return .init(title: "🐱 The cat caught a mouse (probably \(who))",
+                             body: "Something \(what)\(when). Probably \(who): its command line named the file.\(dest) Severity: \(sev.label).", severity: sev)
+            case .serious:
+                return .init(title: "Decoy file accessed, probably by \(who)",
+                             body: "Something \(what)\(when). Likely \(who) (pid \(c.pid)): its command line named the file.\(dest) Severity: \(sev.label).", severity: sev)
+            }
+        }
+        switch tone {
+        case .playful:
+            return .init(title: "🐱 Something touched a bait file",
+                         body: "Something \(what)\(when). \(unattributedLimit).\(dest) Severity: \(sev.label).", severity: sev)
+        case .serious:
+            return .init(title: "Decoy file accessed (program unknown)",
+                         body: "Something \(what)\(when). \(unattributedLimit).\(dest) No legitimate app does this. Severity: \(sev.label).", severity: sev)
         }
     }
 

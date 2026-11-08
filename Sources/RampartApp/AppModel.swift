@@ -461,6 +461,7 @@ final class AppModel {
                 let heavy = Date().timeIntervalSince(lastHeavyRefresh) > 600
                 let c0 = ProcStats.cpuSeconds(), t0 = Date()
                 await refresh(heavy: heavy)
+                await CatAndMouseModel.shared.backgroundPoll()   // Cat & Mouse catches notify without the screen open
                 if Headless.active {
                     HeadlessRunner.log(String(format: "headless-check: periodic refresh%@ took %.2f s wall, %.3f s CPU; activity=%d",
                                               heavy ? " (heavy)" : "", Date().timeIntervalSince(t0), ProcStats.cpuSeconds() - c0, activity.count))
@@ -671,6 +672,7 @@ final class AppModel {
         eventHandle = client.stream(.subscribeEvents, onMessage: { resp in
             if case .event(let d) = resp { AppModel.shared.receive(detection: d) }
             if case .emergency(let d) = resp { EmergencyModel.shared.receivePush(d) }
+            if case .deception(let d) = resp { CatAndMouseModel.shared.receiveAlert(d) }   // Cat & Mouse catch / lure knock
             return true
         }, onEnd: { _ in
             AppModel.shared.eventHandle = nil
@@ -682,7 +684,9 @@ final class AppModel {
         if mode == .live { scheduleActivityFetch() }   // the service logged it; show it within a second or two
         else { recordActivity(Self.activityEntry(for: d)) }
         // Notify only for "Needs you" (likely or confirmed); possible findings and notes stay quiet in FYI.
-        if DetectionPolicy.tier(d) == .needsYou { Notifier.shared.threat(d) }
+        // Decoy and lure detections get their own Cat & Mouse notification (one per story): don't post a second one.
+        let catMouse = d.name == "Decoy accessed: credential theft behaviour" || d.name == "Network lure contacted"
+        if DetectionPolicy.tier(d) == .needsYou && !catMouse { Notifier.shared.threat(d) }
     }
 
     /// PasteGuard runs in the app: its decisions are recorded here (reasons only, never the command text).

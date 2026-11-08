@@ -10,7 +10,7 @@ import RampartGuard
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifier()
 
-    enum Category: String { case threat = "app.rampart.threat", scan = "app.rampart.scan", network = "app.rampart.network", update = "app.rampart.update", weekly = "app.rampart.weekly", wifi = "app.rampart.wifi", lockdown = "app.rampart.lockdown" }
+    enum Category: String { case threat = "app.rampart.threat", scan = "app.rampart.scan", network = "app.rampart.network", update = "app.rampart.update", weekly = "app.rampart.weekly", wifi = "app.rampart.wifi", lockdown = "app.rampart.lockdown", catMouse = "app.rampart.catmouse", catMouseContain = "app.rampart.catmouse.contain" }
 
     private let defaults = UserDefaults.standard
     private var lastNonCritical: Date? {
@@ -34,7 +34,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         let restore = UNNotificationAction(identifier: "restoreInternet", title: EmergencyNotice.restoreAction, options: [.foreground])
         let details = UNNotificationAction(identifier: "lockdownDetails", title: EmergencyNotice.detailsAction, options: [.foreground])
         let lockdown = UNNotificationCategory(identifier: Category.lockdown.rawValue, actions: [restore, details], intentIdentifiers: [])
-        center.setNotificationCategories([threat, wifi, lockdown])
+        let catDetails = UNNotificationAction(identifier: "catDetails", title: "Details", options: [.foreground])
+        let catContain = UNNotificationAction(identifier: "catContain", title: "Contain it", options: [.destructive])
+        let cat = UNNotificationCategory(identifier: Category.catMouse.rawValue, actions: [catDetails], intentIdentifiers: [])
+        let catC = UNNotificationCategory(identifier: Category.catMouseContain.rawValue, actions: [catDetails, catContain], intentIdentifiers: [])
+        center.setNotificationCategories([threat, wifi, lockdown, cat, catC])
         center.getNotificationSettings { s in
             let ok = s.authorizationStatus == .authorized || s.authorizationStatus == .provisional
             DispatchQueue.main.async { MainActor.assumeIsolated { Notifier.shared.authorized = ok } }
@@ -84,6 +88,24 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         } else {
             post(.threat, title: "1 item needs your attention", body: "\(Product.name) stopped \"\(name)\". Open \(Product.name) to choose what to do next.", critical: true)
         }
+    }
+
+    /// Cat & Mouse: one notification per story (same identifier ⇒ a burst replaces it with a growing count).
+    /// Never rate-limited. "Contain it" only while the named program is still running.
+    func catMouse(_ a: CatMouseAlert) {
+        guard let center else { return }
+        let c = UNMutableNotificationContent()
+        c.title = a.title
+        c.body = a.body
+        c.threadIdentifier = Category.catMouse.rawValue
+        let running = a.pid.map { $0 > 1 && kill($0, 0) == 0 } ?? false
+        c.categoryIdentifier = (running && !a.calm ? Category.catMouseContain : Category.catMouse).rawValue
+        var info: [String: String] = ["alertID": a.id.uuidString]
+        if let id = a.catchID { info["catchID"] = id.uuidString }
+        c.userInfo = info
+        c.interruptionLevel = a.calm ? .passive : (a.timeSensitive ? .timeSensitive : .active)
+        if !a.calm, defaults.bool(forKey: "notif.sounds") || a.timeSensitive { c.sound = .default }
+        center.add(UNNotificationRequest(identifier: a.identifier, content: c, trigger: nil)) { _ in }
     }
 
     func scanFinished(_ r: ScanRecord) {
@@ -165,6 +187,20 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                 NSApp.activate(ignoringOtherApps: true)
                 AppModel.shared.selection = .emergency
                 if restore { Task { await EmergencyModel.shared.killSwitch() } }
+            }
+            return
+        }
+        let cat = response.notification.request.content.categoryIdentifier
+        if cat == Category.catMouse.rawValue || cat == Category.catMouseContain.rawValue {
+            let action = response.actionIdentifier
+            let catchID = (response.notification.request.content.userInfo["catchID"] as? String).flatMap(UUID.init(uuidString:))
+            await MainActor.run {
+                if action == "catContain", let id = catchID {
+                    Task { await CatAndMouseModel.shared.contain(catchID: id) }
+                } else if action == "catDetails" || action == UNNotificationDefaultActionIdentifier {
+                    NSApp.activate(ignoringOtherApps: true)
+                    AppModel.shared.selection = .catAndMouse
+                }
             }
             return
         }

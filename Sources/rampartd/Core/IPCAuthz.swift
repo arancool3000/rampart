@@ -193,7 +193,7 @@ enum IPCAuthz {
         switch r {
         case .status, .health, .checkURL, .checkURLChain, .scamCheck, .webLookup, .scan, .forwardEvents:
             return .anyLocal
-        case .deceptionStatus, .deceptionEvidence:
+        case .deceptionStatus, .deceptionEvidence, .deceptionContain:
             return .sessionUser
         case .deceptionSetDecoys(let on), .deceptionSetMaze(let on):
             return on ? .adminClient : .adminClientWeakening

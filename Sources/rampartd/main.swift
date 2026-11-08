@@ -138,6 +138,13 @@ Emergency.start(protection)
 if let dec = DaemonWiring.deception {
     dec.notify = { m in protection.activity.add(.detection, m.title, detail: m.body, outcome: "decoy", severity: m.severity, event: .deceptionEvent, actor: .system) }
     dec.onLureDetection = { d in protection.handle(d) }
+    dec.onDetection = { d in protection.handle(d) }   // watcher catches with a certain, still-running actor
+    // Every catch / lure knock becomes a notification posted by the app's menu bar process. When no app is listening,
+    // wake the login agent (menu bar only, no window); it posts what it missed from `status().alerts`.
+    dec.onAlert = { a in
+        if let d = try? JSONEncoder.rampart.encode(a) { protection.broadcastDeceptionAlert(d) }
+        if protection.subscriberCount == 0 { AgentWake.wake() }
+    }
     // An automatic signal (not a manual lockdown): it goes through the corroboration policy and never cuts the network alone.
     dec.onEmergency = { why in
         Emergency.automatic(protection, reason: EmergencyTriggerReason(kind: .deception, summary: "Cat & Mouse: " + why, confidence: 90), detection: nil)

@@ -358,6 +358,8 @@ public enum IPCRequest: Codable, Sendable {
     case deceptionEvidence(catchID: UUID)            // -> .deceptionEvidence(Data)
     // v7 (added later in v7; an older v7 daemon answers "unknown request", which the app treats as unsupported)
     case deceptionSetDecoysVisible(visible: Bool)    // -> .deception(Data)
+    // "Contain it" on a Cat & Mouse notification: stop the still-running program a catch names -> .deception(Data)
+    case deceptionContain(catchID: UUID)
 }
 
 public enum IPCResponse: Codable, Sendable {

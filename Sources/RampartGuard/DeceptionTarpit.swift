@@ -16,6 +16,8 @@ public struct TarpitAttempt: Codable, Hashable, Sendable, Identifiable {
     public var credentialAttempts: Int = 0
     public var seconds: Double
     public var refused: String? = nil  // set when dropped by scope / rate / concurrency caps
+    /// What the lure answered (its jokes), sanitised, first 12 lines. Never contains what the peer typed.
+    public var replies: [String]? = nil
 }
 
 public final class TarpitServer: @unchecked Sendable {
@@ -120,11 +122,13 @@ public final class TarpitServer: @unchecked Sendable {
         var total = 0
         var creds = 0
         var lastInput = Date()
+        var replies: [String] = []
         let deadline = start.addingTimeInterval(limits.maxSessionSeconds)
 
         func send(_ lines: [String]) -> Bool {
             for l in lines {
                 if isStopped || Date() > deadline { return false }
+                if replies.count < 12 { let t = SafeText.line(l, max: 160); if !t.isEmpty { replies.append(t) } }
                 let b = Array((l + "\r\n").utf8)
                 if Darwin.send(c, b, b.count, 0) < 0 { return false }
                 if lineDelay > 0 { Thread.sleep(forTimeInterval: lineDelay) }   // the tarpit
@@ -155,6 +159,6 @@ public final class TarpitServer: @unchecked Sendable {
         }
         record(TarpitAttempt(date: start, port: boundPort == 0 ? port : boundPort, proto: proto, remote: remote,
                              clientBanner: SafeText.line(sm.firstLine, max: 120), bytesReceived: total,
-                             credentialAttempts: creds, seconds: Date().timeIntervalSince(start)))
+                             credentialAttempts: creds, seconds: Date().timeIntervalSince(start), replies: replies))
     }
 }

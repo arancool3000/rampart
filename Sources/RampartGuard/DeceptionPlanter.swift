@@ -56,6 +56,7 @@ public struct DecoyPlanter: Sendable {
             throw errno == EEXIST ? DeceptionError.exists(path) : DeceptionError.io("rename \(errno)")
         }
         if hideFromFinder { _ = lchflags(path, UInt32(UF_HIDDEN)) }
+        DecoyIO.arm(path)   // atime a day before mtime: the next read moves it forward (see DecoyWatcher)
         let hash = deceptionSHA256(data)
         let created = Date(timeIntervalSince1970: floor(now.timeIntervalSince1970))
         registry.add(DecoyRecord(path: path, kind: kind, contentSHA256: hash, created: created,
@@ -132,11 +133,14 @@ public struct DecoyPlanter: Sendable {
         guard lstat(dir, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else { throw DeceptionError.unsafePath(dir) }
     }
 
+    /// RamPart's own read of a decoy: never follows a link and never updates atime (so it can't look like a thief).
     static func readNoFollow(_ p: String) -> Data? {
-        let fd = open(p, O_RDONLY | O_NOFOLLOW)
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-        return FileHandle(fileDescriptor: fd, closeOnDealloc: false).readDataToEndOfFile()
+        DecoyIO.withoutAtimeUpdates {
+            let fd = open(p, O_RDONLY | O_NOFOLLOW)
+            guard fd >= 0 else { return nil }
+            defer { close(fd) }
+            return FileHandle(fileDescriptor: fd, closeOnDealloc: false).readDataToEndOfFile()
+        }
     }
 
     static func readLink(_ p: String) -> String? {
