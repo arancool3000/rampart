@@ -83,7 +83,12 @@ enum EmergencyBridge {
         }
         let first = await ask(nil)
         if case .success = first { return first }
-        guard let form = AdminAuthorization.externalForm() else { return .failure(Failure(message: "Administrator authentication was cancelled.")) }
+        guard let form = AdminAuthorization.externalForm() else {
+            let code = AdminAuthorization.lastStatus
+            let msg = code == errAuthorizationCanceled ? "Administrator authentication was cancelled."
+                : "macOS didn't show the password prompt (code \(code)). Use Super Kill Switch, or run in Terminal: sudo /Applications/RamPart.app/Contents/Helpers/rampart emergency off"
+            return .failure(Failure(message: msg))
+        }
         return await ask(form)
     }
 }
@@ -92,8 +97,12 @@ enum EmergencyBridge {
 /// (never at launch, never in headless runs, never with RAMPART_NO_PRIVILEGED_TOOLS).
 @MainActor
 enum AdminAuthorization {
+    /// Last AuthorizationCopyRights result, so a failure isn't misreported as "cancelled".
+    static var lastStatus: OSStatus = errAuthorizationSuccess
     static func externalForm() -> Data? {
         guard EmergencyAppActions.sessionActionsAllowed else { return nil }
+        // The password sheet only appears for the frontmost app; RamPart often runs as a menu bar (background) app.
+        NSApp.activate(ignoringOtherApps: true)
         var ref: AuthorizationRef?
         guard AuthorizationCreate(nil, nil, [], &ref) == errAuthorizationSuccess, let ref else { return nil }
         defer { AuthorizationFree(ref, []) }
@@ -109,6 +118,7 @@ enum AdminAuthorization {
         // The daemon accepts RamPart's own right or, failing that, the standard admin right.
         var st = obtain(ProtectionDisableFlow.rightName)
         if st != errAuthorizationSuccess && st != errAuthorizationCanceled { st = obtain(ProtectionDisableFlow.fallbackRight) }
+        lastStatus = st
         guard st == errAuthorizationSuccess else { return nil }
         var form = AuthorizationExternalForm()
         guard AuthorizationMakeExternalForm(ref, &form) == errAuthorizationSuccess else { return nil }

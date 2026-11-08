@@ -519,13 +519,16 @@ final class AppModel {
         return m
     }
 
+    private var refreshOwnsError = false
+
     func refresh(heavy: Bool = true) async {
         guard mode == .live else { return }
         do {
             if case .status(let s) = try await client.request(.status) { status = s; daemonOutdated = (s.ipcVersion ?? 0) < IPC.version }
-            lastError = nil
+            // Only clear an error the refresh itself raised: errors from user actions stay until dismissed.
+            if refreshOwnsError { lastError = nil; refreshOwnsError = false }
         } catch {
-            lastError = AppModel.userFacing(error)
+            lastError = AppModel.userFacing(error); refreshOwnsError = true
             return
         }
         // Each v2 request is optional: an older daemon answers .error and that screen keeps its empty state.
