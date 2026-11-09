@@ -13,6 +13,11 @@ enum FeatureRouter {
         case .refresh: RefreshDestinationView(item: .refreshSmart)
         case .emergency: EmergencyView()
         case .catAndMouse: CatAndMouseView()
+        case .downloadGate: DownloadGateView()
+        case .mediaGuard: MediaGuardView()
+        case .appFirewall: AppFirewallView()
+        case .privacyFilters: PrivacyFiltersView()
+        case .vpn: VPNView()
         case .authenticator: AuthenticatorView()
         case .passwordChecker: PasswordCheckerView()
         case .networkScan: NetworkScanView()
@@ -25,7 +30,7 @@ enum FeatureRouter {
 
 /// Feature services that run in the user session. Kept here so the core app files don't import feature modules.
 enum AppFeatures {
-    @MainActor static func startBackgroundServices() { PasteGuardHost.shared.start(); ScamAIWiring.install(); PublicWiFiHost.shared.start(); FDAAutoPrompt.runIfNeeded() }
+    @MainActor static func startBackgroundServices() { PasteGuardHost.shared.start(); ScamAIWiring.install(); PublicWiFiHost.shared.start(); VPNAutoConnector.shared.start(); FDAAutoPrompt.runIfNeeded(); DesktopMode.shared.start(); BotController.shared.start(); BreachWatch.shared.start() }
     @MainActor static func explain(_ d: Detection) {
         AIChatModel.shared.explain(d)
         AppModel.shared.selection = .aiAssistant

@@ -2,6 +2,7 @@ import Foundation
 import RampartShared
 import RampartPosture
 import RampartGuard
+import RampartNetwork
 
 /// Identity of the IPC caller (from getpeereid), or the local process in CLI --local mode.
 struct Peer {
@@ -31,6 +32,7 @@ final class Router {
              .setSettings, .setRealtime, .remediate, .addAllowRule, .removeAllowRule,
              .allowRemoteTool, .revokeRemoteTool, .setRemoteLockdown, .disableProtection, .requestUninstall, .uninstall,
              .restoreQuarantinedTo, .exportQuarantined, .sandboxRun, .liftEmergencyLockdown, .killSwitch: return true
+        case .vpn(let op, _): return op != "status"
         default: return false
         }
     }
@@ -66,6 +68,12 @@ final class Router {
         case .deceptionSetTarpit: return "deceptionSetTarpit"; case .deceptionSetTone: return "deceptionSetTone"
         case .deceptionEvidence: return "deceptionEvidence"; case .deceptionSetDecoysVisible: return "deceptionSetDecoysVisible"
         case .deceptionContain: return "deceptionContain"
+        case .vpn(let op, _): return "vpn." + (op.count <= 24 && op.allSatisfy { $0.isLetter } ? op : "other")
+        case .downloadGateStatus: return "downloadGateStatus"; case .downloadGateSetEnabled: return "downloadGateSetEnabled"
+        case .downloadGateDecide: return "downloadGateDecide"; case .mediaGuardStatus: return "mediaGuardStatus"
+        case .mediaGuardSetEnabled: return "mediaGuardSetEnabled"; case .mediaGuardTrust: return "mediaGuardTrust"
+        case .mediaGuardStop: return "mediaGuardStop"; case .mediaGuardSetTone: return "mediaGuardSetTone"
+        case .netGuard: return "netGuard"
         }
     }
 
@@ -88,6 +96,7 @@ final class Router {
     func authorizationDenial(_ req: IPCRequest, peer: Peer) -> String? {
         var weakens = true
         if case .setSettings(let s) = req { weakens = IPCAuthz.settingsWeaken(old: p.settings(), new: s) }
+        if case .netGuard(let d) = req { weakens = p.services.netGuard?.weakens(d) ?? true }
         let level = IPCAuthz.level(req, settingsWeakens: weakens)
         let caller = AuthzCaller(uid: peer.uid, isAdmin: peer.isAdmin, isConsole: AuthzCaller.consoleUID() == peer.uid,
                                  client: peer.client,
@@ -215,8 +224,8 @@ final class Router {
                 // New exclusions broader than one user-owned subfolder need an admin-authenticated session
                 // (requestDisableProtection + disableProtection(token, minutes: 0)).
                 let old = Set(p.runtime.config.exclusions)
-                let added = s.exclusions.map { ($0 as NSString).expandingTildeInPath }.filter { $0.hasPrefix("/") && !old.contains($0) }
-                if let broad = added.first(where: { !PathScope.isNarrowUserScope($0, uid: peer.uid) }),
+                let added = s.exclusions.map { e in autoreleasepool { (e as NSString).expandingTildeInPath } }.filter { $0.hasPrefix("/") && !old.contains($0) }
+                if let broad = added.first(where: { a in autoreleasepool { !PathScope.isNarrowUserScope(a, uid: peer.uid) } }),
                    !(p.services.guardian?.hasAuthenticatedSession(peer) ?? false) {
                     throw ServiceError.denied("excluding \(broad) needs administrator confirmation (authenticate first)")
                 }
@@ -408,6 +417,57 @@ final class Router {
             case .deceptionEvidence(let id):
                 guard let e = try deception().evidence(catchID: id) else { throw ServiceError.notFound("catch \(id)") }
                 _ = send(.deceptionEvidence(try JSONEncoder.rampart.encode(e)))
+            case .netGuard(let d):
+                guard let ng = p.services.netGuard else { throw ServiceError.unavailable("App Firewall and content filter") }
+                guard let cmd = try? JSONDecoder.rampart.decode(NetGuardCommand.self, from: d) else { throw ServiceError.failed("unreadable App Firewall request") }
+                if cmd.op == .classifyHosts {   // browser extension (via rampart-nmh): slim answer, no connection data
+                    let r = TrackerClassifier.classify(hosts: Array((cmd.hosts ?? []).prefix(500)), pageHost: cmd.pageHost, policy: ng.policy)
+                    _ = send(.netGuard(try JSONEncoder.rampart.encode(r))); return .done
+                }
+                let st = try ng.handle(cmd)
+                switch cmd.op {
+                case .firewallDecide, .firewallForget:
+                    let app = st.firewall.rules.first { $0.key == cmd.key }?.name ?? (cmd.key.map { ($0 as NSString).lastPathComponent } ?? "app")
+                    let what = cmd.op == .firewallForget ? "rule removed for \(app)" : "\(app): \(cmd.decision?.rawValue ?? "")"
+                    p.activity.add(.settings, "App Firewall: \(what)", outcome: cmd.decision?.rawValue ?? "forget", event: .settingsChanged, actor: .user,
+                                   facts: ["changes": "App Firewall: \(what)"])
+                case .filterSet:
+                    p.activity.add(.settings, "Content filter settings changed", outcome: "saved", event: .settingsChanged, actor: .user,
+                                   facts: ["changes": "Content filter: \(st.activeNow.joined(separator: ", "))\(st.filter.safeSearch ? " + SafeSearch" : "")"])
+                default: break
+                }
+                _ = send(.netGuard(try JSONEncoder.rampart.encode(st)))
+            // Download Gate and Camera & Microphone Guard (FeatureServices.swift; user-session daemon only)
+            case .downloadGateStatus:
+                _ = send(.downloadGate(try JSONEncoder.rampart.encode(try FeatureServices.gate().status())))
+            case .downloadGateSetEnabled(let on):
+                let g = try FeatureServices.gate()
+                p.activity.add(.settings, "Download Gate turned \(on ? "on" : "off")", outcome: on ? "on" : "off", event: .protectionToggled, actor: .user)
+                _ = send(.downloadGate(try JSONEncoder.rampart.encode(g.setEnabled(on))))
+            case .downloadGateDecide(let id, let allow):
+                let g = try FeatureServices.gate()
+                _ = try g.decide(id: id, allow: allow)
+                _ = send(.downloadGate(try JSONEncoder.rampart.encode(g.status())))
+            case .mediaGuardStatus:
+                _ = send(.mediaGuard(try JSONEncoder.rampart.encode(try FeatureServices.media().status())))
+            case .mediaGuardSetEnabled(let on):
+                let m = try FeatureServices.media()
+                p.activity.add(.settings, "Camera & Microphone Guard turned \(on ? "on" : "off")", outcome: on ? "on" : "off", event: .protectionToggled, actor: .user)
+                _ = send(.mediaGuard(try JSONEncoder.rampart.encode(m.setEnabled(on))))
+            case .mediaGuardTrust(let appID, let trusted):
+                let st = try FeatureServices.media().setTrusted(appID, trusted: trusted)
+                p.activity.add(.settings, "\(trusted ? "Trusted" : "Stopped trusting") \(SafeText.line(appID, max: 80)) for camera and microphone",
+                               outcome: trusted ? "trusted" : "untrusted", event: .settingsChanged, actor: .user, target: appID)
+                _ = send(.mediaGuard(try JSONEncoder.rampart.encode(st)))
+            case .mediaGuardStop(let appID):
+                let st = try FeatureServices.media().stopApp(appID)
+                p.activity.add(.realtime, "Stopped \(SafeText.line(appID, max: 80)) (camera / microphone)", outcome: "stopped", severity: .medium,
+                               event: .processStopped, actor: .user, target: appID)
+                _ = send(.mediaGuard(try JSONEncoder.rampart.encode(st)))
+            case .mediaGuardSetTone(let serious):
+                _ = send(.mediaGuard(try JSONEncoder.rampart.encode(try FeatureServices.media().setTone(serious: serious))))
+            case .vpn(let op, let body):
+                _ = send(.vpn(try VPNWiring.handle(op: op, body: body)))
             case .subscribeEvents:
                 let token = p.subscribe(send)
                 _ = send(.ok)

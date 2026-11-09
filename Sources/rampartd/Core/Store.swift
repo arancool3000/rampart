@@ -80,6 +80,8 @@ final class DetectionStore {
 
 /// Small persistent daemon state (last scan, last update, persistence baseline, posture score).
 struct DaemonState: Codable {
+    /// The service's own cdhash the last time it had Full Disk Access (detects "lost FDA after an update").
+    var fdaGrantCDHash: String?
     var lastScan: Date?
     var lastQuickScan: Date?
     var lastUpdate: Date?

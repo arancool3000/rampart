@@ -43,10 +43,16 @@ extension SelfTest {
             ("attackx3", SelfTest.attackX3Checks),
             ("integration", SelfTest.integrationChecks),
             ("deception", SelfTest.deceptionChecks),
+            ("bot", SelfTest.botChecks),
+            ("gates", SelfTest.protectionGateChecks),
             ("b5x", SelfTest.b5xChecks),
             ("activity", SelfTest.activityChecks),
             ("compress", SelfTest.compressChecks),
             ("snr", SelfTest.signalNoiseChecks),
+            ("vpn", SelfTest.vpnChecks),
+            ("netguard", SelfTest.netGuardChecks),
+            ("desktop", SelfTest.desktopChecks),
+            ("reliability", SelfTest.reliabilityChecks),
         ]
     }
 }

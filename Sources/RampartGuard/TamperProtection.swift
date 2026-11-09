@@ -93,12 +93,39 @@ public final class TamperDetector: @unchecked Sendable {
         for k in ready.keys { pending[k] = nil }
         let spilled = overflow; overflow = []
         lock.unlock()
-        return spilled + ready.values.sorted { $0.detection.date < $1.detection.date }.compactMap { p in
+        return spilled + flushUnloads(now: now, force: force) + ready.values.sorted { $0.detection.date < $1.detection.date }.compactMap { p in
             if p.isPlist {
                 return FileManager.default.fileExists(atPath: p.path) && plistValidator(p.path) ? nil : p.detection
             }
             return bundleValidator(paths.appBundle) && serviceAlive() ? nil : p.detection
         }
+    }
+
+    public static let launchctlReloadVerbs: Set<String> = ["bootstrap", "load", "kickstart"]
+    public static let userDaemonLabel = Product.bundlePrefix + ".userdaemon"
+    static func sessionJobLabels(_ paths: GuardPaths) -> [String] { [paths.agentLabel, userDaemonLabel] }
+    private var reloaded: [String: Date] = [:]
+    private struct HeldUnload { let detection: Detection; let label: String; let firstSeen: Date; let due: Date }
+    private var heldUnloads: [String: HeldUnload] = [:]
+
+    private func holdUnload(_ d: Detection, label: String, at date: Date) {
+        lock.lock(); defer { lock.unlock() }
+        if heldUnloads[label] == nil, heldUnloads.count < 16 {
+            heldUnloads[label] = HeldUnload(detection: d, label: label, firstSeen: date, due: max(date, Date()).addingTimeInterval(updateGrace))
+        }
+    }
+
+    /// Held session-job unloads whose grace period is over: reported unless the same job was loaded again since.
+    private func flushUnloads(now: Date, force: Bool) -> [Detection] {
+        lock.lock(); defer { lock.unlock() }
+        let horizon = now.addingTimeInterval(max(maxHold, updateGrace) + 1)
+        var out: [Detection] = []
+        for (k, h) in heldUnloads {
+            let back = reloaded[h.label].map { $0 >= h.firstSeen } ?? false
+            if back { heldUnloads[k] = nil; continue }
+            if force || h.due <= now || h.due > horizon { heldUnloads[k] = nil; out.append(h.detection) }
+        }
+        return out
     }
 
     public static let launchctlUnloadVerbs: Set<String> = ["bootout", "unload", "disable", "remove", "kill", "stop", "bsexec", "asuser", "submit", "attach", "debug"]
@@ -257,9 +284,27 @@ public final class TamperDetector: @unchecked Sendable {
            args.dropFirst().contains(where: { a in paths.labels.contains { a.hasSuffix("/" + $0) || a == $0 } }) { tool = "launchctl" }
         guard mentionsUs else { return [] }
 
+        // rampart-setup.sh install / install-from reloads the per-user jobs: `launchctl bootout gui/<uid>/app.rampart.agent`
+        // then `launchctl bootstrap gui/<uid> /Library/LaunchAgents/app.rampart.agent.plist`. A reload is noted here.
+        if tool == "launchctl", let verb = args.dropFirst().first(where: { Self.launchctlReloadVerbs.contains($0) }) {
+            for label in Self.sessionJobLabels(paths) where args.dropFirst().contains(where: { $0.hasSuffix("/" + label) || $0 == label || $0.hasSuffix("/" + label + ".plist") }) {
+                lock.lock(); reloaded[label] = ev.date; lock.unlock()
+            }
+            _ = verb
+        }
         if tool == "launchctl", args.dropFirst().contains(where: { Self.launchctlUnloadVerbs.contains($0) }), paths.isOurLabel(joined) || args.contains(where: isProtectedArg) {
             guard dedupe("unload:\(joined)", at: ev.date) else { return [] }
-            return [detection(.unloadAttempt, severity: .critical, score: 95, title: "launchctl used against \(Product.name)", detail: joined, ev: ev, path: nil)]
+            let d = detection(.unloadAttempt, severity: .critical, score: 95, title: "launchctl used against \(Product.name)", detail: joined, ev: ev, path: nil)
+            // Only the per-user session jobs (menu bar agent, user helper) are held: a bootout followed by a bootstrap of the
+            // same job within the grace period is an install / upgrade reloading it, not tampering. The system service
+            // labels are always reported at once.
+            let targets = args.dropFirst().filter { a in paths.labels.contains { a.hasSuffix("/" + $0) } || a.hasSuffix("/" + Self.userDaemonLabel) }
+            let session = Self.sessionJobLabels(paths)
+            if !targets.isEmpty, targets.allSatisfy({ t in t.hasPrefix("gui/") && session.contains { t.hasSuffix("/" + $0) } }),
+               let label = session.first(where: { l in targets.contains { $0.hasSuffix("/" + l) } }) {
+                holdUnload(d, label: label, at: ev.date); return []
+            }
+            return [d]
         }
         if Self.fileMutators.contains(tool), let target = args.first(where: isProtectedArg) {
             guard dedupe("mutate:\(p.pid):\(target)", at: ev.date) else { return [] }
@@ -350,9 +395,15 @@ public final class TamperDetector: @unchecked Sendable {
     /// For the daemon's settings handler: refuse exclusions that cover our own install paths and raise a detection.
     /// Returns the offending entries. Call before persisting `RampartSettings.exclusions`.
     public func exclusionsCoveringSelf(_ exclusions: [String]) -> [String] {
-        exclusions.filter { e in
-            let n = GuardPaths.normalize(e)
-            return paths.isProtected(n) || n == "/" || paths.protectedPrefixes.contains { $0.hasPrefix(n + "/") } || n == "/Library" || n == "/Applications"
+        // Normalise the protected prefixes once (not once per exclusion) and drain temporaries per entry: 100k
+        // exclusions used to create ~1M autoreleased NSStrings in one request.
+        let prefixes = paths.protectedPrefixes.map(GuardPaths.normalize)
+        return exclusions.filter { e in
+            autoreleasepool {
+                let n = GuardPaths.normalize(e)
+                return n == "/" || n == "/Library" || n == "/Applications"
+                    || prefixes.contains { n == $0 || n.hasPrefix($0 + "/") || $0.hasPrefix(n + "/") }
+            }
         }
     }
 

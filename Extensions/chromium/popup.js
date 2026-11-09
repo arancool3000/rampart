@@ -9,6 +9,8 @@ async function refresh() {
   document.getElementById("enabled").checked = !!s.enabled;
   document.getElementById("clip").checked = !!s.interceptClipboard;
   document.getElementById("allowcount").textContent = (s.allowedHosts.length || 0) + " trusted site" + (s.allowedHosts.length === 1 ? "" : "s");
+  const tr = document.getElementById("trackers");
+  if (tr) tr.textContent = st.trackers ? (st.trackers.count + " tracker" + (st.trackers.count === 1 ? "" : "s") + " on " + st.trackers.host + (st.trackers.companies.length ? " (" + st.trackers.companies.join(", ") + ")" : "")) : "";
   const line = document.getElementById("hostline");
   // Built with textContent: the version string comes from the native host, never parsed as HTML.
   const dot = (cls) => { const d = document.createElement("span"); d.className = cls; d.textContent = "●"; return d; };

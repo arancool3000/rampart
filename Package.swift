@@ -29,6 +29,8 @@ let package = Package(
         .target(name: "RampartVault", dependencies: ["RampartShared"]),
         .target(name: "RampartAI", dependencies: ["RampartShared"]),
         .target(name: "RampartRefresh", dependencies: ["RampartShared"]),
+        // RamPart VPN: pure-Swift WireGuard client (runs in the root daemon), config import, home-server setup.
+        .target(name: "RampartVPN", dependencies: ["RampartShared"]),
         .executableTarget(name: "rampart-nmh", dependencies: ["RampartShared", "RampartWeb"]),
         // Cat & Mouse network lure: the tiny sandboxed helper the root daemon starts via launchd (LureContainment).
         .executableTarget(name: "rampart-lure", dependencies: ["RampartGuard"]),
@@ -38,15 +40,15 @@ let package = Package(
         .executableTarget(name: "rampartd", dependencies: [
             "RampartShared", "RampartEngine", "RampartYara", "RampartSigning", "RampartTelemetry",
             "RampartBehaviour", "RampartRemediation", "RampartNetwork", "RampartPosture",
-            "RampartGuard", "RampartWeb"]),
+            "RampartGuard", "RampartWeb", "RampartVPN"]),
         .executableTarget(name: "rampart", dependencies: [
             "RampartShared", "RampartEngine", "RampartYara", "RampartSigning", "RampartRemediation",
-            "RampartPosture", "RampartNetwork", "RampartBehaviour", "RampartGuard", "RampartWeb"]),
-        .executableTarget(name: "RampartApp", dependencies: ["RampartShared", "RampartVault", "RampartAI", "RampartWeb", "RampartNetwork", "RampartBehaviour", "RampartGuard", "RampartRefresh"]),
+            "RampartPosture", "RampartNetwork", "RampartBehaviour", "RampartGuard", "RampartWeb", "RampartVPN"]),
+        .executableTarget(name: "RampartApp", dependencies: ["RampartShared", "RampartVault", "RampartAI", "RampartWeb", "RampartNetwork", "RampartBehaviour", "RampartGuard", "RampartRefresh", "RampartVPN"]),
         .executableTarget(name: "rampart-selftest", dependencies: [
             "RampartShared", "RampartEngine", "RampartYara", "RampartSigning", "RampartTelemetry",
             "RampartBehaviour", "RampartRemediation", "RampartNetwork", "RampartPosture",
-            "RampartGuard", "RampartWeb", "RampartVault", "RampartAI", "RampartRefresh"]),
+            "RampartGuard", "RampartWeb", "RampartVault", "RampartAI", "RampartRefresh", "RampartVPN"]),
     ],
     swiftLanguageModes: [.v5]
 )

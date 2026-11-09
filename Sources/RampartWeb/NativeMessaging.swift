@@ -9,6 +9,7 @@ import RampartShared
 public struct NMRequest: Codable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case ping, checkURL, checkPage, checkText, checkClipboard, allowHost, reportDecision, status
+        case countTrackers   // hosts a page loaded -> trackers / trackerCompanies (needs the daemon's tracker list)
     }
     public var id: String?
     public var type: Kind
@@ -19,6 +20,7 @@ public struct NMRequest: Codable, Sendable {
     public var host: String?
     public var decision: String?          // "continued" | "wentBack" | "dismissedBanner"
     public var tamper: [String]?          // in-page tamper observations from the Safari JS-control scanner
+    public var hosts: [String]?           // countTrackers: third-party hosts the page loaded
     public init(id: String? = nil, type: Kind, url: String? = nil, html: String? = nil, text: String? = nil, signals: PageSignals? = nil, host: String? = nil, decision: String? = nil, tamper: [String]? = nil) {
         self.id = id; self.type = type; self.url = url; self.html = html; self.text = text; self.signals = signals; self.host = host; self.decision = decision; self.tamper = tamper
     }
@@ -47,6 +49,8 @@ public struct NMResponse: Codable, Sendable {
     public var version: String?
     public var daemon: Bool?               // true when rampartd answered (reputation lists loaded)
     public var blocklistDomains: Int?
+    public var trackers: Int?
+    public var trackerCompanies: [String]?
     public init(id: String? = nil, ok: Bool = true, error: String? = nil) { self.id = id; self.ok = ok; self.error = error }
 
     public init(id: String?, report: ScamReport, daemon: Bool) {
@@ -174,6 +178,12 @@ public final class WebVerdictService: @unchecked Sendable {
             return NMResponse(id: req.id)
         case .reportDecision:
             return NMResponse(id: req.id)
+        case .countTrackers:
+            guard let hosts = req.hosts, !hosts.isEmpty else { return NMResponse(id: req.id, ok: false, error: "hosts required") }
+            guard let (n, cos) = (bridge as? TrackerCounting)?.trackerCount(hosts: Array(hosts.prefix(300)), pageHost: req.url.flatMap { URL(string: $0)?.host }) else {
+                return NMResponse(id: req.id, ok: false, error: "tracker list unavailable")
+            }
+            var r = NMResponse(id: req.id); r.trackers = n; r.trackerCompanies = cos; return r
         }
     }
 
@@ -262,7 +272,10 @@ struct DaemonBlocklistProvider: WebBlocklistProvider {
 /// (`.webLookup(host:)` → `.webLookup(Data?)`, `.webVerdict(...)` → `.ok`). Short timeouts; everything
 /// degrades to nil when the daemon is down. Also exposes `checkURL`/`scamCheck` for callers that want
 /// the daemon's (list-backed) verdict instead of a local one.
-public final class IPCDaemonBridge: DaemonBridge, @unchecked Sendable {
+/// Bridges that can classify a page's hosts as trackers (the IPC bridge; test doubles may too).
+public protocol TrackerCounting { func trackerCount(hosts: [String], pageHost: String?) -> (Int, [String])? }
+
+public final class IPCDaemonBridge: DaemonBridge, TrackerCounting, @unchecked Sendable {
     private let lock = NSLock()
     private var lastProbe: Date = .distantPast
     private var available = false
@@ -291,6 +304,16 @@ public final class IPCDaemonBridge: DaemonBridge, @unchecked Sendable {
     public func daemonURLReport(_ url: String) -> URLReport? {
         guard isAvailable, case .urlVerdict(let data)? = roundTrip(.checkURL(url: url), timeoutMs: 3000) else { return nil }
         return try? JSONDecoder.rampart.decode(URLReport.self, from: data)
+    }
+
+    /// Per-site tracker count via IPC `.netGuard` (op classifyHosts, answered with JSON {trackers, companies}).
+    public func trackerCount(hosts: [String], pageHost: String?) -> (Int, [String])? {
+        struct Cmd: Encodable { let op = "classifyHosts"; let hosts: [String]; let pageHost: String? }
+        struct Res: Decodable { let trackers: [String]; let companies: [String] }
+        guard isAvailable, let body = try? JSONEncoder.rampart.encode(Cmd(hosts: hosts, pageHost: pageHost)),
+              case .netGuard(let data)? = roundTrip(.netGuard(body), timeoutMs: 1500),
+              let r = try? JSONDecoder.rampart.decode(Res.self, from: data) else { return nil }
+        return (r.trackers.count, r.companies)
     }
 
     public func daemonScamReport(_ text: String, kind: ScamInputKind) -> ScamReport? {

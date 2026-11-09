@@ -360,6 +360,21 @@ public enum IPCRequest: Codable, Sendable {
     case deceptionSetDecoysVisible(visible: Bool)    // -> .deception(Data)
     // "Contain it" on a Cat & Mouse notification: stop the still-running program a catch names -> .deception(Data)
     case deceptionContain(catchID: UUID)
+    // RamPart VPN (RampartVPN): op is a RampartVPN.VPNOp raw value, body JSON of VPNRequestBody -> .vpn(Data)
+    case vpn(op: String, body: Data?)
+    // v9: App Firewall, content filter / parental controls, privacy report (JSON of RampartNetwork.NetGuardCommand)
+    // -> .netGuard(Data) with JSON of RampartNetwork.NetGuardStatus
+    case netGuard(Data)
+    // v9: Download Gate (RampartGuard/DownloadGate.swift), user-session service -> .downloadGate(Data) (JSON of DownloadGateStatus)
+    case downloadGateStatus
+    case downloadGateSetEnabled(on: Bool)
+    case downloadGateDecide(id: UUID, allow: Bool)       // Allow (restore permission to run) / Delete (move to Trash) a held file
+    // v9: Camera & Microphone Guard (RampartGuard/MediaGuard.swift) -> .mediaGuard(Data) (JSON of MediaGuardStatus)
+    case mediaGuardStatus
+    case mediaGuardSetEnabled(on: Bool)
+    case mediaGuardTrust(appID: String, trusted: Bool)
+    case mediaGuardStop(appID: String)                   // "Stop it", after the app asked the user to confirm
+    case mediaGuardSetTone(serious: Bool)
 }
 
 public enum IPCResponse: Codable, Sendable {
@@ -402,4 +417,10 @@ public enum IPCResponse: Codable, Sendable {
     // v7
     case deception(Data)          // JSON of RampartGuard.DeceptionStatus
     case deceptionEvidence(Data)  // JSON of RampartGuard.DeceptionEvidence
+    case vpn(Data)                // RamPart VPN: JSON of RampartVPN.VPNReply
+    // v9
+    case netGuard(Data)           // JSON of RampartNetwork.NetGuardStatus; pushed to subscribers as JSON of NetGuardPush (new firewall prompts)
+    case downloadGate(Data)       // JSON of RampartGuard.DownloadGateStatus (also pushed to subscribers on every decision)
+    case mediaGuard(Data)         // JSON of RampartGuard.MediaGuardStatus (also pushed when a camera / mic use starts or ends)
+    case mediaGuardAlert(Data)    // JSON of RampartGuard.MediaGuardAlert, pushed for the app to post as a notification
 }

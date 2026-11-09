@@ -2,6 +2,7 @@ import Foundation
 import RampartShared
 import Security
 import RampartGuard
+import RampartNetwork
 
 // rampartd — Rampart protection daemon.
 //   As root (LaunchDaemon): state in /Library/Application Support/Rampart, socket /var/run/rampart.sock.
@@ -79,22 +80,15 @@ let stateLockFD: Int32 = {
     let path = runtime.root.appendingPathComponent("rampartd.lock").path
     let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
     // A user helper left running from a REPLACED copy of the app holds the lock forever (it never restarts by itself).
-    // In user mode only: if the holder is the same user's rampartd at our own path, started before our binary was
-    // installed, stop it and take over.
+    // User mode only: stop it when StaleHelperPolicy agrees (same uid, our signing identity and signer, started before
+    // our binary was installed, same path or its copy is gone), then take over.
     if fd >= 0, flock(fd, LOCK_EX | LOCK_NB) != 0, runtime.userMode, getuid() != 0,
-       let txt = try? String(contentsOfFile: path, encoding: .utf8), let holder = Int32(txt.trimmingCharacters(in: .whitespacesAndNewlines)), holder > 1 {
-        var buf = [CChar](repeating: 0, count: 4096)
+       let holder = StaleHelperPolicy.lockHolder(stateRoot: runtime.root.path) {
         let me = CommandLine.arguments[0].hasPrefix("/") ? CommandLine.arguments[0] : (Bundle.main.executablePath ?? "")
-        var info = proc_bsdinfo()
-        let ok = proc_pidpath(holder, &buf, UInt32(buf.count)) > 0
-            && proc_pidinfo(holder, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0
-        let holderPath = ok ? String(cString: buf) : ""
-        let mine = (try? FileManager.default.attributesOfItem(atPath: me)[.modificationDate] as? Date) ?? nil
-        let started = Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec))
-        if ok, info.pbi_uid == getuid(), holderPath == me, let mine, started < mine {
-            FileHandle.standardError.write(Data("rampartd: stopping stale helper \(holder) from a replaced copy\n".utf8))
-            kill(holder, SIGTERM)
-            for _ in 0..<30 where flock(fd, LOCK_EX | LOCK_NB) != 0 { usleep(100_000) }
+        if let facts = StaleHelperPolicy.selfFacts(binary: me) {
+            let d = StaleHelperPolicy.stopIfStale(pid: holder, me: facts)
+            FileHandle.standardError.write(Data("rampartd: lock held by pid \(holder): \(d.shouldStop ? "stopped" : "kept"), \(d.why)\n".utf8))
+            if d.shouldStop { for _ in 0..<30 where flock(fd, LOCK_EX | LOCK_NB) != 0 { usleep(100_000) } }
         }
     }
     guard fd >= 0, flock(fd, LOCK_EX | LOCK_NB) == 0 else {
@@ -153,6 +147,8 @@ DaemonWiring.hub?.onHealthNote = { n in
 (services.web as? WebProtection)?.onDetection = { protection.handle($0) }
 // Emergency Lockdown: re-applies a persisted lockdown and starts its watch timer.
 Emergency.start(protection)
+// RamPart VPN: removes DNS keys / pf rules a crashed run left behind; connects only when asked (or auto-connect).
+VPNWiring.start(protection)
 // Cat & Mouse: messages to Activity, lure detections to the store, emergencies to the lockdown trigger.
 if let dec = DaemonWiring.deception {
     dec.notify = { m in protection.activity.add(.detection, m.title, detail: m.body, outcome: "decoy", severity: m.severity, event: .deceptionEvent, actor: .system) }
@@ -169,6 +165,16 @@ if let dec = DaemonWiring.deception {
         Emergency.automatic(protection, reason: EmergencyTriggerReason(kind: .deception, summary: "Cat & Mouse: " + why, confidence: 90), detection: nil)
     }
 }
+// App Firewall: an unknown, untrusted app connected out for the first time -> in-app prompt / notification (never a system dialog).
+services.netGuard?.onPrompts = { prompts in
+    for p in prompts {
+        protection.activity.add(.settings, "New app on the internet: \(p.name)", detail: "\(p.signerLabel) · \(p.host ?? p.address)",
+                                outcome: "waiting for your choice", severity: .low, event: .other, actor: .system, target: p.host ?? p.address)
+    }
+    if let d = try? JSONEncoder.rampart.encode(NetGuardPush(prompts: prompts)) { protection.broadcastNetGuard(d) }
+}
+// Download Gate + Camera & Microphone Guard (user-session daemon only).
+FeatureServices.start(protection)
 let router = Router(protection)
 let server = IPCServer(path: runtime.socketPath, router: router, userMode: runtime.userMode)
 do { try server.start() } catch {
@@ -217,7 +223,10 @@ func shutdown(_ why: String) {
     scheduler.stop()
     // The emergency pf anchor never outlives the daemon (SIGTERM, bootout, uninstall), like DNS below.
     Emergency.shutdown(protection)
+    _ = VPNWiring.stop("service stopping")
     services.realtime?.stop()
+    FeatureServices.mediaGuard?.stop(); FeatureServices.downloadGate?.stop()
+    services.netGuard?.stop()   // unloads the App Firewall pf anchor (re-applied at the next start)
     if let w = services.web, w.isOn { try? w.setOn(false) }
     (services.web as? WebProtection)?.restoreOnExit()
     server.stop()

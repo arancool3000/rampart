@@ -1,6 +1,7 @@
 import Foundation
 import Security
 import RampartShared
+import RampartNetwork
 
 // Root-daemon authorization matrix (hardening hx10). Pure and self-contained so rampart-selftest can compile it
 // (Sources/rampart-selftest/IPCAuthz.swift is a symlink to this file) and test every cell.
@@ -195,14 +196,38 @@ enum IPCAuthz {
             return .anyLocal
         case .deceptionStatus, .deceptionEvidence, .deceptionContain:
             return .sessionUser
+        case .downloadGateStatus, .mediaGuardStatus:
+            return .sessionUser
+        case .downloadGateSetEnabled(let on), .mediaGuardSetEnabled(let on):
+            return on ? .adminClient : .adminClientWeakening
+        case .downloadGateDecide(_, let allow):
+            return allow ? .adminClientWeakening : .adminClient
+        case .mediaGuardTrust(_, let trusted):
+            return trusted ? .adminClientWeakening : .adminClient
+        case .mediaGuardStop, .mediaGuardSetTone:
+            return .adminClient
         case .deceptionSetDecoys(let on), .deceptionSetMaze(let on):
             return on ? .adminClient : .adminClientWeakening
         case .deceptionRemoveAll:
             return .adminClientWeakening
         case .deceptionSetTarpit, .deceptionSetTone, .deceptionSetDecoysVisible:
             return .adminClient
+        case .netGuard(let d):
+            switch NetGuardCommand.access(of: d) {
+            case .anyLocal: return .anyLocal
+            case .read: return .sessionUser
+            case .change: return settingsWeakens ? .adminClientWeakening : .adminClient
+            }
         case .emergencyStatus, .emergencyRescan, .emergencyAck:
             return .sessionUser
+        case .vpn(let op, _):
+            // RamPart VPN: status for the session; connect / import / setup strengthen; disconnect, remove and option
+            // changes (kill switch off) weaken. Unknown ops get the strictest level.
+            switch op {
+            case "status": return .sessionUser
+            case "connect", "importConfig", "setupHome": return .adminClient
+            default: return .adminClientWeakening
+            }
         case .emergencyLockdown:
             // Locking down is the safe direction, but it suspends processes and cuts the network: RamPart's own clients only.
             return .adminClient

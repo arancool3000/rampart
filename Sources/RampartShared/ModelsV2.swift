@@ -119,6 +119,8 @@ public enum ActivityEvent: String, Codable, Sendable, CaseIterable {
     case refreshCleanup, refreshUndo, networkScan
     // Cat & Mouse deception messages (decoys touched, tarpit visits)
     case deceptionEvent
+    // Download Gate decisions (cleared / held / blocked / allowed / deleted) and camera / microphone use
+    case downloadGate, cameraMicUsed
     // service
     case serviceStarted, serviceStopped, uninstall
     /// Older free-text entries that match no known decision.

@@ -69,49 +69,94 @@ enum EmergencyBridge {
         } catch { return .failure(Failure(message: error.localizedDescription)) }
     }
 
-    /// Step 1 of the existing admin token flow. Asks without a password first (user mode accepts that); only if
-    /// the system service insists does it show the macOS admin password sheet. Runs only from a button click.
-    static func adminToken(client: DaemonClient) async -> Result<String, EmergencyBridge.Failure> {
+    /// Admin-authenticated call (lift, restore internet, kill switch). User incident 2026-11-09: Touch ID succeeded once
+    /// and the lift still failed; afterwards the app never asked again and showed "administrator authentication is
+    /// required". Root cause: the AuthorizationRef was freed (`defer AuthorizationFree`) before the service read its
+    /// external form, so the service could never verify it; and the right stayed cached, so later clicks didn't prompt.
+    /// Now every call: a fresh prompt (Touch ID or password) → a fresh token → the call → the authorization is freed
+    /// with its rights destroyed. Nothing (token, failure, credential) is reused between clicks.
+    static func withAdminToken(client: DaemonClient, purpose: String, _ body: (String) async -> Outcome) async -> Outcome {
         func ask(_ auth: Data?) async -> Result<String, EmergencyBridge.Failure> {
             do {
-                switch try await client.request(.requestDisableProtection(authorization: auth, reason: "lift emergency lockdown")) {
+                switch try await client.request(.requestDisableProtection(authorization: auth, reason: purpose)) {
                 case .disableToken(let t): return .success(t)
                 case .error(let e): return .failure(Failure(message: e))
                 default: return .failure(Failure(message: "Unexpected reply from \(Product.name)."))
                 }
             } catch { return .failure(Failure(message: error.localizedDescription)) }
         }
-        let first = await ask(nil)
-        if case .success = first { return first }
-        guard let form = AdminAuthorization.externalForm() else {
-            let code = AdminAuthorization.lastStatus
-            let msg = code == errAuthorizationCanceled ? "Administrator authentication was cancelled."
-                : "macOS didn't show the password prompt (code \(code)). Use Super Kill Switch, or run in Terminal: sudo /Applications/RamPart.app/Contents/Helpers/rampart emergency off"
-            return .failure(Failure(message: msg))
+        // Headless / dev runs (zero pop-ups): no prompt; only a user-mode service accepts that.
+        guard EmergencyAppActions.sessionActionsAllowed else {
+            switch await ask(nil) {
+            case .success(let t): return await body(t)
+            case .failure(let f): return .error(f.message)
+            }
         }
-        return await ask(form)
+        let handle: AdminAuthHandle
+        switch AdminAuthorization.obtain(prompt: "\(Product.name) needs an administrator to \(purpose).") {
+        case .failure(let f): return .error(f.message)
+        case .success(let h): handle = h
+        }
+        defer { handle.release() }   // only after the service has redeemed the token
+        switch await ask(handle.form) {
+        case .failure(let f): return .error(f.message)
+        case .success(let t): return await body(t)
+        }
     }
 }
 
-/// AuthorizationServices: shows the standard admin password sheet. Called only after the user clicks "Lift lockdown"
+/// An admin authorization kept alive until the service has used it, then freed with its rights destroyed so the
+/// next action prompts again.
+final class AdminAuthHandle: @unchecked Sendable {
+    let form: Data
+    private var ref: AuthorizationRef?
+    private let lock = NSLock()
+    init(ref: AuthorizationRef, form: Data) { self.ref = ref; self.form = form }
+    func release() {
+        lock.lock(); let r = ref; ref = nil; lock.unlock()
+        if let r { AuthorizationFree(r, [.destroyRights]) }
+    }
+    deinit { release() }
+}
+
+/// AuthorizationServices: shows the standard admin sheet (Touch ID or password). Called only after the user clicks
 /// (never at launch, never in headless runs, never with RAMPART_NO_PRIVILEGED_TOOLS).
 @MainActor
 enum AdminAuthorization {
     /// Last AuthorizationCopyRights result, so a failure isn't misreported as "cancelled".
     static var lastStatus: OSStatus = errAuthorizationSuccess
-    static func externalForm() -> Data? {
-        guard EmergencyAppActions.sessionActionsAllowed else { return nil }
-        // The password sheet only appears for the frontmost app; RamPart often runs as a menu bar (background) app.
+
+    static func message(for status: OSStatus) -> String {
+        switch status {
+        case errAuthorizationCanceled: return "Administrator authentication was cancelled. Nothing was changed; press the button again to retry."
+        case errAuthorizationDenied: return "macOS refused the administrator authentication (wrong password, or this account isn't an administrator). Nothing was changed."
+        case errAuthorizationInteractionNotAllowed: return "macOS couldn't show the administrator prompt. Bring \(Product.name) to the front and try again, or run in Terminal: \(EmergencyStatus.sudoEscape)"
+        default: return "macOS didn't complete the administrator prompt (code \(status)). Try again, use Super Kill Switch, or run in Terminal: \(EmergencyStatus.sudoEscape)"
+        }
+    }
+
+    static func obtain(prompt: String) -> Result<AdminAuthHandle, EmergencyBridge.Failure> {
+        guard EmergencyAppActions.sessionActionsAllowed else { return .failure(.init(message: "Not available in this build.")) }
+        // The sheet only appears for the frontmost app; RamPart often runs as a menu bar (background) app.
         NSApp.activate(ignoringOtherApps: true)
         var ref: AuthorizationRef?
-        guard AuthorizationCreate(nil, nil, [], &ref) == errAuthorizationSuccess, let ref else { return nil }
-        defer { AuthorizationFree(ref, []) }
+        // A brand-new authorization every time: no credential from an earlier click is reused.
+        guard AuthorizationCreate(nil, nil, [], &ref) == errAuthorizationSuccess, let ref else {
+            return .failure(.init(message: "macOS couldn't start an administrator authorization. Try again."))
+        }
         func obtain(_ name: String) -> OSStatus {
             name.withCString { c in
-                var item = AuthorizationItem(name: c, valueLength: 0, value: nil, flags: 0)
-                return withUnsafeMutablePointer(to: &item) { ip in
-                    var rights = AuthorizationRights(count: 1, items: ip)
-                    return AuthorizationCopyRights(ref, &rights, nil, [.interactionAllowed, .extendRights, .preAuthorize], nil)
+                prompt.withCString { pc in
+                    var item = AuthorizationItem(name: c, valueLength: 0, value: nil, flags: 0)
+                    var envItem = AuthorizationItem(name: kAuthorizationEnvironmentPrompt, valueLength: strlen(pc),
+                                                    value: UnsafeMutableRawPointer(mutating: pc), flags: 0)
+                    return withUnsafeMutablePointer(to: &item) { ip in
+                        withUnsafeMutablePointer(to: &envItem) { ep in
+                            var rights = AuthorizationRights(count: 1, items: ip)
+                            var env = AuthorizationEnvironment(count: 1, items: ep)
+                            return AuthorizationCopyRights(ref, &rights, &env, [.interactionAllowed, .extendRights, .preAuthorize], nil)
+                        }
+                    }
                 }
             }
         }
@@ -119,10 +164,16 @@ enum AdminAuthorization {
         var st = obtain(ProtectionDisableFlow.rightName)
         if st != errAuthorizationSuccess && st != errAuthorizationCanceled { st = obtain(ProtectionDisableFlow.fallbackRight) }
         lastStatus = st
-        guard st == errAuthorizationSuccess else { return nil }
+        guard st == errAuthorizationSuccess else {
+            AuthorizationFree(ref, [.destroyRights])
+            return .failure(.init(message: message(for: st)))
+        }
         var form = AuthorizationExternalForm()
-        guard AuthorizationMakeExternalForm(ref, &form) == errAuthorizationSuccess else { return nil }
-        return withUnsafeBytes(of: &form) { Data($0) }
+        guard AuthorizationMakeExternalForm(ref, &form) == errAuthorizationSuccess else {
+            AuthorizationFree(ref, [.destroyRights])
+            return .failure(.init(message: "macOS couldn't hand the administrator authorization to \(Product.name). Try again."))
+        }
+        return .success(AdminAuthHandle(ref: ref, form: withUnsafeBytes(of: &form) { Data($0) }))
     }
 }
 

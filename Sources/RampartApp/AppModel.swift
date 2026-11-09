@@ -8,11 +8,14 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
     case dashboard, scan, threats, activity, network, posture, rules, settings
     // Tools (owned by feature agents; their screens live in Features/<Name>/). One case per feature.
     case scamCheck, passwords, authenticator, passwordChecker, networkScan, aiAssistant, remoteAccess, refresh, emergency, catAndMouse
+    case downloadGate, mediaGuard
+    case appFirewall, privacyFilters
+    case vpn
     // Refresh mode (its own sidebar): one destination per former RefreshView tab / category.
     case refreshSmart, refreshStorage, refreshMap, refreshSpeed, refreshStartup, refreshLargeOld, refreshDuplicates, refreshLeftovers, refreshSettings
 
     static let core: [SidebarItem] = [.dashboard, .scan, .threats, .activity, .network, .posture, .rules, .settings]
-    static let tools: [SidebarItem] = [.emergency, .catAndMouse, .scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess]
+    static let tools: [SidebarItem] = [.emergency, .catAndMouse, .downloadGate, .mediaGuard, .appFirewall, .privacyFilters, .vpn, .scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess]
     static let refreshItems: [SidebarItem] = [.refreshSmart, .refreshStorage, .refreshMap, .refreshSpeed, .refreshStartup, .refreshLargeOld, .refreshDuplicates, .refreshLeftovers, .refreshSettings]
     var isRefresh: Bool { self == .refresh || Self.refreshItems.contains(self) }
     var id: String { rawValue }
@@ -36,6 +39,11 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .refresh: return "Refresh"
         case .emergency: return "Emergency"
         case .catAndMouse: return "Cat & Mouse"
+        case .vpn: return "VPN"
+        case .downloadGate: return "Download Gate"
+        case .mediaGuard: return "Camera & Mic"
+        case .appFirewall: return "App Firewall"
+        case .privacyFilters: return "Filters & Privacy"
         case .refreshSmart: return "Smart Refresh"
         case .refreshStorage: return "Storage Cleanup"
         case .refreshMap: return "Disk Map"
@@ -67,6 +75,11 @@ enum SidebarItem: String, CaseIterable, Identifiable, Hashable {
         case .refresh: return "sparkles.rectangle.stack"
         case .emergency: return "exclamationmark.octagon"
         case .catAndMouse: return "cat"
+        case .vpn: return "network.badge.shield.half.filled"
+        case .downloadGate: return "arrow.down.to.line.circle"
+        case .mediaGuard: return "video.badge.checkmark"
+        case .appFirewall: return "flame"
+        case .privacyFilters: return "line.3.horizontal.decrease.circle"
         case .refreshSmart: return "sparkles"
         case .refreshStorage: return "internaldrive"
         case .refreshMap: return "square.grid.3x3.square"
@@ -462,6 +475,7 @@ final class AppModel {
                 let c0 = ProcStats.cpuSeconds(), t0 = Date()
                 await refresh(heavy: heavy)
                 await CatAndMouseModel.shared.backgroundPoll()   // Cat & Mouse catches notify without the screen open
+                await DownloadGateModel.shared.backgroundPoll(); await MediaGuardModel.shared.backgroundPoll()
                 if Headless.active {
                     HeadlessRunner.log(String(format: "headless-check: periodic refresh%@ took %.2f s wall, %.3f s CPU; activity=%d",
                                               heavy ? " (heavy)" : "", Date().timeIntervalSince(t0), ProcStats.cpuSeconds() - c0, activity.count))
@@ -676,6 +690,10 @@ final class AppModel {
             if case .event(let d) = resp { AppModel.shared.receive(detection: d) }
             if case .emergency(let d) = resp { EmergencyModel.shared.receivePush(d) }
             if case .deception(let d) = resp { CatAndMouseModel.shared.receiveAlert(d) }   // Cat & Mouse catch / lure knock
+            if case .downloadGate(let d) = resp { DownloadGateModel.shared.receive(d) }
+            if case .mediaGuard(let d) = resp { MediaGuardModel.shared.receiveStatus(d) }
+            if case .mediaGuardAlert(let d) = resp { MediaGuardModel.shared.receiveAlert(d) }
+            if case .netGuard(let d) = resp { NetGuardModel.shared.receivePush(d) }   // App Firewall first-connection prompt
             return true
         }, onEnd: { _ in
             AppModel.shared.eventHandle = nil

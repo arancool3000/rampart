@@ -179,11 +179,17 @@ final class IPCServer {
                 tv = timeval(tv_sec: 300, tv_usec: 0)
                 setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
             }
-            let req: IPCRequest
-            do { req = try JSONDecoder.rampart.decode(IPCRequest.self, from: frame) }
-            catch { _ = send(.error("malformed request")); return }
-            if DLog.shared.verbose { logInfo("IPC \(Router.name(req)) from uid \(peer.uid) pid \(peer.pid)") }
-            switch router.handle(req, peer: peer, requireAdminForPrivileged: !userMode, send: send) {
+            // Each request runs in its own autorelease pool: a large request (100k exclusions) creates many
+            // temporary NSStrings and must not keep them alive for the life of the connection.
+            let routed: RouteResult? = autoreleasepool {
+                let req: IPCRequest
+                do { req = try JSONDecoder.rampart.decode(IPCRequest.self, from: frame) }
+                catch { _ = send(.error("malformed request")); return nil }
+                if DLog.shared.verbose { logInfo("IPC \(Router.name(req)) from uid \(peer.uid) pid \(peer.pid)") }
+                return router.handle(req, peer: peer, requireAdminForPrivileged: !userMode, send: send)
+            }
+            guard let routed else { return }
+            switch routed {
             case .done: continue
             case .keepOpen(let token):
                 subscription = token

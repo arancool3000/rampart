@@ -214,6 +214,8 @@ struct GeneralSettings: View {
                            isOn: Binding(get: { ChromeState.shared.menuBarInserted }, set: { ChromeState.shared.setMenuBarInserted($0) }))
                 HintToggle("Show Dock icon", hint: "Turn off to keep \(Product.name) out of the Dock and app switcher.", isOn: $showDock)
                     .onChange(of: showDock) { _, v in if !Headless.active { NSApp.setActivationPolicy(v ? .regular : .accessory) } }
+                HintToggle("Show floating guard bot", hint: "A small pixel robot on top of your windows. Click it to chat; right-click for quick actions.",
+                           isOn: Binding(get: { BotController.shared.enabled }, set: { BotController.shared.setEnabled($0) }))
             } footer: {
                 VStack(alignment: .leading, spacing: Spacing.s) {
                     Text("With basic protection, closing \(Product.name) leaves checking running in the background unless you turn that off here.")
@@ -223,6 +225,7 @@ struct GeneralSettings: View {
                     }
                 }
             }
+            DesktopModeSettingsSection()
             Section {
                 Picker("Text size", selection: $textSize) {
                     Text("Default").tag("default"); Text("Large").tag("large"); Text("Larger").tag("larger")

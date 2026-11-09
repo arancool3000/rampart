@@ -132,7 +132,7 @@ async function bump(key) {
 // MARK: Per-tab state (memory only; a browser restart forgets it)
 // tabId -> { last: {url, host, resp, at}, continued: Set<host> }
 const tabs = new Map();
-function tabState(id) { let t = tabs.get(id); if (!t) { t = { last: null, continued: new Set() }; tabs.set(id, t); } return t; }
+function tabState(id) { let t = tabs.get(id); if (!t) { t = { last: null, continued: new Set(), trackers: null }; tabs.set(id, t); } return t; }
 function noteVerdict(tabId, url, resp) {
   if (typeof tabId !== "number" || tabId < 0 || !resp || (resp.action !== "block" && resp.action !== "warn")) return;
   const t = tabState(tabId);
@@ -212,6 +212,15 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (resp.action === "block" || resp.action === "warn") await bump(resp.action === "block" ? "blocked" : "warned");
         sendResponse(withContinued(resp, tabId, pageHost)); break;
       }
+      case "countTrackers": {
+        // Hostnames only (validated); the answer is kept per tab for the popup.
+        const hosts = Array.isArray(msg.hosts) ? msg.hosts.slice(0, 300).map((h) => str(h, 253).toLowerCase()).filter((h) => /^[a-z0-9.-]+$/.test(h)) : [];
+        const resp = hosts.length ? await askHost({ type: "countTrackers", url: pageURL, hosts }, 2000) : null;
+        if (resp && resp.ok && typeof resp.trackers === "number") {
+          tabState(tabId).trackers = { host: pageHost, count: resp.trackers, companies: Array.isArray(resp.trackerCompanies) ? resp.trackerCompanies.slice(0, 6).map((c) => str(c, 40)) : [] };
+        }
+        sendResponse({ ok: true }); break;
+      }
       case "urlVerdict": {
         const c = verdictCache.get(pageURL);
         sendResponse(c ? withContinued(c.resp, tabId, pageHost) : null); break;
@@ -277,7 +286,9 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (sender.tab) { sendResponse(null); break; }       // popup only
         const s = await getSettings();
         const ping = await askHost({ type: "ping" }, 1500);
-        sendResponse({ settings: s, host: Object.assign({}, hostState, { reachable: !!(ping && ping.ok), version: str(ping && ping.version, 40), daemon: !!(ping && ping.daemon) }) });
+        let trackers = null;
+        try { const [t] = await api.tabs.query({ active: true, currentWindow: true }); if (t && tabs.get(t.id)) trackers = tabs.get(t.id).trackers; } catch { /* no tab */ }
+        sendResponse({ settings: s, trackers, host: Object.assign({}, hostState, { reachable: !!(ping && ping.ok), version: str(ping && ping.version, 40), daemon: !!(ping && ping.daemon) }) });
         break;
       }
       case "page:setSettings": {

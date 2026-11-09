@@ -36,9 +36,60 @@ enum Emergency {
     /// without its network block, and any leftover emergency anchor is removed. Then the watch timer starts.
     static func start(_ p: Protection) {
         let c = ctl(p)
-        let reapplyNet = c.prepareForRestart()
-        if c.isActive { q.async { reapply(p, c, network: reapplyNet) } }
-        if !reapplyNet { q.async { unloadNetwork(p, c, why: "start: no network block wanted") } }
+        // User incident 2026-11-09: a stale automatic lockdown started by RamPart's own (reinstalled, now verified) files
+        // survived the reinstall. Re-check it first; a false alarm is lifted, undone, logged and announced.
+        if c.isActive, recheckOnStart(p, c) {
+            q.async { unloadNetwork(p, c, why: "false alarm lifted at start") }
+        } else {
+            let reapplyNet = c.prepareForRestart()
+            if c.isActive { q.async { reapply(p, c, network: reapplyNet) } }
+            if !reapplyNet { q.async { unloadNetwork(p, c, why: "start: no network block wanted") } }
+        }
+        startWatch(p, c)
+    }
+
+    /// Daemon start with an active lockdown: an automatic one whose trigger was RamPart's own now-verified files, or
+    /// that no longer qualifies under the current trigger policy, is lifted. A manual lockdown is never auto-lifted.
+    /// Returns true when it was lifted.
+    @discardableResult
+    static func recheckOnStart(_ p: Protection, _ c: EmergencyController) -> Bool {
+        let st = c.state
+        let d = st.reason?.detectionID.flatMap { p.store.get($0) }
+        guard let why = EmergencyFalseAlarm.reason(state: st, detection: d,
+                                                   isVerifiedOwnFile: { OwnInstall.isVerifiedOwnFile($0, p) },
+                                                   isOwnPath: { OwnInstall.isOwnPath($0, p) }),
+              let undo = c.liftFalseAlarm(why: why) else { return false }
+        undoActions(p, c, undo)
+        restoreOwnQuarantined(p, c, st)
+        if let id = st.reason?.detectionID { _ = p.store.update(id) { $0.resolved = true } }
+        logWarn("emergency: lockdown lifted at start, false alarm: \(why)")
+        p.activity.add(.system, "Emergency lockdown lifted: false alarm", detail: why, outcome: "lifted (false alarm)", severity: .medium,
+                       detectionID: st.reason?.detectionID, event: .lockdownLifted, actor: .system,
+                       reason: "Re-checked when the \(Product.name) service started", action: "Lifted lockdown and undid its steps")
+        notify(p, c, .falseAlarm)
+        return true
+    }
+
+    /// Our own files a false-alarm lockdown quarantined come back only if nothing (e.g. a reinstall) replaced them.
+    private static func restoreOwnQuarantined(_ p: Protection, _ c: EmergencyController, _ st: EmergencyState) {
+        let paths = Set(st.actions.filter { $0.kind == .quarantineFiles }.flatMap(\.paths).filter { OwnInstall.isOwnPath($0, p) })
+        guard !paths.isEmpty else { return }
+        for rec in p.services.quarantine.list() where paths.contains(rec.originalPath) {
+            if FileManager.default.fileExists(atPath: rec.originalPath) {
+                c.log("Kept \(rec.originalPath) as reinstalled; its quarantined copy stays in the vault")
+                continue
+            }
+            // Only a copy pinned by the sealed install manifest goes back; anything else stays in the vault.
+            guard let pinned = p.services.guardian?.manifest?.entries[rec.originalPath], pinned.lowercased() == rec.sha256.lowercased() else {
+                c.log("Left \(rec.originalPath) in quarantine (not pinned by the install manifest); reinstalling \(Product.name) puts it back")
+                continue
+            }
+            do { _ = try p.services.quarantine.restore(id: rec.id); c.log("Restored \(Product.name)'s own file \(rec.originalPath)") }
+            catch { c.log("Couldn't restore \(rec.originalPath): \(error.localizedDescription)") }
+        }
+    }
+
+    private static func startWatch(_ p: Protection, _ c: EmergencyController) {
         let t = DispatchSource.makeTimerSource(queue: q)
         t.schedule(deadline: .now() + 15, repeating: 15, leeway: .seconds(2))
         t.setEventHandler { watch(p, c) }
@@ -50,6 +101,10 @@ enum Emergency {
     static func consider(_ d: Detection, protection p: Protection) {
         // Health problems (a telemetry source down / not permitted / missing Full Disk Access) are never a trigger.
         if EmergencyTriggerPolicy.isHealthIssue(d) { return }
+        // RamPart's own verified files (an install / upgrade rewriting them) never trigger or feed a lockdown.
+        if let path = d.path, OwnInstall.isVerifiedOwnFile(path, p) {
+            logInfo("emergency: ignored \(d.name): \(path) is \(Product.name)'s own verified file"); return
+        }
         let c = ctl(p)
         let allow: (Detection) -> Bool = { d in
             if let h = d.sha256, p.runtime.config.allowlist.contains(h) { return true }
@@ -58,7 +113,7 @@ enum Emergency {
         }
         let reason = EmergencyTriggerPolicy.evaluate(d, isAllowlisted: allow)
         if c.isActive {
-            _ = c.noteDetection(d)
+            _ = c.noteDetection(d, isVerifiedOwnFile: { OwnInstall.isVerifiedOwnFile($0, p) })
             guard let reason else { return }
             let a = c.assess(reason)
             if a.containNetwork, !c.state.isNetworkBlocked {
@@ -234,7 +289,7 @@ enum Emergency {
 
     // MARK: user-facing notification (user incident 2026-11-07: lockdown engaged silently)
 
-    enum NoticeKind: String { case engaged, networkBlocked, networkRestored, expired, lifted }
+    enum NoticeKind: String { case engaged, networkBlocked, networkRestored, expired, lifted, falseAlarm }
 
     /// Root cause of the silent lockdown: the alert was an app-side action that ran only when the app happened to
     /// poll (Emergency screen or banner on screen); the root daemon has no GUI session to post from. Now the daemon
@@ -265,7 +320,8 @@ enum Emergency {
         }
         var files = [reason.path].compactMap { $0 }
         if let d = detection { files += d.evidence.compactMap { e in e.detail.hasPrefix("/") ? e.detail.components(separatedBy: " ").first : nil } }
-        files = files.filter { FileManager.default.fileExists(atPath: $0) && !p.runtime.isOwnData($0) }
+        files = files.filter { FileManager.default.fileExists(atPath: $0) && !p.runtime.isOwnData($0) && !OwnInstall.isVerifiedOwnFile($0, p) }
+        tree = tree.filter { !OwnInstall.isVerifiedOwnProcess(pid: $0.pid, p) }
         let base = Set(p.state.value.persistenceBaseline ?? [])
         let newItems = base.isEmpty ? [] : p.lastPersistence.filter { !base.contains($0.id) }
         return EmergencyContext(processTree: tree, files: files, newLaunchItems: newItems, uid: consoleUID(),
@@ -278,12 +334,13 @@ enum Emergency {
             case .suspendProcesses:
                 guard enforce else { c.updateAction(a.kind, state: .dryRun, result: "would SIGSTOP \(a.pids)"); continue }
                 var stopped: [Int32] = []
-                for pid in a.pids where !ProcessKiller.isPlatformBinary(pid) && Darwin.kill(pid, SIGSTOP) == 0 { stopped.append(pid) }
+                for pid in a.pids where !ProcessKiller.isPlatformBinary(pid) && !OwnInstall.isVerifiedOwnProcess(pid: pid, p) && Darwin.kill(pid, SIGSTOP) == 0 { stopped.append(pid) }
                 for pid in stopped { p.services.deception?.markContained(pid: pid, quarantineID: nil) }
                 c.updateAction(a.kind, state: stopped.isEmpty ? .failed : .done, result: "suspended \(stopped)") { $0.pids = stopped }
             case .quarantineFiles:
                 var done: [String] = [], hashes: [String] = []
                 for path in a.paths {
+                    if OwnInstall.isVerifiedOwnFile(path, p) { c.log("Not quarantined: \(path) is \(Product.name)'s own verified file"); continue }
                     let d = detection ?? Detection(path: path, name: "Emergency lockdown", category: .suspicious, severity: .critical, confidence: 100, evidence: [])
                     if let rec = try? p.services.quarantine.quarantine(path: path, detection: d) {
                         done.append(path); hashes.append(rec.sha256); p.markDecoyCatchContained(d, quarantineID: rec.id)
@@ -362,8 +419,10 @@ enum Emergency {
             for pid in a.pids where isRunningNotStopped(pid) { c.noteSignal(.processWontStop); break }
         }
         if let path = st.reason?.path, st.actions.contains(where: { $0.kind == .quarantineFiles && $0.state == .done }) {
-            if FileManager.default.fileExists(atPath: path) { c.noteSignal(.payloadReappeared) }
-            if !ProcessKiller().processes(runningExecutable: path).isEmpty { c.noteSignal(.processWontStop) }
+            // Escalate only if the file that came back is still malicious or unverified: RamPart's own file put back by
+            // a reinstall (and verifying) is not a payload reappearing.
+            if FileManager.default.fileExists(atPath: path), !OwnInstall.isVerifiedOwnFile(path, p) { c.noteSignal(.payloadReappeared) }
+            if !OwnInstall.isVerifiedOwnFile(path, p), !ProcessKiller().processes(runningExecutable: path).isEmpty { c.noteSignal(.processWontStop) }
         }
         // Persistence re-appears: a paused launch item is loaded again (plist back on disk after removal is enough).
         if !st.pausedLaunchLabels.isEmpty {

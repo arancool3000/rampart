@@ -154,6 +154,8 @@ public enum ActivityPresenter {
         case .vaultEvent, .authenticatorEvent: return .privacy
         case .refreshCleanup, .refreshUndo: return .maintenance
         case .deceptionEvent: return .threats
+        case .downloadGate: return .threats
+        case .cameraMicUsed: return .privacy
         case .other: return .protection
         }
     }
@@ -579,6 +581,28 @@ public enum ActivityPresenter {
             p.whatWeDid = e.action ?? "\(Product.name) recorded it and kept the intruder busy with harmless decoys."
             p.whatYouCanDo = "Run a full scan. If it keeps happening, turn on Emergency Lockdown."
             p.burstNoun = "decoy events"
+        case .downloadGate:
+            let o = e.outcome.lowercased()
+            p.tone = o == "blocked" ? .danger : o == "held" ? .attention : o == "cleared" || o == "allowed" ? .good : .neutral
+            p.symbol = o == "blocked" ? "xmark.shield" : o == "held" ? "hand.raised" : "arrow.down.circle"
+            p.title = cleanTitle(e.title); p.subtitle = SafeText.line(e.detail, max: 200)
+            p.status = o == "held" ? "Held for your review" : humanOutcome(e.outcome)
+            p.whatHappened = "A new download arrived in \(e.facts?["folder"] ?? "a watched folder") and Download Gate checked it within about a second."
+            p.why = reason ?? "Download Gate checks every new download before you open it."
+            p.whatWeDid = e.action ?? (o == "held" ? "Took away its permission to run until you decide." : o == "blocked" ? "Moved it to quarantine." : "Checked it and left it ready to use.")
+            p.whatYouCanDo = o == "held" ? "Open Download Gate and choose Allow or Delete." : "No action is needed."
+            p.burstNoun = "downloads checked"
+        case .cameraMicUsed:
+            let alerted = e.outcome.lowercased() == "alerted"
+            p.tone = alerted ? .attention : .info
+            p.symbol = (e.facts?["device"] ?? "") == "camera" ? "video" : "mic"
+            p.title = cleanTitle(e.title); p.subtitle = SafeText.line(e.detail, max: 200)
+            p.status = alerted ? "You were alerted" : "Logged"
+            p.whatHappened = cleanTitle(e.title) + "."
+            p.why = alerted ? "The app isn't on your trusted list, or it was used while your Mac was locked or idle." : "RamPart keeps a record of every camera and microphone use."
+            p.whatWeDid = "Recorded which app used it and for how long."
+            p.whatYouCanDo = alerted ? "If you don't recognise this, open Camera & Mic and stop the app." : "No action is needed."
+            p.burstNoun = "camera and microphone uses"
         case .other:
             p.title = cleanTitle(e.title); p.subtitle = e.detail
             p.whatHappened = cleanTitle(e.title) + "."; p.whatWeDid = outcomeSentence(e.outcome, default: "Recorded.")

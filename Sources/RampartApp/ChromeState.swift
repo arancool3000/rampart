@@ -52,7 +52,7 @@ final class ChromeState {
 struct MenuBarLabel: View {
     let chrome = ChromeState.shared
     var body: some View {
-        Group {
+        HStack(spacing: 2) {
             if let b = chrome.lockdownBadge {
                 // Red, not a template image: the lockdown must be visible at a glance.
                 HStack(spacing: 2) {
@@ -60,6 +60,7 @@ struct MenuBarLabel: View {
                     if !b.isEmpty { Text(b) }
                 }
             } else if chrome.hasThreat { Image(systemName: "exclamationmark.shield") } else { Image(nsImage: BrandImages.menuBarTemplate) }
+            MediaInUseBadge()   // live camera / microphone indicator (Camera & Mic)
         }
             .accessibilityLabel(chrome.lockdownBadge != nil ? "\(Product.name): emergency lockdown on" : chrome.hasThreat ? "\(Product.name): item needs attention" : "\(Product.name): protected")
     }

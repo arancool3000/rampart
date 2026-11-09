@@ -353,6 +353,8 @@ public struct EmergencyState: Codable, Hashable, Sendable {
     public var keepBlocking: Bool?
     /// Why the network was or wasn't cut, in plain words.
     public var networkWhy: String?
+    /// Set when the daemon lifted an automatic lockdown by itself as a false alarm (why, in plain words).
+    public var falseAlarm: String?
     public init() {}
     public var isAutomatic: Bool { automatic ?? (reason.map { $0.kind != .manual } ?? false) }
     public var isNetworkBlocked: Bool { networkBlocked ?? (active && actions.contains { $0.kind == .networkContainment && ($0.state == .done || $0.state == .dryRun || $0.state == .planned || $0.state == .failed) }) }
@@ -589,9 +591,12 @@ public final class EmergencyController: @unchecked Sendable {
 
     /// Feed every detection seen while locked down. Returns new escalation signals.
     @discardableResult
-    public func noteDetection(_ d: Detection) -> [EmergencyEscalation.Signal] {
+    /// `isVerifiedOwnFile`: RamPart's own installed file that verifies (OwnInstallTrust). A finding about such a file
+    /// (a reinstall putting our own plist back, our installer rewriting it) is never an escalation.
+    public func noteDetection(_ d: Detection, isVerifiedOwnFile: (String) -> Bool = { _ in false }) -> [EmergencyEscalation.Signal] {
         lock.lock(); defer { save(); lock.unlock() }
         guard s.active, !EmergencyTriggerPolicy.isHealthIssue(d) else { return [] }
+        if let p = d.path, isVerifiedOwnFile(p) { logLocked("Ignored a finding about \(Product.name)'s own verified file: \(p)"); return [] }
         var new: [EmergencyEscalation.Signal] = []
         if d.severity >= .high && !EmergencyTriggerPolicy.isTestArtifact(d) { s.lastCriticalAt = clock.now(); s.rescanClean = false }
         if let h = d.sha256, s.quarantinedHashes.contains(h) { new.append(.payloadReappeared) }
@@ -645,6 +650,19 @@ public final class EmergencyController: @unchecked Sendable {
         s.active = false; s.liftedAt = clock.now(); s.networkBlocked = false; s.networkExpiresAt = nil
         for i in s.actions.indices where s.actions[i].undoable && s.actions[i].state == .done { s.actions[i].state = .undone }
         logLocked("Lockdown lifted by an administrator\(r.ready ? "" : " before every check passed")")
+        return undo
+    }
+
+    /// Daemon start: an automatic lockdown found to be a false alarm (EmergencyFalseAlarm) is lifted without a password.
+    /// Never for a manual lockdown. Returns the actions to undo (nil when nothing was lifted).
+    public func liftFalseAlarm(why: String) -> [EmergencyAction]? {
+        lock.lock(); defer { save(); lock.unlock() }
+        guard s.active, let r = s.reason, r.kind != .manual, s.automatic != false else { return nil }
+        let undo = s.actions.filter { $0.runner == .daemon && ($0.kind == .networkContainment || ($0.undoable && ($0.state == .done || $0.state == .dryRun || $0.state == .failed))) }
+        s.active = false; s.liftedAt = clock.now(); s.networkBlocked = false; s.networkExpiresAt = nil; s.signals = []
+        for i in s.actions.indices where s.actions[i].undoable && s.actions[i].state == .done { s.actions[i].state = .undone }
+        s.falseAlarm = why
+        logLocked("Lockdown lifted: false alarm. \(why)")
         return undo
     }
 

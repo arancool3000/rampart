@@ -249,6 +249,9 @@ public struct ManifestMismatch: Codable, Hashable, Sendable {
     public var kind: Kind
     public var expected: String?
     public var actual: String?
+    public init(path: String, kind: Kind, expected: String?, actual: String?) {
+        self.path = path; self.kind = kind; self.expected = expected; self.actual = actual
+    }
 }
 
 /// Signed list of installed files and their SHA-256. Written by the installer/daemon at install or update time,

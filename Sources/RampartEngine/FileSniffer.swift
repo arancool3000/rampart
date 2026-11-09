@@ -28,8 +28,13 @@ public enum FileSniffer {
         guard n > 0 else { return (.other, []) }
         header.removeSubrange(n...)
         let k = kind(header: header, path: path)
+        // A compressed UDIF image (UDZO/ULFO) starts with a zlib/lzfse chunk, so its header sniffs as
+        // `.archive` (zlib stream); the "koly" trailer is authoritative and must win over that weak magic.
+        if k == .other || k == .archive || k == .dmg {
+            if trailerKind(fd: fd, size: size) == .dmg { return (.dmg, header) }
+        }
         if k != .other { return (k, header) }
-        return (trailerKind(fd: fd, size: size), header)
+        return (.other, header)
     }
 
     private static func trailerKind(fd: Int32, size: UInt64) -> FileKind {

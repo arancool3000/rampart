@@ -14,6 +14,13 @@ public struct NetworkConnection: Codable, Hashable, Sendable {
     public var state: String?         // TCP state, e.g. "ESTABLISHED", "LISTEN"
     public var source: String         // "libproc" / "lsof"
 
+    public init(pid: Int32, processName: String, processPath: String?, proto: String, localAddress: String, localPort: UInt16,
+                remoteAddress: String, remotePort: UInt16, state: String?, source: String) {
+        self.pid = pid; self.processName = processName; self.processPath = processPath; self.proto = proto
+        self.localAddress = localAddress; self.localPort = localPort; self.remoteAddress = remoteAddress
+        self.remotePort = remotePort; self.state = state; self.source = source
+    }
+
     public var isListening: Bool { state == "LISTEN" }
     public var hasRemote: Bool { remotePort != 0 && !remoteAddress.isEmpty && remoteAddress != "0.0.0.0" && remoteAddress != "::" && remoteAddress != "*" }
 }

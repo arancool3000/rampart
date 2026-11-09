@@ -7,7 +7,7 @@ public enum IPC {
     /// 6: emergency lockdown, checkURLChain, scanProgress walk/timeout fields.
     /// 7: Cat & Mouse (deception) requests.
     /// 8: lockdown safety (emergencyNetwork), Super Kill Switch, ProtectionStatus.healthNotes.
-    public static let version = 8
+    public static let version = 9
     public static let socketPath = "/var/run/rampart.sock"
     public static let userSocketPath = NSHomeDirectory() + "/Library/Application Support/Rampart/rampart.sock"
 

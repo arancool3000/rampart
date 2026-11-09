@@ -88,6 +88,9 @@ enum Integrations {
         web.onQuery = { [weak s] e in s?.onDNSEvent?(e) }
         s.signingLookup = { path in SigningInspector.inspectCached(path: path).info }
         s.wiring.append("web protection: RampartNetwork.DNSFilterServer on 127.0.0.1:\(runtime.dnsPort) (\(runtime.config.webProtection ? "on" : "off"))")
+        if let ng = NetGuardWiring.wire(s, runtime: runtime, web: web, daemon: daemon) {
+            updaters.append(("content filter", { ng.updateLists() }))
+        }
         updaters.append(("blocklists", {
             let r = runBlocking { await lists.updateAll() }
             web.reloadBlocklist()
@@ -251,6 +254,9 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
     let lists: BlocklistUpdater
     var onBlock: ((String, String?) -> Void)?
     var onQuery: ((SecurityEvent) -> Void)?
+    /// Content filter / SafeSearch / app-firewall DNS policy (NetGuardWiring.swift) and a raw query-log observer.
+    var dnsPolicy: DNSPolicy?
+    var onLog: ((DNSQueryLogEntry) -> Void)?
     private var server: DNSFilterServer?
     private var switcher: DNSSwitcher?
     private let lock = NSLock()
@@ -287,6 +293,7 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
             cfg.pinStateURL = runtime.root.appendingPathComponent("doh-pins.json")   // hx4 N5: learned DoH key pins
             let srv = DNSFilterServer(config: cfg, blocklist: list)
             srv.queryLog = { [weak self] e in self?.record(e) }
+            srv.policy = dnsPolicy
             srv.doh.onPinFailure = { [weak self] host, detail in self?.pinFailed(host: host, detail: detail) }
             try srv.start()
             server = srv
@@ -411,6 +418,12 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
                                severity: .high, confidence: 75, evidence: [ev]))
     }
 
+    /// The DNS policy's config or lists changed: drop cached answers so the change applies at once.
+    func dnsPolicyChanged() {
+        lock.lock(); let srv = server; lock.unlock()
+        srv?.cache.clear()
+    }
+
     func reloadBlocklist() {
         lock.lock(); defer { lock.unlock() }
         let l = lists.buildBlocklist()
@@ -446,6 +459,7 @@ final class WebProtection: WebProtectionService, NetworkInfoService {
         lock.unlock()
         if let (d, l) = notify { onBlock?(d, l) }
         if !e.name.isEmpty { onQuery?(e.securityEvent) }
+        onLog?(e)
     }
 
     private func saveStatsLocked() {

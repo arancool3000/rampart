@@ -180,3 +180,28 @@ extension Severity {
         }
     }
 }
+
+// MARK: - Design system tokens (dashboard, desktop mode, shared cards)
+
+/// One scale for spacing, radii and type so screens line up. `Spacing` stays as the older alias.
+enum DS {
+    enum Space {
+        static let xs: CGFloat = 4, s: CGFloat = 8, m: CGFloat = 12, l: CGFloat = 16, xl: CGFloat = 24, xxl: CGFloat = 32, xxxl: CGFloat = 48
+    }
+    enum Radius {
+        static let control: CGFloat = 10, tile: CGFloat = 14, card: CGFloat = 16, panel: CGFloat = 22, hero: CGFloat = 28
+    }
+    /// Type scale: display 40 · title 22 · headline 17 · body 14 · callout 13 · caption 11.5 · eyebrow 11 (caps).
+    enum Font {
+        static let display = SwiftUI.Font.system(size: 40, weight: .bold, design: .rounded)
+        static let title = SwiftUI.Font.system(size: 22, weight: .semibold, design: .rounded)
+        static let headline = SwiftUI.Font.system(size: 17, weight: .semibold, design: .rounded)
+        static let body = SwiftUI.Font.system(size: 14)
+        static let callout = SwiftUI.Font.system(size: 13)
+        static let caption = SwiftUI.Font.system(size: 11.5)
+        static let eyebrow = SwiftUI.Font.system(size: 11, weight: .semibold, design: .rounded)
+        static let metric = SwiftUI.Font.system(size: 30, weight: .bold, design: .rounded)
+    }
+    /// Space the floating RamPart bot (bottom-right corner) needs kept clear on full-window layouts.
+    static let botClearance: CGFloat = 170
+}

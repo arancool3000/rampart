@@ -203,6 +203,9 @@ struct RampartCommands: Commands {
             Divider()
             Button("Protection") { AppModel.shared.switchMode(.protection) }.keyboardShortcut("1", modifiers: [.command, .option])
             Button("Refresh") { AppModel.shared.switchMode(.refresh) }.keyboardShortcut("2", modifiers: [.command, .option])
+            Divider()
+            // ⌃⌥⌘D is a global hot key (DesktopMode), so it isn't bound here too (it would toggle twice).
+            Button("Toggle Desktop Mode (\(DesktopMode.shortcutLabel))") { DesktopMode.shared.toggle() }
         }
         CommandMenu("Scan") {
             Button("Quick Scan") { AppModel.shared.selection = .scan; AppModel.shared.startScan(.quick) }

@@ -25,6 +25,7 @@ enum UIRenderer {
 
     static func renderAll(to dir: URL) async {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if CommandLine.arguments.contains("--render-desktop") { await DesktopPreviews.renderAll(to: dir); return }
         let model = AppModel.shared
         // Wait for demo/live data.
         for _ in 0..<40 where model.mode == .connecting { await sleep(0.1) }

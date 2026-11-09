@@ -2,98 +2,79 @@
 
 The name is **RamPart**: capital R, capital P, one word. It reads "ram part", never "ramp art".
 
-## The mark: the "Two-Part Shield"
-A minimal shield drawn with three curves: a shallow crown and two flanks that meet at the point. It is split down the centre into a white half and a teal half.
+## The mark: the Pixel Guard (chosen 2026-11-09)
+RamPart's mascot is a friendly robot security guard built from **pixel boxes**. The logo is the guard's **head**:
+- a teal peaked cap with a gold shield badge, and a dark brim;
+- a white shell with a dark face screen, two lit mint eyes and a little blush;
+- grey ear guards and an antenna with a beacon light on top.
 
-**Look again:** the seam where the two halves meet is a keyhole. Two parts, one lock: *Ram* + *Part*, locked together.
+Every box is a slightly rounded square with a small gap, so it reads as "made of boxes". At 16 px the boxes become whole pixels with no gaps, so the silhouette stays crisp. It is two-tone: the right half of the shell, cap and uniform is a shade darker, as if lit from the left. Only the visor (the eyes) is lit, and it is crisp, with no glow.
 
-At a glance it is just a clean, modern, two-tone shield. On a second look, the round bow and the flaring slot of a keyhole show up in the negative space between the halves, running out through the shield's point.
+The floating desktop bot is the same guard with a small boxy body: a teal uniform with a gold shield badge on the chest, white arms, a belt with a gold buckle, and grey legs.
 
-The outline and the keyhole are written by hand as SVG path data in `generate.swift` (`MarkGeometry.shieldD` / `keyholeD`). The halves are that outline split at x = 512 with the keyhole removed. Everything else is generated from it.
+### Single source of truth
+`Sources/RampartApp/Features/Bot/PixelGuard.swift` holds:
+- the pixel matrices (three head variants and the body);
+- the face layout and expressions;
+- the palette;
+- the renderer (`PixelRenderer`), which is shared by SwiftUI (`PixelGuardView(size:expression:)`, `PixelBotView`) and CoreGraphics (icon generation).
+
+`BotLogic.swift` holds the animator, the state machine and the speech bubble text.
+
+### Regenerate
+```sh
+Resources/Brand/generate-guard.sh                  # AppIcon.iconset + .icns, logo-mark-1024.png, MenuBarIconTemplate(@2x).png, previews/icon-*.png
+Resources/Brand/generate-guard.sh --previews DIR   # variant sheets + bot pose sheet into DIR only
+```
+The script compiles `generate-guard.swift` together with `PixelGuard.swift` and `BotLogic.swift`, and renders offscreen with CoreGraphics only.
+
+## Variants explored
+| # | Name | Notes |
+|---|---|---|
+| 1 | **Cap Guard** (shipped) | Peaked cap and badge read as "security guard" instantly. Friendly screen face. Strongest 16 px silhouette (antenna, cap, ears). |
+| 2 | Visor Sentinel | Helmet with a forehead badge and a single slit visor. Cooler, but colder and less friendly. |
+| 3 | Beacon Bot | A light bar on top and a big screen face. Reads as "robot" but not as "guard". |
 
 ## Colour
 | Token | Hex | Use |
 |---|---|---|
-| Navy | `#070D1C` | Tile base, dark backgrounds (Palette.navy) |
-| Midnight | `#0A2840` | Tile mid-tone |
-| Deep teal | `#0F5466` | Tile highlight (top left) |
-| Teal | `#17B8CC` | Tile glow (Palette.teal) |
-| Mint | `#54E6C2` | Teal half, gradient top (Palette.mint) |
-| Accent, light | `#0A84A0` | Teal half, gradient bottom; R and P in the wordmark on light backgrounds; teal half of the light glyph |
-| Accent, dark | `#40C8E0` | R and P in the wordmark on dark backgrounds; teal half of the dark glyph; glint glow |
-| Ink | `#0B1B2E` | Wordmark and glyph on light backgrounds |
-| Frost | `#C4EEF4` | White half, gradient bottom |
-
-## Wordmark
-SF Pro Rounded Bold, tracking −0.025 em, outlined to paths. **R** and **P** take the accent colour and the rest takes ink (light) or white (dark), so the two halves of the name read at a glance. Never retype the wordmark: use the SVGs.
-
-## Clear space and minimum sizes
-- Let **k** be the diameter of the keyhole bow (116 on the 1024 grid, about 1/5 of the shield's height).
-  - Keep at least **1 k** clear around the bare shield.
-  - In a lockup with the wordmark, leave 1 k to 1.5 k between the shield and the wordmark.
-- Keep clear space of at least half the cap height of the R around the wordmark.
-- App icon: the shipped sizes run from 16 px up.
-  - At 16 px the keyhole shrinks to a hint, and the mark reads as a two-tone shield. That is intended.
-  - From 32 px up the keyhole is clear.
-- Bare shield: 12 pt tall at minimum. The menu bar uses the 18 pt template.
-- Wordmark: at least 80 px (or 14 pt cap height) wide. Below that, use the shield alone.
+| Tile top / bottom | `#172131` / `#080D17` | App tile gradient |
+| Cap / uniform | `#1FB4C8` (shade `#1696A8`) | Brand teal |
+| Brim / belt | `#0E6876` (shade `#0B5866`) | |
+| Shell | `#F5F8FB` (shade `#D3DCE6`) | Head and arms |
+| Steel | `#95A3B6` (shade `#7A889C`) | Ear guards, antenna, legs |
+| Badge gold | `#FFC53D` (shade `#E5A626`) | Cap and chest shield, buckle |
+| Screen | `#0A1522` | Face |
+| Visor / eyes | `#63F2CF` | Lit eyes, beacon at rest |
+| Alert | `#FF5A5F` / beacon `#FF4D57` | Alert state only, never in the logo |
+| Blush | `#F27C9C` | Cheeks |
 
 ## Files
 | File | What |
 |---|---|
-| `logo-mark.svg` | Full icon (squircle tile and shield). `part-0` is the tile, `part-1` the white half (Ram) and `part-2` the teal half (Part). `part-3` is the keyhole plug: invisible at rest, and used only to animate the reveal. |
-| `logo-glyph-light.svg` / `logo-glyph-dark.svg` | Bare shield for light and dark backgrounds. |
-| `logo-wordmark-light.svg` / `logo-wordmark-dark.svg` | Outlined wordmark with one path per letter (`letter-R`, `letter-a`, `letter-m`, `letter-P`, `letter-a-2`, `letter-r`, `letter-t`). |
-| `logo-mark-1024.png` | Icon master. |
-| `AppIcon.iconset/`, `AppIcon.icns` | macOS app icon on the 824/1024 grid with 100-unit margins. Built with `iconutil`. |
-| `MenuBarIconTemplate.png`, `@2x`, `MenuBarIcon.pdf` | 18 pt monochrome template (black and alpha). Set `isTemplate = true`. |
-| `animation.json` | Path data, order, delays, durations, start values and easing for the mark and the letters. |
-| `storyboard/frame-t000..t100.png` | Assembly animation at t = 0, 0.25, 0.5, 0.75 and 1 (1.6 s total). |
-| `previews/` | Icon at 16 to 256 px, wordmark PNGs, and `concepts.png`, the labelled sheet of every concept explored. |
-| `generate.swift` | Regenerates everything: `swift Resources/Brand/generate.swift`. Offscreen only. |
+| `logo-mark-1024.png` | Icon master (824/1024 tile grid). |
+| `AppIcon.iconset/`, `AppIcon.icns` | All sizes from 16 to 1024. The 16 and 32 px sizes are full-bleed, so each box lands on a whole pixel. |
+| `MenuBarIconTemplate.png`, `@2x` | 18 pt monochrome template (black and alpha). The screen and badge are cut-outs and the eyes stay solid. Set `isTemplate = true`. |
+| `logo-wordmark-light.svg` / `-dark.svg` | Outlined wordmark, unchanged. |
+| `previews/icon-*.png` | Icon at 16 to 256 px. |
+| `previous-concepts/` | The retired Two-Part Shield, its generators and its concept sheet. |
 
-## Motion
-The animation runs 1.6 s and reveals the hidden meaning last:
-1. The tile springs in.
-2. The white and teal halves glide in from the left and right and meet as a solid shield.
-3. The letters of "RamPart" rise and fade in, 60 ms apart.
-4. At 0.95 s the keyhole opens: the plug shrinks into the bow and fades.
-5. A four-point glint flashes once on the shield's right shoulder (1.10 to 1.55 s).
+## Motion (floating bot)
+All motion is made of pixel boxes, runs at 30 fps at most (12 fps when idle) and pauses when the bot is hidden. Under Reduce Motion each state shows a static pose.
 
-Under Reduce Motion, cross-fade to the final state in 0.2 s and skip the glint. Nothing flashes red, shakes or loops.
-
-## Do
-- Use the supplied files on navy, white or the app's mesh backgrounds.
-- Keep the white half on the left and the teal half on the right, so the keyhole reads.
-- Use the dark glyph or wordmark on dark surfaces and the light versions on light surfaces.
+| State | Motion |
+|---|---|
+| Assembling (launch) | Scattered boxes fly in, top row first, then the dark plate fades in. |
+| Idle | Blinks every few seconds; a dim visor scan line runs down the screen every 7 s. |
+| Scanning | The beacon turns amber, a ripple runs through the boxes and the eyes sweep left and right. |
+| Alert | The visor and beacon turn red, the beacon blinks, and the bot gives a short shake every 2.5 s. |
+| Celebrating (Cat & Mouse catch) | Happy eyes, a wave, a bounce, and a finite burst of gold, mint and pink boxes. |
+| Sleeping (protection paused) | Eyes closed, beacon off, small pixel "z"s drift up. |
+| Happy (all clear) | Happy eyes and a wave. |
+| Thinking, talking, listening | Typing dots, a moving mouth, or a pulsing beacon while you chat or speak. |
 
 ## Don't
-- Don't close or fill the keyhole. Don't add a check mark, a letter or any icon inside the shield.
-- Don't recolour the mark red, orange, yellow or green. Those are status colours, and the McAfee, Norton, Avast and Bitdefender brands use them.
-- Don't outline the shield, add bevels, or use glows beyond the supplied depth.
+- Don't add glow, blur or gradients to the boxes. Keep them flat, crisp and pixel-snapped.
+- Don't recolour the guard red or orange outside the alert state.
 - Don't write "Rampart", "RAMPART" or "Ram Part" in brand contexts.
-- Don't stretch, rotate or skew the mark, or set the wordmark in another font.
-
-## Distinctiveness check (2026-11)
-Checked against how the major vendors' logos are publicly described. This is not a legal trademark search. Get one before launch.
-
-| Vendor | Their mark | How ours differs |
-|---|---|---|
-| Norton | Yellow circle with a black check mark | Not a circle, no check, no yellow |
-| McAfee | Red shield carrying a white "M" | Ours carries no letter, uses no red, and is split in two with the keyhole as negative space |
-| Avast | Orange orb or "amoeba" | No orb, no orange |
-| Bitdefender | Red and black, with a "B" | No letterform, no red |
-| Malwarebytes | Blue "M" emblem | No letterform |
-| Kaspersky | Green and teal wordmark | Shares a teal family, but no wordmark-only mark |
-| ESET | Teal wordmark | Shares a teal family, but no wordmark-only mark |
-| Sophos | Blue wordmark | No wordmark-only mark |
-| Intego | No logo descriptions found | Could not check |
-
-Shield-and-keyhole is a common general idea in security clip-art. Ours is made distinctive by three things together:
-- the keyhole exists only as the seam between two halves;
-- the halves are split white and teal;
-- the slot runs out through the point.
-
-## Final mark (chosen 2026-11-06): the Two-Part Shield
-A white shield with a peaked top, sloped shoulders and a soft point, drawn from scratch (not an SF Symbol), on a near-black squircle tile. The right half is about 11% darker, so it reads as lit from the left: two parts, Ram + Part, one shield. No keyholes, no glow.
-Source: `generate-shield.swift` (variant 0). Earlier concepts are in `previous-concepts/`; the wordmark files above still apply.
+- Don't stretch, rotate or skew the mark.

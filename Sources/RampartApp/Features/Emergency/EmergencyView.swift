@@ -21,7 +21,13 @@ struct EmergencyView: View {
                     Text("Emergency Lockdown needs the \(Product.name) background service with this feature. It isn't connected yet, so nothing here can switch on by itself.")
                         .foregroundStyle(.secondary).card()
                 }
-                if let e = m.error { Text(SafeText.line(e, max: 240)).foregroundStyle(Color.statusAction).card(tint: .statusAction) }
+                if let e = m.actionError {
+                    HStack(alignment: .top, spacing: 10) {
+                        Text(SafeText.line(e, max: 400)).foregroundStyle(Color.statusAction).frame(maxWidth: .infinity, alignment: .leading)
+                        Button("Dismiss") { m.dismissActionError() }.accessibilityLabel("Dismiss this error")
+                    }.card(tint: .statusAction)
+                }
+                if let e = m.error, m.actionError == nil { Text(SafeText.line(e, max: 240)).foregroundStyle(Color.statusAction).card(tint: .statusAction) }
                 ProtectEverythingView()
                 honestCard
             }
@@ -239,6 +245,12 @@ struct EmergencyBanner: View {
                     if m.showSudoEscape {
                         Text("Can't reach the \(Product.name) service. To get back online, run in Terminal: \(EmergencyStatus.sudoEscape)")
                             .font(.caption.weight(.semibold)).textSelection(.enabled)
+                    }
+                    if let e = m.actionError {
+                        HStack(spacing: Spacing.s) {
+                            Text(SafeText.line(e, max: 300)).font(.caption.weight(.semibold)).textSelection(.enabled)
+                            Button("Dismiss") { m.dismissActionError() }.buttonStyle(.bordered).controlSize(.small)
+                        }
                     }
                 }
                 .padding(.horizontal, Spacing.l).padding(.vertical, Spacing.s)

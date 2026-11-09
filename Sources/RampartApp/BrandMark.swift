@@ -2,72 +2,21 @@ import SwiftUI
 import AppKit
 import RampartShared
 
-/// The RamPart "Two-Part Shield" (Resources/Brand/generate-shield.swift, variant 0): peaked top, sloped
-/// shoulders, soft point. Fits a 1 : 1.21 box centred in the rect. No keyhole, no glow.
-struct RamPartShield: Shape {
-    func path(in rect: CGRect) -> Path {
-        let H = min(rect.height, rect.width * 1.21), W = H / 1.21
-        let x0 = rect.midX - W / 2, yBot = rect.midY + H / 2   // SwiftUI is y-down: b = 0 is the bottom
-        func P(_ a: CGFloat, _ b: CGFloat) -> CGPoint { CGPoint(x: x0 + W * a, y: yBot - H * b) }
-        var p = Path()
-        p.move(to: P(0.5, 1.0))
-        p.addQuadCurve(to: P(0.58, 0.985), control: P(0.535, 1.0))
-        p.addLine(to: P(0.93, 0.875))
-        p.addQuadCurve(to: P(1.0, 0.80), control: P(1.0, 0.86))
-        p.addLine(to: P(1.0, 0.42))
-        p.addCurve(to: P(0.56, 0.015), control1: P(1.0, 0.20), control2: P(0.80, 0.11))
-        p.addQuadCurve(to: P(0.44, 0.015), control: P(0.5, -0.012))
-        p.addCurve(to: P(0.0, 0.42), control1: P(0.20, 0.11), control2: P(0.0, 0.20))
-        p.addLine(to: P(0.0, 0.80))
-        p.addQuadCurve(to: P(0.07, 0.875), control: P(0.0, 0.86))
-        p.addLine(to: P(0.42, 0.985))
-        p.addQuadCurve(to: P(0.5, 1.0), control: P(0.465, 1.0))
-        p.closeSubpath()
-        return p
-    }
-}
-
-/// The mark: white shield, right half 11% darker (gray 0.89), optionally on the near-black squircle tile.
-/// `split` (0…1) pulls the halves apart horizontally (splash); `sweep` (0…1, nil = none) runs one light band across.
+/// The RamPart mark: the Pixel Guard's head (Features/Bot/PixelGuard.swift is the single source of truth),
+/// optionally on its dark rounded tile. Replaces the old two-part shield.
+/// `split` (0…1) scatters the boxes (splash assembly); `sweep` (0…1, nil = none) runs one visor scan line.
 struct RamPartMark: View {
     var size: CGFloat = 64
     var tile: Bool = true
     var split: CGFloat = 0
     var sweep: CGFloat? = nil
     var halfOpacity: Double = 1
+    var expression: PixelGuard.Expression = .neutral
 
     var body: some View {
-        let shieldW = tile ? size * 0.441 / 0.8047 : size / 1.21   // tile proportions from generate-shield.swift
-        let shieldH = shieldW * 1.21
-        ZStack {
-            if tile {
-                RoundedRectangle(cornerRadius: size * 0.18 / 0.8047, style: .continuous)
-                    .fill(LinearGradient(colors: [Color(white: 0.13), Color(white: 0.06)], startPoint: .top, endPoint: .bottom))
-            }
-            ZStack {
-                // Left half (white) and right half (gray 0.89), each clipped from the same shield.
-                RamPartShield().fill(Color.white)
-                    .mask(HStack(spacing: 0) { Rectangle(); Color.clear })
-                    .offset(x: -split * shieldW * 0.9)
-                RamPartShield().fill(Color(white: 0.89))
-                    .mask(HStack(spacing: 0) { Color.clear; Rectangle() })
-                    .offset(x: split * shieldW * 0.9)
-                if let s = sweep, s > 0, s < 1 {
-                    RamPartShield()
-                        .fill(LinearGradient(colors: [.white.opacity(0), .white.opacity(0.85), .white.opacity(0)],
-                                             startPoint: UnitPoint(x: s * 1.6 - 0.5, y: 0), endPoint: UnitPoint(x: s * 1.6 - 0.2, y: 1)))
-                        .blendMode(.plusLighter)
-                        .opacity(0.35)
-                }
-                // Keyhole where the two halves meet (appears once the halves have joined).
-                RamPartKeyhole().fill(Color(white: 0.10))
-                    .opacity(max(0, 1 - Double(split) * 6))
-            }
-            .frame(width: shieldW, height: shieldH)
+        PixelGuardView(size: size, expression: expression, tile: tile, scatter: split, scanLine: sweep)
             .opacity(halfOpacity)
-        }
-        .frame(width: size, height: tile ? size : shieldH)
-        .accessibilityHidden(true)
+            .accessibilityHidden(true)
     }
 }
 
@@ -79,7 +28,7 @@ struct StatusMark: View {
     var dimmed = false
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
-            RamPartMark(size: size, tile: true)
+            RamPartMark(size: size, tile: true, expression: dimmed ? .sleeping : .neutral)
                 .saturation(dimmed ? 0 : 1)
                 .opacity(dimmed ? 0.55 : 1)
             Image(systemName: badge)
@@ -95,20 +44,19 @@ struct StatusMark: View {
 }
 
 enum BrandImages {
-    /// Menu bar template icon: Resources/Brand/MenuBarIconTemplate.png when bundled, else drawn from the same path.
+    /// Menu bar template icon (18 pt): Resources/Brand/MenuBarIconTemplate.png when bundled, else drawn from the matrix.
     @MainActor static let menuBarTemplate: NSImage = {
-        for name in ["MenuBarIconTemplate"] {
-            if let url = Bundle.main.url(forResource: name, withExtension: "png"), let img = NSImage(contentsOf: url) {
-                img.size = NSSize(width: 18, height: 18); img.isTemplate = true; return img
+        if let url = Bundle.main.url(forResource: "MenuBarIconTemplate", withExtension: "png"), let img = NSImage(contentsOf: url) {
+            if let url2 = Bundle.main.url(forResource: "MenuBarIconTemplate@2x", withExtension: "png"),
+               let rep2 = NSImage(contentsOf: url2)?.representations.first {
+                img.addRepresentation(rep2)
             }
+            img.size = NSSize(width: 18, height: 18); img.isTemplate = true; return img
         }
         let img = NSImage(size: NSSize(width: 18, height: 18), flipped: true) { rect in
-            let shieldRect = rect.insetBy(dx: 2.5, dy: 1)
-            let path = RamPartShield().path(in: shieldRect).cgPath
             guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            ctx.addPath(path); ctx.setFillColor(NSColor.black.cgColor); ctx.fillPath()
-            // The two parts: a hairline gap down the middle keeps the "two-part" read at 18 pt.
-            ctx.setBlendMode(.clear); ctx.fill(CGRect(x: rect.midX - 0.5, y: 0, width: 1, height: rect.height))
+            let px = Int(rect.width)
+            PixelRenderer.drawTemplate(in: ctx, px: px)
             return true
         }
         img.isTemplate = true
@@ -120,25 +68,5 @@ enum BrandImages {
         let r = ImageRenderer(content: RamPartMark(size: size, tile: true))
         r.scale = 2
         return r.nsImage ?? NSImage()
-    }
-}
-
-
-/// Keyhole cut at the seam of the Two-Part Shield. Geometry mirrors Resources/Brand/generate-shield.swift
-/// (variant 2): circle radius 0.075·1.07·W, centred 0.10·W above the shield centre, tapered slot below.
-struct RamPartKeyhole: Shape {
-    func path(in rect: CGRect) -> Path {
-        let W = rect.width
-        let r = W * 0.075 * 1.07
-        let cx = rect.midX, cy = rect.midY - W * 0.10
-        var p = Path()
-        p.addEllipse(in: CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r))
-        var slot = Path()
-        slot.move(to: CGPoint(x: cx - r * 0.55, y: cy))
-        slot.addLine(to: CGPoint(x: cx + r * 0.55, y: cy))
-        slot.addLine(to: CGPoint(x: cx + r * 0.85, y: cy + r * 3.2))
-        slot.addLine(to: CGPoint(x: cx - r * 0.85, y: cy + r * 3.2))
-        slot.closeSubpath()
-        return p.union(slot)
     }
 }

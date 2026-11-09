@@ -76,7 +76,7 @@ struct SplashOverlay: View {
             if visible {
                 ZStack {
                     AppBackdrop()
-                    BrandAssembly(progress: progress)
+                    PixelLaunchAssembly(progress: progress)
                 }
                 .opacity(opacity)
                 .contentShape(Rectangle())
@@ -95,8 +95,8 @@ struct SplashOverlay: View {
                 withAnimation(.easeIn(duration: 0.2)) { opacity = 1 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { dismiss(fast: false) }
             } else {
-                withAnimation(.linear(duration: BrandAssembly.duration)) { progress = 1 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + BrandAssembly.duration + 0.4) { dismiss(fast: false) }
+                withAnimation(.linear(duration: PixelLaunchAssembly.duration)) { progress = 1 }
+                DispatchQueue.main.asyncAfter(deadline: .now() + PixelLaunchAssembly.duration + 0.35) { dismiss(fast: false) }
             }
         }
     }
@@ -301,4 +301,32 @@ struct ScanParticles: View {
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
+}
+
+// MARK: - Counting number (counts up on appear and eases to new values; no overshoot)
+
+struct CountUpNumber: View {
+    let value: Int
+    var duration: Double = 0.9
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateVar private var shown: Double = -1
+
+    var body: some View {
+        GroupedCount(value: shown < 0 ? (Headless.active || reduceMotion ? Double(value) : 0) : shown)
+            .monospacedDigit()
+            .onAppear {
+                if Headless.active || reduceMotion { shown = Double(value); return }
+                shown = 0
+                withAnimation(.easeOut(duration: duration)) { shown = Double(value) }
+            }
+            .onChange(of: value) { _, new in withAnimation(reduceMotion ? nil : .easeOut(duration: 0.5)) { shown = Double(new) } }
+            .accessibilityLabel("\(value)")
+    }
+}
+
+/// Animatable integer label with thousands separators ("12,480").
+private struct GroupedCount: View, Animatable {
+    var value: Double
+    var animatableData: Double { get { value } set { value = newValue } }
+    var body: some View { Text(Int(value.rounded()).formatted(.number)) }
 }

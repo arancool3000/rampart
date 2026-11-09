@@ -71,6 +71,7 @@ struct RootView: View {
             .animation(reduceMotion ? nil : .easeOut(duration: 0.22), value: model.lastError)
         }
         .overlay { SplashOverlay() }
+        .background(DesktopOpenWindowBridge())
         .sheet(isPresented: $showOnboarding) {
             OnboardingView { onboardingDone = true; showOnboarding = false }
                 .environment(model)
@@ -106,7 +107,7 @@ struct RootView: View {
         case .posture: PostureView()
         case .rules: RulesView()
         // Tools: see FeatureRouter (one line per feature).
-        case .scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess, .refresh, .emergency, .catAndMouse: FeatureRouter.view(for: model.selection ?? .dashboard)
+        case .scamCheck, .passwords, .authenticator, .passwordChecker, .networkScan, .aiAssistant, .remoteAccess, .refresh, .emergency, .catAndMouse, .downloadGate, .mediaGuard, .appFirewall, .privacyFilters, .vpn: FeatureRouter.view(for: model.selection ?? .dashboard)
         case .refreshSmart, .refreshStorage, .refreshMap, .refreshSpeed, .refreshStartup, .refreshLargeOld, .refreshDuplicates, .refreshLeftovers, .refreshSettings:
             RefreshDestinationView(item: model.selection ?? .refreshSmart)
         case .settings: SettingsView(standalone: false)

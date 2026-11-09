@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import ServiceManagement
 import RampartShared
+import RampartGuard
 
 /// Starts "basic protection": the bundled `Contents/Helpers/rampartd --user` (no root, no install).
 ///
@@ -87,6 +88,8 @@ final class DaemonLauncher {
         guard DaemonPeerTrust.fileSatisfiesHelperRequirement(helper.path) else {
             return .failed("The protection service file in this copy of \(Product.name) has been changed or isn't signed like the app, so it wasn't started. Reinstalling \(Product.name) fixes this.")
         }
+        // A helper left from a replaced copy of the app holds the state lock and would make ours exit at once.
+        let stale = stopStaleHelper(helper: helper.path)
         if isInstalledCopy, Self.socketOverride == nil, !Headless.active, registerAgent() {
             if await waitForSocket(client: client, timeout: timeout) { return .agent }
         }
@@ -121,7 +124,43 @@ final class DaemonLauncher {
         do { try p.run() } catch { return .failed("Couldn't start basic protection: \(error.localizedDescription)") }
         child = p
         if await waitForSocket(client: client, timeout: timeout) { return .running(pid: p.processIdentifier) }
-        return p.isRunning ? .failed("Basic protection started but isn't answering yet.") : .failed("Basic protection stopped right after starting. See \(logURL.path).")
+        if p.isRunning { return .failed("Basic protection started but isn't answering yet.") }
+        // Exit 75: another helper holds the state lock. Stop it if it is stale and try once more; otherwise say who it is.
+        if p.terminationStatus == 75 {
+            let again = stopStaleHelper(helper: helper.path)
+            if again?.shouldStop == true, !retried { return await relaunch(client: client, timeout: timeout) }
+            return .failed(Self.lockedMessage(again ?? stale, logPath: logURL.path))
+        }
+        return .failed("Basic protection stopped right after starting. See \(logURL.path).")
+    }
+
+    private var retried = false
+    private func relaunch(client: DaemonClient, timeout: TimeInterval) async -> State {
+        retried = true; defer { retried = false }
+        child = nil
+        return await launchAndWait(client: client, timeout: timeout)
+    }
+
+    /// The user helper's state folder (where it writes `rampartd.lock`).
+    var helperStateRoot: String { Self.rootOverride ?? Paths.userRoot.path }
+
+    /// Stops a stale helper holding our state lock (StaleHelperPolicy: same user, RamPart's signing identity and signer,
+    /// started before this copy's helper was installed, and from this path or a copy that is gone). Never headless.
+    @discardableResult
+    func stopStaleHelper(helper: String) -> StaleHelperPolicy.Decision? {
+        guard !Headless.active || Self.rootOverride != nil,
+              let pid = StaleHelperPolicy.lockHolder(stateRoot: helperStateRoot), pid != child?.processIdentifier,
+              let me = StaleHelperPolicy.selfFacts(binary: helper, pid: getpid()) else { return nil }
+        let d = StaleHelperPolicy.stopIfStale(pid: pid, me: me)
+        if d.shouldStop { NSLog("RamPart: stopped a stale protection helper: %@", d.why) }
+        return d
+    }
+
+    static func lockedMessage(_ d: StaleHelperPolicy.Decision?, logPath: String) -> String {
+        if let d, d.shouldStop {
+            return "Basic protection couldn't start because an old copy of its service was still running; it was stopped just now. Open \(Product.name) again in a moment. Details: \(logPath)."
+        }
+        return "Basic protection couldn't start: another \(Product.name) protection service is running\(d.map { " (\($0.why))" } ?? ""), so it was left alone. Quit other copies of \(Product.name), or restart your Mac. Details: \(logPath)."
     }
 
     static func sanitizedEnvironment(_ env: [String: String]) -> [String: String] {

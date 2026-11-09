@@ -120,6 +120,13 @@ public final class DNSFilterServer: @unchecked Sendable {
     private var lastUpstreamSuccess: Date?
     public private(set) var droppedNonLocal = 0
 
+    private var _policy: DNSPolicy?
+    /// Content filter / SafeSearch / app-firewall hook (ContentFilter.swift). Changing it clears the cache.
+    public var policy: DNSPolicy? {
+        get { blocklistLock.lock(); defer { blocklistLock.unlock() }; return _policy }
+        set { blocklistLock.lock(); _policy = newValue; blocklistLock.unlock(); cache.clear() }
+    }
+
     public init(config: DNSFilterConfig = DNSFilterConfig(), blocklist: DomainBlocklist = DomainBlocklist()) {
         self.config = config
         self._blocklist = blocklist
@@ -458,9 +465,20 @@ public final class DNSFilterServer: @unchecked Sendable {
             finish(DNSWire.buildError(for: query, rcode: DNSRCode.nxDomain), .canary, rule: q.name, list: "canary")
             return
         }
-        // 2. Lists.
+        // 2. Lists (and the content-filter policy, which may override them).
         let allowRule: String?
-        switch blocklist.verdict(for: q.name) {
+        var listVerdict = blocklist.verdict(for: q.name)
+        if let pol = policy {
+            switch pol.decide(name: q.name, type: q.type, listVerdict: listVerdict, now: started) {
+            case .useList: break
+            case .pass: listVerdict = .allowed
+            case .block(let rule, let source): listVerdict = .blocked(rule: rule, source: source)
+            case .rewrite(let target, let rule):
+                rewrite(query: query, q: q, target: target, rule: rule, finish: finish)
+                return
+            }
+        }
+        switch listVerdict {
         case .blocked(let rule, let source):
             finish(DNSWire.buildBlockedResponse(for: query, mode: config.blockMode, ttl: config.blockedTTL),
                    .blocked, rule: rule, list: source)
@@ -495,6 +513,40 @@ public final class DNSFilterServer: @unchecked Sendable {
                 self.noteUpstream(ok: false)
                 self.log.error("DoH failed for \(q.name, privacy: .public): \(e.description, privacy: .public)")
                 finish(DNSWire.buildError(for: query, rcode: DNSRCode.servFail), .servfail, error: e.description)
+            }
+        }
+    }
+
+    /// SafeSearch: answers `q` with `q.name CNAME target` plus the target's own records. Only A/AAAA are rewritten;
+    /// other types (HTTPS/SVCB hints could carry the unrestricted addresses) get an empty NOERROR answer.
+    private func rewrite(query: DNSMessage, q: DNSQuestion, target: String, rule: String,
+                         finish: @escaping @Sendable (Data, DNSQueryLogEntry.Verdict, String?, String?, String?, String?) -> Void) {
+        var r = DNSMessage(id: query.id, flags: DNSWire.responseFlags(for: query, rcode: DNSRCode.noError))
+        r.questions = [q]
+        guard q.qclass == 1, q.type == DNSType.a || q.type == DNSType.aaaa else {
+            finish(r.serialize(), .forwarded, rule, "safesearch", nil, nil); return   // not a block (no activity row)
+        }
+        r.answers.append(DNSResourceRecord(name: q.name, type: DNSType.cname, ttl: 300,
+                                           rdata: Data(DNSWire.encodeName(target)), value: target))
+        let base = r
+        doh.resolve(DNSWire.buildQuery(name: target, type: q.type)) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let (data, url)):
+                self.noteUpstream(ok: true)
+                var out = base
+                if let m = try? DNSMessage.parse(data) {
+                    for rr in m.answers where rr.type == q.type || rr.type == DNSType.cname {
+                        // CNAME rdata may hold compression pointers into the upstream message: re-encode it.
+                        let rdata = rr.type == DNSType.cname ? Data(DNSWire.encodeName(rr.value ?? "")) : rr.rdata
+                        if rr.type == DNSType.cname && (rr.value ?? "").isEmpty { continue }
+                        out.answers.append(DNSResourceRecord(name: rr.name, type: rr.type, ttl: min(rr.ttl, 300), rdata: rdata, value: rr.value))
+                    }
+                }
+                finish(out.serialize(), .forwarded, rule, "safesearch", url.host, nil)
+            case .failure(let e):
+                self.noteUpstream(ok: false)
+                finish(DNSWire.buildError(for: query, rcode: DNSRCode.servFail), .servfail, rule, "safesearch", nil, e.description)
             }
         }
     }

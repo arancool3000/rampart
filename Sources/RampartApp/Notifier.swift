@@ -191,6 +191,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             return
         }
         let cat = response.notification.request.content.categoryIdentifier
+        let info = response.notification.request.content.userInfo, act = response.actionIdentifier
+        if await MainActor.run(body: { MediaGuardNotifications.handle(category: cat, action: act, userInfo: info) }) { return }   // Camera & Mic, Download Gate
         if cat == Category.catMouse.rawValue || cat == Category.catMouseContain.rawValue {
             let action = response.actionIdentifier
             let catchID = (response.notification.request.content.userInfo["catchID"] as? String).flatMap(UUID.init(uuidString:))
@@ -206,9 +208,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
         guard response.actionIdentifier == UNNotificationDefaultActionIdentifier || ["review", "allow"].contains(response.actionIdentifier) else { return }
         let isThreat = response.notification.request.content.categoryIdentifier == Category.threat.rawValue
+        let route = info["route"] as? String
         await MainActor.run {
             NSApp.activate(ignoringOtherApps: true)
             if isThreat { AppModel.shared.selection = .threats }
+            if route == "appFirewall" { AppModel.shared.selection = .appFirewall }   // App Firewall first-connection prompt
         }
     }
 }

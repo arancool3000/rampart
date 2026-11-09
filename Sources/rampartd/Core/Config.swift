@@ -45,7 +45,7 @@ struct RampartConfig: Codable, Equatable {
     mutating func apply(_ s: RampartSettings) {
         realtime = s.realtimeOn; autoQuarantine = s.autoQuarantine; scanArchives = s.scanArchives
         scheduledQuickScan = s.scheduledQuickScan; scheduledScanHour = max(0, min(23, s.scheduledScanHour))
-        exclusions = s.exclusions.map { ($0 as NSString).expandingTildeInPath }.filter { $0.hasPrefix("/") }
+        exclusions = s.exclusions.map { e in autoreleasepool { (e as NSString).expandingTildeInPath } }.filter { $0.hasPrefix("/") }
         notifyThreats = s.notifyThreats; notifyInfo = s.notifyInfo; learningMode = s.learningMode
         developerMode = s.developerMode; ransomwareCanaries = s.ransomwareCanaries; autoUpdate = s.autoUpdate
         webProtection = s.webProtection; blockTrackers = s.blockTrackers

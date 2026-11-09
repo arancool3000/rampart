@@ -13,6 +13,9 @@ final class EmergencyModel {
     var status: EmergencyStatus?
     var unsupported = false
     var error: String?
+    /// The last failed action (lift, restore internet, kill switch) in plain words. Unlike `error` (the last poll), it is
+    /// not cleared by the next status poll: it stays until the user dismisses it or the same action succeeds.
+    var actionError: String?
     var busy = false
     var wifiMessage: String?
     var copied = false
@@ -109,22 +112,38 @@ final class EmergencyModel {
         await apply(await EmergencyBridge.rescan(client: client))
     }
 
-    /// Admin token flow, then lift. `force` = lift before every check passed (still needs the admin password).
-    func lift(force: Bool) async {
+    func dismissActionError() { actionError = nil }
+
+    /// Runs one admin-authenticated action: a fresh prompt and token every time; a failure is kept in `actionError`.
+    private func adminAction(_ what: String, failurePrefix: String, _ call: @escaping (String) async -> EmergencyBridge.Outcome) async {
         busy = true; defer { busy = false }
-        switch await EmergencyBridge.adminToken(client: client) {
-        case .failure(let why): error = why.message
-        case .success(let token): await apply(await EmergencyBridge.lift(client: client, token: token, force: force))
+        let o = await EmergencyBridge.withAdminToken(client: client, purpose: what, call)
+        switch o {
+        case .status: actionError = nil; await apply(o)
+        case .unsupported: actionError = "\(failurePrefix): this version of the \(Product.name) service doesn't support it."
+        case .error(let e): actionError = Self.explain(e, prefix: failurePrefix)
         }
     }
 
-    /// "Restore internet now": admin password, then the network block goes. No readiness gate.
+    /// Plain words for the service's refusal, with the way out.
+    static func explain(_ e: String, prefix: String) -> String {
+        let l = e.lowercased()
+        var hint = ""
+        if l.contains("token") && (l.contains("expired") || l.contains("invalid")) { hint = " Press the button again: each try asks again and gets a new approval." }
+        else if l.contains("authentication") || l.contains("authorization") || l.contains("permission denied") { hint = " Press the button again to get a new administrator prompt (Touch ID or password)." }
+        return "\(prefix): \(e).\(hint) If it keeps failing, use Super Kill Switch or run \(EmergencyStatus.sudoEscape) in Terminal."
+    }
+
+    /// Admin prompt + fresh token, then lift. `force` = lift before every check passed (still needs the admin password).
+    func lift(force: Bool) async {
+        let c = client
+        await adminAction("lift Emergency Lockdown", failurePrefix: "Couldn't lift lockdown") { await EmergencyBridge.lift(client: c, token: $0, force: force) }
+    }
+
+    /// "Restore internet now": admin prompt, then the network block goes. No readiness gate.
     func restoreInternet() async {
-        busy = true; defer { busy = false }
-        switch await EmergencyBridge.adminToken(client: client) {
-        case .failure(let why): error = why.message
-        case .success(let token): await apply(await EmergencyBridge.restoreNetwork(client: client, token: token))
-        }
+        let c = client
+        await adminAction("restore the internet", failurePrefix: "Couldn't restore the internet") { await EmergencyBridge.restoreNetwork(client: c, token: $0) }
     }
 
     func keepBlocking() async {
@@ -136,13 +155,21 @@ final class EmergencyModel {
     func killSwitch() async {
         busy = true; defer { busy = false }
         let noPriv = ProcessInfo.processInfo.environment["RAMPART_NO_PRIVILEGED_TOOLS"] == "1"
-        if !noPriv { guard await KillSwitchAuth.confirm() else { error = "Super Kill Switch cancelled."; return } }
+        if !noPriv { guard await KillSwitchAuth.confirm() else { actionError = "Super Kill Switch cancelled. Nothing was changed."; return } }
         // Wi-Fi auto-disconnect lives in the app.
         var w = PublicWiFiHost.shared.guardian.settings; w.disconnectInsecureWiFi = false; PublicWiFiHost.shared.guardian.settings = w
-        if AppModel.shared.mode == .live, !noPriv, case .success(let token) = await EmergencyBridge.adminToken(client: client),
-           case .success(let r) = await EmergencyBridge.killSwitch(client: client, token: token) {
-            killSwitchReport = r.summary + "\n" + r.steps.map { "\($0.ok ? "✓" : "✗") \($0.title)" }.joined(separator: "\n")
-            await refresh(); return
+        if AppModel.shared.mode == .live, !noPriv {
+            let c = client
+            var report: KillSwitch.Report?
+            _ = await EmergencyBridge.withAdminToken(client: c, purpose: "turn off everything \(Product.name) is doing to your network") { token in
+                if case .success(let r) = await EmergencyBridge.killSwitch(client: c, token: token) { report = r }
+                return .unsupported
+            }
+            if let r = report {
+                actionError = nil
+                killSwitchReport = r.summary + "\n" + r.steps.map { "\($0.ok ? "✓" : "✗") \($0.title)" }.joined(separator: "\n")
+                await refresh(); return
+            }
         }
         guard let script = KillSwitchScript.locate() else {
             killSwitchReport = "The service didn't answer and the kill switch script isn't available in this copy. In Terminal run: sudo rampart killswitch"

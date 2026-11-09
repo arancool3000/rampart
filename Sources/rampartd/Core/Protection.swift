@@ -2,6 +2,7 @@ import Foundation
 import RampartShared
 import RampartEngine
 import RampartBehaviour
+import RampartGuard
 
 /// Central coordinator: owns the store and services, applies remediation policy, fans detections out to subscribers.
 final class Protection {
@@ -53,6 +54,10 @@ final class Protection {
     func broadcastEmergency(_ d: Data) { broadcast(.emergency(d)) }
     /// Cat & Mouse alert (JSON of RampartGuard.CatMouseAlert) for the app to post as a notification.
     func broadcastDeceptionAlert(_ d: Data) { broadcast(.deception(d)) }
+    /// Download Gate / Camera & Microphone Guard pushes (status changes, alerts) to every subscribed app.
+    func push(_ r: IPCResponse) { broadcast(r) }
+    /// App Firewall prompt (JSON of RampartNetwork.NetGuardPush) for the app to show in-app / as a notification.
+    func broadcastNetGuard(_ d: Data) { broadcast(.netGuard(d)) }
     var subscriberCount: Int { subLock.lock(); defer { subLock.unlock() }; return subscribers.count }
 
     private func broadcast(_ r: IPCResponse) {
@@ -72,6 +77,11 @@ final class Protection {
             return nil
         }
         if let path = detection.path, let h = detection.sha256, state.value.restored?[path] == h { return nil }
+        // RamPart's own installed file that verifies (rewritten by our installer / an upgrade): not tampering.
+        if Self.isOwnInstallFinding(detection), let path = detection.path, OwnInstall.isVerifiedOwnFile(path, self) {
+            logInfo("not tampering: \(detection.name) on \(path), which is \(Product.name)'s own verified file (install or upgrade)")
+            return nil
+        }
         let (triaged, outcome) = FindingTriage.apply(detection, triageContext())
         guard let triaged else {
             if case .notAFinding(let why) = outcome { logInfo("not a finding: \(detection.name) at \(detection.path ?? "-"): \(why)") }
@@ -89,7 +99,11 @@ final class Protection {
         // Only Confirmed findings, or Likely ones with an independent second signal, are remediated automatically.
         if remediate && assessment.autoRemediate && !d.resolved {
             var actions: [String] = []
-            if cfg.killMaliciousProcesses, let pid = d.pid, pid > 1, let killer = services.processes {
+            // RamPart never kills, freezes or quarantines its own verified processes and installed files.
+            let ownProcess = d.pid.map { OwnInstall.isVerifiedOwnProcess(pid: $0, self) } ?? false
+            let ownFile = d.path.map { OwnInstall.isVerifiedOwnFile($0, self) } ?? false
+            if ownProcess || ownFile { actions.append("no action: \(Product.name)'s own verified \(ownFile ? "file" : "process")") }
+            if cfg.killMaliciousProcesses, !ownProcess, !ownFile, let pid = d.pid, pid > 1, let killer = services.processes {
                 let r = killer.terminate(pid: pid, expectedPath: d.path)
                 actions.append(r)
                 if r.hasPrefix("killed ") && !r.hasPrefix("killed 0 ") { markDecoyCatchContained(d, quarantineID: nil) }
@@ -98,7 +112,7 @@ final class Protection {
             // plists, scripts or apps that need a reviewed, journaled remediation instead.
             // (A heuristic alone never quarantines; the EICAR test signature does, as every antivirus does.)
             let fileEvidence = d.evidence.contains { [.hash, .yara, .xprotect].contains($0.source) && $0.score >= 90 } || DetectionPolicy.isTestSignature(d)
-            if cfg.autoQuarantine, fileEvidence, let path = d.path, isRegularFile(path) {
+            if cfg.autoQuarantine, fileEvidence, !ownFile, let path = d.path, isRegularFile(path) {
                 do {
                     let rec = try services.quarantine.quarantine(path: path, detection: d)
                     actions.append("quarantined as \(rec.id.uuidString)")
@@ -142,6 +156,13 @@ final class Protection {
             Emergency.consider(raw, protection: self)
         }
         return d
+    }
+
+    /// Findings that a file of RamPart's install changed (tamper detector file kinds, manifest check). Kill / unload
+    /// attempts are about an actor, not a file, and are never dropped here.
+    static func isOwnInstallFinding(_ d: Detection) -> Bool {
+        let fileKinds = ["plistTamper", "fileTamper", "configTamper", "binaryTamper"]
+        return fileKinds.contains { d.name == "Tampering with \(Product.name): \($0)" } || d.name.hasPrefix("Tamper: installed files changed")
     }
 
     /// A file-engine finding (hash / YARA / XProtect / heuristic incl. EICAR / signing) on a path inside our own
@@ -207,8 +228,26 @@ final class Protection {
         status.definitionsUpdated = st.lastUpdate
         status.ipcVersion = IPC.version
         status.healthNotes = DaemonHooks.healthNotes?()
+        if let n = fdaAfterUpdateNote(hasAccess: status.fullDiskAccess) { status.healthNotes = [n] + (status.healthNotes ?? []) }
         return status
     }
+
+    /// Full Disk Access is tied to the exact build: after an update (new cdhash) the user's switch no longer applies.
+    /// Remembers the cdhash while access works and, when it's gone with a different cdhash, says exactly what to do.
+    func fdaAfterUpdateNote(hasAccess: Bool) -> HealthNote? {
+        let me = Self.ownCDHash
+        if hasAccess {
+            if let me, state.value.fdaGrantCDHash != me { state.update { $0.fdaGrantCDHash = me } }
+            return nil
+        }
+        guard ServiceFDAAdvice.state(hasAccess: false, grantedCDHash: state.value.fdaGrantCDHash, currentCDHash: me) == .lostAfterUpdate else { return nil }
+        let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
+        return runtime.userMode ? ServiceFDAAdvice.note(itemName: Product.name, binaryPath: "/Applications/\(Product.name).app")
+                                : ServiceFDAAdvice.note(itemName: Product.daemonLabel, binaryPath: exe)
+    }
+    static let ownCDHash: String? = {
+        OwnCodeSignature.read(URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path).flatMap { $0.valid ? $0.cdhash.lowercased() : nil }
+    }()
 
     func posture() throws -> [PostureCheck] {
         guard let p = services.posture else { throw ServiceError.unavailable("posture scanner") }

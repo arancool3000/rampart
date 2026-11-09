@@ -127,6 +127,8 @@ final class Services {
     var deep: DeepProtectionService?
     /// Cat & Mouse decoys, maze and tarpit (RampartGuard Deception*), user-session daemon only.
     var deception: DeceptionService?
+    /// App Firewall, content filter / parental controls, privacy report (NetGuardWiring.swift).
+    var netGuard: NetGuardService?
     /// EventHub.cpuBySource (daemon only).
     var sourceCPU: (() -> [String: Double])?
     /// DNS query-log events (.dnsQuery, detail["name"]) for the behaviour engine; set by the daemon wiring.

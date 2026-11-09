@@ -107,6 +107,18 @@ final class GuardService {
     func verifyManifest() -> Detection? {
         guard let m = manifestBox?.value else { return nil }
         let bad = m.verify(requireOwner: 0)
+        // A verified install / upgrade (new binaries and plists that verify by signature + the install identity's
+        // cdhash) is resealed, never reported as tampering.
+        if !bad.isEmpty {
+            OwnInstall.invalidate()
+            let trust = OwnInstallTrust(paths: paths, manifest: nil, trustedCDHashes: OwnInstall.trustedCDHashes())
+            if trust.isVerifiedUpgrade(bad) {
+                logInfo("install manifest: \(bad.count) change(s) are a verified \(Product.name) install/upgrade; manifest resealed")
+                resealManifest()
+                lock.lock(); lastManifestSignature = ""; lock.unlock()
+                return nil
+            }
+        }
         let sig = bad.map { "\($0.kind.rawValue)\($0.path)" }.sorted().joined(separator: "|")
         lock.lock(); let same = sig == lastManifestSignature; lastManifestSignature = sig; lock.unlock()
         guard !bad.isEmpty, !same else { return nil }
@@ -141,7 +153,16 @@ final class GuardService {
     func requestDisable(peer: Peer, authorization: Data?) throws -> String {
         guard let flow else { throw ServiceError.unavailable("tamper protection key") }
         var authOK = runtime.userMode
-        if !authOK, let a = authorization, case .success = ProtectionDisableFlow.verifyExternalForm(a) { authOK = true }
+        if !authOK, let a = authorization {
+            // Say exactly why a supplied authorization was refused (it used to collapse into "authentication is required",
+            // which looked like the app never asked). The app retries with a fresh prompt and a fresh token.
+            switch ProtectionDisableFlow.verifyExternalForm(a) {
+            case .success: authOK = true
+            case .failure(let f):
+                logWarn("disable-protection: authorization from uid \(peer.uid) refused: \(f.description)")
+                throw ServiceError.denied("administrator authentication couldn't be verified (\(f.description)); please try again")
+            }
+        }
         switch flow.issueToken(peerUID: peer.uid, isAdmin: peer.isAdmin || runtime.userMode, authorizationOK: authOK) {
         case .success(let t): return t
         case .failure(let f): throw ServiceError.denied(f.description)

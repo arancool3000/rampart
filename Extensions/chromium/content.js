@@ -344,6 +344,14 @@ button { cursor: pointer; font: 600 14px -apple-system, "Helvetica Neue", Arial,
     };
     await check();
     setTimeout(check, 2500);
+    // Per-site tracker count (popup): third-party hosts this page loaded, classified by RamPart's tracker list.
+    if (window.top === window) setTimeout(() => {
+      try {
+        const hosts = Array.from(new Set(performance.getEntriesByType("resource").map((e) => { try { return new URL(e.name).hostname; } catch { return ""; } })
+          .filter((h) => h && h !== location.hostname))).slice(0, 300);
+        if (hosts.length) send({ type: "countTrackers", hosts });
+      } catch { /* ignore */ }
+    }, 4000);
     // Re-check when a big overlay is injected later (ClickFix pages often render on click).
     let scheduled = false;
     const mo = new MutationObserver(() => { if (scheduled || shownLevel === "block") return; scheduled = true; setTimeout(() => { scheduled = false; check(); }, 1200); });

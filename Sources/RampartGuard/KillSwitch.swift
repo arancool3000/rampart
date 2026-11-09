@@ -103,7 +103,7 @@ public enum KillSwitch {
 /// The user-facing notice for a lockdown transition. The daemon pushes status changes; the app (or its agent) turns
 /// each transition into one time-sensitive notification with "Restore internet" (Super Kill Switch) and "Details".
 public struct EmergencyNotice: Hashable, Sendable {
-    public enum Kind: String, Sendable { case engaged, networkBlocked, networkRestored, expired, lifted }
+    public enum Kind: String, Sendable { case engaged, networkBlocked, networkRestored, expired, lifted, falseAlarm }
     public var kind: Kind
     public var title: String
     public var body: String
@@ -139,6 +139,10 @@ public struct EmergencyNotice: Hashable, Sendable {
             return EmergencyNotice(kind: k, title: "\(Product.name) blocked the internet",
                                    body: "\(Product.name) blocked the internet: \(reason).\(st.networkSecondsLeft != nil ? " Internet is blocked for \(mins) min." : "")",
                                    actions: [restoreAction, detailsAction], timeSensitive: true)
+        case .falseAlarm:
+            return EmergencyNotice(kind: k, title: "Emergency Lockdown lifted: false alarm",
+                                   body: "\(Product.name) lifted Emergency Lockdown: false alarm. \(s.falseAlarm ?? "It was started by \(Product.name)'s own files.") Nothing needs doing.",
+                                   actions: [], timeSensitive: true)
         case .networkRestored, .expired, .lifted:
             return EmergencyNotice(kind: k, title: "Internet restored",
                                    body: k == .lifted ? "Emergency Lockdown is off. Internet restored." : k == .expired ? "The automatic network block ended. Internet restored." : "Internet restored.",
@@ -153,7 +157,11 @@ public struct EmergencyNotice: Hashable, Sendable {
         let isBlocked = isActive && new.state.isNetworkBlocked
         if isActive && (!wasActive || old?.state.startedAt != new.state.startedAt) { return text(new, kind: Kind.engaged.rawValue) }
         if isActive && isBlocked && !wasBlocked { return text(new, kind: Kind.networkBlocked.rawValue) }
-        if wasActive && !isActive { return text(new, kind: Kind.lifted.rawValue) }
+        if wasActive && !isActive { return text(new, kind: (new.state.falseAlarm != nil ? Kind.falseAlarm : Kind.lifted).rawValue) }
+        // An app that starts after the daemon lifted a false alarm still tells the user once.
+        if old == nil, !isActive, new.state.falseAlarm != nil, let l = new.state.liftedAt, Date().timeIntervalSince(l) < 600 {
+            return text(new, kind: Kind.falseAlarm.rawValue)
+        }
         if wasBlocked && !isBlocked {
             let expired = new.state.log.last?.text.contains("automatically") ?? false
             return text(new, kind: (expired ? Kind.expired : Kind.networkRestored).rawValue)

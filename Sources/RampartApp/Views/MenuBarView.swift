@@ -12,6 +12,7 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.m) {
             top
+            MediaInUseBadge(compact: false).font(.caption).foregroundStyle(.green)   // camera / mic in use (Camera & Mic)
             if !model.isScanning {
                 HStack(spacing: Spacing.s) {
                     Button { model.startScan(.quick) } label: { Label("Quick Scan", systemImage: "bolt.fill").frame(maxWidth: .infinity) }
@@ -63,6 +64,8 @@ struct MenuBarView: View {
                 .help("Temporarily pause real-time protection; it resumes on its own")
                 .accessibilityHint("Real-time protection resumes automatically after the chosen time")
                 .padding(.horizontal, 8).padding(.vertical, 4)
+                DesktopMenuRow()
+                BotMenuRow()
                 MenuRowButton(title: "Settings…", shortcut: "⌘,") { NSApp.activate(ignoringOtherApps: true); openSettings() }
                 MenuRowButton(title: "Quit \(Product.name)", shortcut: "⌘Q") { showQuitInfo = true }
                 if showQuitInfo {

@@ -41,6 +41,7 @@ enum KillSwitchExec {
                 var notes: [String] = []
                 if let d = p.services.deception { do { try d.setTarpit(false); notes.append("network lure stopped") } catch { notes.append("lure: \(error.localizedDescription)") } }
                 if let g = p.services.guardian { g.setLockdown(false); notes.append("remote-access lockdown off") }
+                notes.append(VPNWiring.stop("Super Kill Switch"))
                 notes.append("web protection off")
                 notes.append("Wi-Fi auto-disconnect is turned off by the app")
                 return notes.joined(separator: "; ")
@@ -58,7 +59,7 @@ enum KillSwitchExec {
         KillSwitch.run([
             (.liftLockdown, { Emergency.offline(stateRoot: stateRoot, dryRun: dryRun).joined(separator: "; ") }),
             (.unloadAnchors, { try unloadAllAnchors() }),
-            (.restoreDNS, { try dnsAutomatic() }),
+            (.restoreDNS, { [try dnsAutomatic(), VPNWiring.offlineCleanup(dryRun: dryRun)].joined(separator: "; ") }),
             (.resumeProcesses, { resumeFrozen(stateRoot: stateRoot) }),
             (.stopGuards, {
                 let jobs = ["app.rampart.sentinel", "app.rampart.watchdog", Product.daemonLabel]

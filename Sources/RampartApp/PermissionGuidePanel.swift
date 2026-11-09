@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import RampartShared
+import RampartGuard
 
 /// A small floating hint shown beside System Settings after we open Full Disk Access.
 /// Non-activating, joins all spaces, ignores the mouse except for its own buttons.
@@ -11,13 +12,23 @@ final class PermissionGuidePanel {
     private var panel: NSPanel?
     private let state = GuideState()
 
-    @MainActor @Observable final class GuideState { var done = false; var pointRight = false }
+    @MainActor @Observable final class GuideState {
+        var done = false; var pointRight = false
+        /// The service lost Full Disk Access after an update: the old entry must be removed and the service added again.
+        var lostAfterUpdate: HealthNote?
+    }
+
+    /// The daemon's "lost Full Disk Access after an update" note, if it reported one.
+    static var lostAfterUpdateNote: HealthNote? {
+        AppModel.shared.status.healthNotes?.first { $0.id == ServiceFDAAdvice.noteID }
+    }
 
     var isShowing: Bool { panel != nil }
 
     func show() {
         guard !Headless.active, Bundle.main.bundleIdentifier != nil else { return }
         state.done = false
+        state.lostAfterUpdate = Self.lostAfterUpdateNote
         if panel == nil {
             let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 320, height: 250),
                             styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: true)
@@ -111,6 +122,8 @@ private struct PermissionGuideView: View {
                     Text("\(Product.name) now has Full Disk Access.").font(.callout)
                 }
                 .transition(.opacity)
+            } else if state.lostAfterUpdate != nil {
+                lostAfterUpdateSteps
             } else {
                 HStack(spacing: 6) {
                     if !state.pointRight { guideArrow }
@@ -136,6 +149,26 @@ private struct PermissionGuideView: View {
             // One calm toggle animation; nothing bounces or moves the text.
             withAnimation(.spring(response: 0.4, dampingFraction: 0.7).delay(0.6)) { toggleOn = true }
         }
+    }
+
+    /// After an update: remove the stale app.rampart.daemon entry and add the new service (toggling is not enough).
+    private var lostAfterUpdateSteps: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                if !state.pointRight { guideArrow }
+                Text("The update gave the protection service a new identity. Remove app.rampart.daemon and add it again.")
+                    .font(.callout.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+                if state.pointRight { guideArrow }
+            }
+            ForEach(Array(ServiceFDAAdvice.steps().dropFirst().enumerated()), id: \.offset) { i, step in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("\(i + 1).").font(.caption.weight(.bold)).monospacedDigit()
+                    Text(step).font(.caption).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+                }
+            }
+            Text(ServiceFDAAdvice.why).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private var row: some View {

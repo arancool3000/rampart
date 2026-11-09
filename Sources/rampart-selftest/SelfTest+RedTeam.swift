@@ -47,6 +47,13 @@ private final class RTDaemon {
         let r = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) } }
         return r == 0 ? Double(info.ri_resident_size) / 1_048_576 : -1
     }
+    /// Physical footprint (what Activity Monitor's "Memory" and jetsam count). Resident size also includes clean,
+    /// shared and already-freed-but-not-yet-returned malloc pages, so it swings with the allocator, not real use.
+    func footprintMB() -> Double {
+        var info = rusage_info_v2()
+        let r = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) } }
+        return r == 0 ? Double(info.ri_phys_footprint) / 1_048_576 : -1
+    }
 }
 
 /// Samples a pid's peak RSS in the background.
@@ -289,7 +296,8 @@ extension SelfTest {
             let big = RT.call(sock, .setSettings(s), timeout: 60).last
             if case .settings? = big { check(Date().timeIntervalSince(t0) < 30, "redteam settings: 100k exclusions accepted in \(Int(Date().timeIntervalSince(t0))) s") }
             else { check(false, "redteam settings: 100k exclusions answered") }
-            check(d.alive && d.rssMB() < 400, "redteam settings: alive and bounded after 100k exclusions (\(Int(d.rssMB())) MB)")
+            let foot = d.footprintMB()
+            check(d.alive && foot > 0 && foot < 400, "redteam settings: alive and bounded after 100k exclusions (footprint \(Int(foot)) MB, resident \(Int(d.rssMB())) MB)")
             s = orig; s.exclusions = ["/"]
             if case .settings(let got)? = RT.call(sock, .setSettings(s)).last { check(!got.exclusions.contains("/"), "redteam settings: excluding / refused") }
             else { check(false, "redteam settings: exclude / answered") }
