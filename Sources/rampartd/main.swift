@@ -78,6 +78,25 @@ let stateLockFD: Int32 = {
     try? FileManager.default.createDirectory(at: runtime.root, withIntermediateDirectories: true)
     let path = runtime.root.appendingPathComponent("rampartd.lock").path
     let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
+    // A user helper left running from a REPLACED copy of the app holds the lock forever (it never restarts by itself).
+    // In user mode only: if the holder is the same user's rampartd at our own path, started before our binary was
+    // installed, stop it and take over.
+    if fd >= 0, flock(fd, LOCK_EX | LOCK_NB) != 0, runtime.userMode, getuid() != 0,
+       let txt = try? String(contentsOfFile: path, encoding: .utf8), let holder = Int32(txt.trimmingCharacters(in: .whitespacesAndNewlines)), holder > 1 {
+        var buf = [CChar](repeating: 0, count: 4096)
+        let me = CommandLine.arguments[0].hasPrefix("/") ? CommandLine.arguments[0] : (Bundle.main.executablePath ?? "")
+        var info = proc_bsdinfo()
+        let ok = proc_pidpath(holder, &buf, UInt32(buf.count)) > 0
+            && proc_pidinfo(holder, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0
+        let holderPath = ok ? String(cString: buf) : ""
+        let mine = (try? FileManager.default.attributesOfItem(atPath: me)[.modificationDate] as? Date) ?? nil
+        let started = Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec))
+        if ok, info.pbi_uid == getuid(), holderPath == me, let mine, started < mine {
+            FileHandle.standardError.write(Data("rampartd: stopping stale helper \(holder) from a replaced copy\n".utf8))
+            kill(holder, SIGTERM)
+            for _ in 0..<30 where flock(fd, LOCK_EX | LOCK_NB) != 0 { usleep(100_000) }
+        }
+    }
     guard fd >= 0, flock(fd, LOCK_EX | LOCK_NB) == 0 else {
         FileHandle.standardError.write(Data("rampartd: another rampartd is using \(runtime.root.path)\n".utf8))
         exit(75)
