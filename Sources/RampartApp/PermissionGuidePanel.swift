@@ -63,32 +63,42 @@ final class PermissionGuidePanel {
 
     func close() { panel?.orderOut(nil); panel = nil }
 
+    /// Re-placed every second while showing, so it follows the Settings window if the user moves it.
+    func reposition() { if panel != nil { position() } }
+
     private func position() {
         guard let panel else { return }
         if let host = panel.contentView as? NSHostingView<PermissionGuideView> { panel.setContentSize(host.fittingSize) }
         let size = panel.frame.size
-        let screen = NSScreen.main ?? NSScreen.screens.first
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         var origin: NSPoint?
-        // Window bounds (not contents) are readable without Screen Recording permission.
-        if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
-           let w = list.first(where: { ($0[kCGWindowOwnerName as String] as? String) == "System Settings" && ($0[kCGWindowLayer as String] as? Int) == 0 }),
-           let b = w[kCGWindowBounds as String] as? [String: CGFloat],
-           let x = b["X"], let y = b["Y"], let width = b["Width"], let h = b["Height"] {
-            let flippedY = primaryHeight - y - h       // CG is top-left origin; AppKit is bottom-left
-            var px = x + width + 12
-            var right = false
-            var py = flippedY + h - size.height - 60
-            if let vf = screen?.visibleFrame, px + size.width > vf.maxX {
-                // No room on the right: sit over Settings' own sidebar (left part of its window), level with
-                // the app list, pointing right at it.
-                px = x + 16; right = true
-                py = flippedY + h * 0.45 - size.height / 2
+        // Window bounds (not contents) are readable without Screen Recording permission. Pick the biggest normal
+        // System Settings window (it can own small helper windows too).
+        if let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+            let rects: [CGRect] = list.compactMap { w in
+                guard (w[kCGWindowOwnerName as String] as? String) == "System Settings", (w[kCGWindowLayer as String] as? Int) == 0,
+                      let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                      let x = b["X"], let y = b["Y"], let width = b["Width"], let h = b["Height"], width > 300, h > 200 else { return nil }
+                return CGRect(x: x, y: primaryHeight - y - h, width: width, height: h)   // flip to AppKit coordinates
             }
-            state.pointRight = right
-            origin = NSPoint(x: px, y: py)
+            if let win = rects.max(by: { $0.width * $0.height < $1.width * $1.height }) {
+                let screen = NSScreen.screens.first(where: { $0.frame.intersects(win) }) ?? NSScreen.main
+                let vf = screen?.visibleFrame ?? win
+                let visible = win.intersection(vf)
+                let gap: CGFloat = 14
+                // Level with the middle of the app list (the list fills the right part of the window).
+                var py = visible.midY - size.height / 2
+                py = min(max(py, vf.minY + 8), vf.maxY - size.height - 8)
+                if vf.maxX - visible.maxX >= size.width + gap {            // room on the right: point left at the list
+                    origin = NSPoint(x: visible.maxX + gap, y: py); state.pointRight = false
+                } else if visible.minX - vf.minX >= size.width + gap {     // room on the left: point right at it
+                    origin = NSPoint(x: visible.minX - size.width - gap, y: py); state.pointRight = true
+                } else {                                                    // no room: sit inside the window's left side
+                    origin = NSPoint(x: max(visible.minX + 12, vf.minX + 8), y: py); state.pointRight = true
+                }
+            }
         }
-        if origin == nil, let vf = screen?.visibleFrame {
+        if origin == nil, let vf = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame {
             origin = NSPoint(x: vf.maxX - size.width - 24, y: vf.maxY - size.height - 24)
         }
         if let origin { panel.setFrameOrigin(origin) }
@@ -234,6 +244,7 @@ enum FullDiskAccessRequest {
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { t in
             MainActor.assumeIsolated {
                 ticks += 1
+                PermissionGuidePanel.shared.reposition()
                 if ticks % 5 == 0 { Task { await AppModel.shared.refresh(heavy: false) } }
                 if bothHaveAccess {
                     t.invalidate(); timer = nil
