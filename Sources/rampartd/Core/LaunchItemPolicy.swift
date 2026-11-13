@@ -73,6 +73,8 @@ enum LaunchItemPolicy {
         let all = ([exe] + arguments).joined(separator: " ")
         let tempRoots = ["/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/tmp/", "/var/folders/", "/private/var/folders/", "/Users/Shared/"]
         if tempRoots.contains(where: { all.contains($0) }) { return false }
+        // wms-o10: RamPart never runs anything from its own data folder; a job pointing there is hiding.
+        if all.lowercased().contains("/library/application support/rampart/") { return false }
         // Hidden path components (".something") in the program or arguments, except the usual dot-folders of tools.
         let allowedDot: Set<String> = [".local", ".nvm", ".pyenv", ".rbenv", ".cargo", ".deno", ".bun", ".config", ".venv", ".npm-global", ".volta"]
         for comp in all.split(whereSeparator: { $0 == "/" || $0 == " " }) where comp.hasPrefix(".") && comp.count > 1 && comp != ".." {
@@ -117,6 +119,7 @@ enum LaunchItemPolicy {
         var bad: [String] = []
         if tempRoots.contains(where: { all.contains($0) }) { bad.append("runs from a temporary or shared folder") }
         if p.contains("/Downloads/") { bad.append("runs from Downloads") }
+        if all.lowercased().contains("/library/application support/rampart/") { bad.append("runs from RamPart's private data folder") }
         if all.split(whereSeparator: { $0 == "/" || $0 == " " }).contains(where: { $0.hasPrefix(".") && $0.count > 1 && $0 != ".." && !allowedDot.contains(String($0)) }) {
             bad.append("hidden path")
         }

@@ -71,6 +71,9 @@ public struct AppBlockPlan: Codable, Sendable {
     public var sharedDomains: [String]
     public var localAddresses: [String]
     public var killCommands: [NetCommand]
+    /// o4: destinations macOS or RamPart rely on (never blocked, whatever app also used them).
+    public var protectedAddresses: [String]? = nil
+    public var protectedDomains: [String]? = nil
 }
 
 public struct AppFirewallStatus: Codable, Sendable {
@@ -168,13 +171,54 @@ public final class AppFirewall: @unchecked Sendable {
     }
 
     /// Never offered for blocking: macOS itself and RamPart.
+    /// o4: only the SIP-protected system paths count as macOS (`/usr/local` is user/Homebrew-writable), and only
+    /// RamPart's installed locations count as RamPart. A name match anywhere (`~/Downloads/Rampart.app`,
+    /// `/tmp/x/rampartd`) used to make malware unblockable just by naming itself after RamPart.
     public static func protectedKey(_ key: String) -> String? {
-        if key.hasPrefix("/System/") || key.hasPrefix("/usr/") || key.hasPrefix("/sbin/") || key.hasPrefix("/bin/") || key.hasPrefix("/Library/Apple/") {
+        let path = key.hasPrefix("/") ? (key as NSString).standardizingPath : key
+        if path.contains("/../") || path.hasSuffix("/..") { return nil }
+        let systemPrefixes = ["/System/", "/usr/", "/sbin/", "/bin/", "/Library/Apple/"]
+        if systemPrefixes.contains(where: path.hasPrefix), !path.hasPrefix("/usr/local/") {
             return "Blocking parts of macOS could break networking for everything."
         }
-        let low = key.lowercased()
-        if low.hasSuffix("/rampart.app") || low.contains("/rampart.app/") || low.hasSuffix("/rampartd") { return "RamPart can't block itself." }
+        let low = path.lowercased()
+        if low == "/applications/rampart.app" || low.hasPrefix("/library/privilegedhelpertools/app.rampart.") {
+            return "RamPart can't block itself."
+        }
         return nil
+    }
+
+    /// o4: names macOS and RamPart need (Apple services, OCSP/updates/time/captive portal, the DoH upstreams, the
+    /// feed hosts and RamPart's own services). Blocks are global (DNS + pf, no per-app filtering), so blocking an
+    /// app that also touched one of these would break the whole Mac or RamPart itself.
+    public static let protectedDomainSuffixes: [String] = [
+        "apple.com", "icloud.com", "icloud-content.com", "mzstatic.com", "cdn-apple.com", "aaplimg.com", "apple-dns.net",
+        "apple-cloudkit.com", "apple.news", "me.com", "itunes.com", "push-apple.com.akadns.net", "apple.com.akadns.net",
+        "cloudflare-dns.com", "quad9.net", "dns.google",
+        "cdn.jsdelivr.net", "malware-filter.gitlab.io", "abuse.ch", "pwnedpasswords.com", "haveibeenpwned.com",
+        "generativelanguage.googleapis.com", "raw.githubusercontent.com",
+    ]
+
+    public static func isProtectedDomain(_ raw: String) -> Bool {
+        let n = DNSWire.normalize(raw)
+        if DoHClient.bootstrapAddresses[n] != nil { return true }
+        return protectedDomainSuffixes.contains { n == $0 || n.hasSuffix("." + $0) }
+    }
+
+    /// o4: run-time protected addresses (the original DNS servers the watchdog restores to, VPN endpoints).
+    public var extraProtectedAddresses: [String] {
+        get { lock.lock(); defer { lock.unlock() }; return pf.alsoProtect }
+        set { lock.lock(); pf.alsoProtect = newValue; lock.unlock() }
+    }
+
+    /// Apple's own 17.0.0.0/8, the DoH upstreams and public resolvers, run-time extras, and any address the DNS
+    /// log ties to a protected name.
+    func isProtectedAddressLocked(_ a: String) -> Bool {
+        if let b = DNSWire.addressBytes(a), b.count == 4, b[0] == 17 { return true }
+        if PFManager.sanitize(a) != nil, PFManager.sanitize(a, protecting: pf.alsoProtect) == nil { return true }
+        if PFManager.protectedAddresses.contains(a) { return true }
+        if let h = ipToHost[a], Self.isProtectedDomain(h) { return true }
+        return false
     }
 
     static func isLocal(_ address: String) -> Bool { PFManager.sanitize(address) == nil }
@@ -279,19 +323,22 @@ public final class AppFirewall: @unchecked Sendable {
         var othersAddr = Set<String>(), othersDom = Set<String>()
         for (k, v) in state.addresses where k != key && state.rules[k]?.decision != .block { othersAddr.formUnion(v) }
         for (k, v) in state.domains where k != key && state.rules[k]?.decision != .block { othersDom.formUnion(v) }
-        var addrs: [String] = [], shared: [String] = [], local: [String] = []
+        var addrs: [String] = [], shared: [String] = [], local: [String] = [], prot: [String] = []
         for a in mine {
-            if Self.isLocal(a) { local.append(a) } else if othersAddr.contains(a) { shared.append(a) } else { addrs.append(a) }
+            if isProtectedAddressLocked(a) { prot.append(a) } else if Self.isLocal(a) { local.append(a) }
+            else if othersAddr.contains(a) { shared.append(a) } else { addrs.append(a) }
         }
-        var doms: [String] = [], sharedD: [String] = []
+        var doms: [String] = [], sharedD: [String] = [], protD: [String] = []
         for d in myDomains {
             guard DomainBlocklist.normalizeDomain(Substring(d)) != nil else { continue }
-            if othersDom.contains(d) { sharedD.append(d) } else { doms.append(d) }
+            if Self.isProtectedDomain(d) { protD.append(d) }
+            else if othersDom.contains(d) { sharedD.append(d) } else { doms.append(d) }
         }
         let live = lastApps.first { $0.key == key }?.endpoints ?? []
         let kills = live.filter { addrs.contains($0.remoteAddress) }.flatMap { Self.killCommands(local: $0.localAddress, remote: $0.remoteAddress) }
         return AppBlockPlan(key: key, name: state.names[key] ?? Self.displayName(key: key, fallback: key), addresses: addrs, domains: doms,
-                            sharedAddresses: shared, sharedDomains: sharedD, localAddresses: local, killCommands: kills)
+                            sharedAddresses: shared, sharedDomains: sharedD, localAddresses: local, killCommands: kills,
+                            protectedAddresses: prot, protectedDomains: protD)
     }
 
     /// `pfctl -k <local> -k <remote>` kills the pf state of an already-open connection so the new block applies to it.
@@ -310,6 +357,10 @@ public final class AppFirewall: @unchecked Sendable {
     @discardableResult
     public func decide(key: String, decision: FirewallDecision, now: Date = Date()) throws -> AppFirewallStatus {
         if decision == .block, let why = Self.protectedKey(key) { throw DecisionError.refused(why) }
+        // o4: Apple-signed software (Safari, Mail, ...) is part of macOS for networking purposes too.
+        if decision == .block, key.hasPrefix("/"), signer(key)?.status == .apple {
+            throw DecisionError.refused("Blocking Apple software could break networking for everything.")
+        }
         lock.lock()
         prompts.removeAll { $0.key == key }
         let name = state.names[key] ?? Self.displayName(key: key, fallback: key)
@@ -351,6 +402,8 @@ public final class AppFirewall: @unchecked Sendable {
             rule.notes = p.sharedAddresses.map { "\($0): also used by another app, not blocked" }
                 + p.sharedDomains.map { "\($0): also used by another app, not blocked" }
                 + p.localAddresses.map { "\($0): local network address, never blocked" }
+                + (p.protectedAddresses ?? []).map { "\($0): used by macOS or RamPart, never blocked" }
+                + (p.protectedDomains ?? []).map { "\($0): used by macOS or RamPart, never blocked" }
             state.rules[k] = rule
             ips.formUnion(p.addresses)
             for d in p.domains { domains[d] = r.name }

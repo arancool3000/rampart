@@ -86,6 +86,24 @@ public struct VPNNetworkPlan: Equatable {
 
     var endpointIsV6: Bool { endpointIP.contains(":") }
 
+    /// The endpoint as a canonical literal, or nil. Everything written into pf rules uses this, never the raw text
+    /// (a profile.json edited on disk, or a resolver quirk, must not be able to widen the kill switch).
+    var safeEndpointIP: String? { IPPrefix.strictLiteral(endpointIP).map(IPPrefix.format) }
+    /// Interface names that are safe inside a pf rule / scutil line.
+    static func safeInterfaceName(_ s: String) -> Bool {
+        (1...15).contains(s.count) && s.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+    }
+
+    /// Full tunnel for one family only: the other family would leave through the physical interface while the user
+    /// believes everything is tunnelled (classic IPv6 leak). Route it into the tunnel too; the peer drops anything
+    /// outside AllowedIPs, so it is blackholed rather than leaked. Skipped for the endpoint's own family.
+    public var leakBlockRoutes: [String] {
+        let full = config.isFullTunnel
+        if full.v4 && !full.v6 && !endpointIsV6 { return ["::/1", "8000::/1"] }
+        if full.v6 && !full.v4 && endpointIsV6 { return ["0.0.0.0/1", "128.0.0.0/1"] }
+        return []
+    }
+
     public func addressCommands() -> [VPNCommand] {
         var c: [VPNCommand] = []
         for a in config.addresses {
@@ -125,11 +143,14 @@ public struct VPNNetworkPlan: Equatable {
         for r in tunnelRoutes {
             c.append(VPNCommand(VPNCommand.route, ["-q", "-n", "add", r.contains(":") ? "-inet6" : "-inet", r, "-interface", interface]))
         }
+        for r in leakBlockRoutes {
+            c.append(VPNCommand(VPNCommand.route, ["-q", "-n", "add", r.contains(":") ? "-inet6" : "-inet", r, "-interface", interface], tolerateFailure: true))
+        }
         return c
     }
 
     public func routeDownCommands() -> [VPNCommand] {
-        var c: [VPNCommand] = tunnelRoutes.map {
+        var c: [VPNCommand] = (tunnelRoutes + leakBlockRoutes).map {
             VPNCommand(VPNCommand.route, ["-q", "-n", "delete", $0.contains(":") ? "-inet6" : "-inet", $0, "-interface", interface], tolerateFailure: true)
         }
         if endpointCoveredByTunnel {
@@ -139,13 +160,16 @@ public struct VPNNetworkPlan: Equatable {
     }
 
     /// DNS servers the system should use while connected.
-    public var effectiveDNS: [String] { dnsFilterActive ? ["127.0.0.1"] : config.dnsServers }
+    public var effectiveDNS: [String] {
+        dnsFilterActive ? ["127.0.0.1"] : config.dnsServers.compactMap { IPPrefix.strictLiteral($0).map(IPPrefix.format) }
+    }
 
     /// scutil script: a service of our own whose IPv4 entry overrides the primary service (full tunnel), so its DNS
     /// becomes the system resolver. Removing the two keys restores everything (no backup of other services needed).
     public func dnsUpCommand() -> VPNCommand? {
         let dns = effectiveDNS
-        guard !dns.isEmpty else { return nil }
+        guard !dns.isEmpty, Self.safeInterfaceName(interface) else { return nil }
+        let search = config.dnsSearch.filter(WGQuickConfig.isHostname)
         let v4 = config.addresses.compactMap(IPPrefix.hostAddress).first { $0.address.count == 4 }.map { IPPrefix.format($0.address) }
         let key = "State:/Network/Service/\(Self.scutilService)"
         var s = "open\n"
@@ -155,8 +179,8 @@ public struct VPNNetworkPlan: Equatable {
             s += "set \(key)/IPv4\n"
         }
         s += "d.init\nd.add ServerAddresses * \(dns.joined(separator: " "))\n"
-        if !config.dnsSearch.isEmpty { s += "d.add SearchDomains * \(config.dnsSearch.joined(separator: " "))\n" }
-        if !config.isFullTunnel.v4 && !config.dnsSearch.isEmpty { s += "d.add SupplementalMatchDomains * \(config.dnsSearch.joined(separator: " "))\n" }
+        if !search.isEmpty { s += "d.add SearchDomains * \(search.joined(separator: " "))\n" }
+        if !config.isFullTunnel.v4 && !search.isEmpty { s += "d.add SupplementalMatchDomains * \(search.joined(separator: " "))\n" }
         s += "set \(key)/DNS\nclose\nquit\n"
         return VPNCommand(VPNCommand.scutil, [], stdin: s)
     }
@@ -167,21 +191,21 @@ public struct VPNNetworkPlan: Equatable {
     }
 
     /// pf rules: only the tunnel, loopback, DHCP / neighbour discovery and our one WireGuard UDP flow may pass.
+    /// Fails closed: an endpoint or interface that isn't a plain literal / name drops its pass rule (block all).
     public func killSwitchRules() -> String {
         let fam = endpointIsV6 ? "inet6" : "inet"
-        return """
-        # RamPart VPN kill switch (generated; pfctl -a \(Self.pfAnchor)). Only the WireGuard tunnel may carry traffic.
-        pass quick on lo0 all
-        pass quick on \(interface) all
-        pass out quick inet proto udp from any port 68 to any port 67 keep state
-        pass in quick inet proto udp from any port 67 to any port 68 keep state
-        pass out quick inet6 proto udp from any port 546 to any port 547 keep state
-        pass quick inet6 proto icmp6 icmp6-type { neighbrsol, neighbradv, routersol, routeradv }
-        pass out quick \(fam) proto udp from any port \(localUDPPort) to \(endpointIP) port \(config.endpointPort) keep state
-        block drop out quick all
-        block drop in quick all
-
-        """
+        var r = ["# RamPart VPN kill switch (generated; pfctl -a \(Self.pfAnchor)). Only the WireGuard tunnel may carry traffic.",
+                 "pass quick on lo0 all"]
+        if Self.safeInterfaceName(interface) { r.append("pass quick on \(interface) all") }
+        r += ["pass out quick inet proto udp from any port 68 to any port 67 keep state",
+              "pass in quick inet proto udp from any port 67 to any port 68 keep state",
+              "pass out quick inet6 proto udp from any port 546 to any port 547 keep state",
+              "pass quick inet6 proto icmp6 icmp6-type { neighbrsol, neighbradv, routersol, routeradv }"]
+        if let ep = safeEndpointIP, localUDPPort > 0, config.endpointPort > 0 {
+            r.append("pass out quick \(fam) proto udp from any port \(localUDPPort) to \(ep) port \(config.endpointPort) keep state")
+        }
+        r += ["block drop out quick all", "block drop in quick all", ""]
+        return r.joined(separator: "\n") + "\n"
     }
 
     public func killSwitchLoadCommands() -> [VPNCommand] {

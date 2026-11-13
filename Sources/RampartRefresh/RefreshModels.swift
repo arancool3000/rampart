@@ -163,6 +163,9 @@ public struct RefreshUndoEntry: Codable, Hashable, Sendable, Identifiable {
     public var trashed: String
     public var bytes: UInt64
     public var date: Date
+    public init(original: String, trashed: String, bytes: UInt64, date: Date) {
+        self.original = original; self.trashed = trashed; self.bytes = bytes; self.date = date
+    }
 }
 
 public struct RefreshOutcome: Sendable {

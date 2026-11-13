@@ -106,9 +106,18 @@ public enum EmergencyProcessGuard {
         if pid <= 1 || pid == getpid() { return true }
         if path.isEmpty { return true }   // unknown executable: don't guess
         if protectedPrefixes.contains(where: { path.hasPrefix($0) }) { return true }
-        if neverSignal.contains((path as NSString).lastPathComponent) { return true }
-        if path.contains("/Rampart.app/") || path.hasPrefix("/Library/PrivilegedHelperTools/app.rampart") { return true }
+        // wms-o7: names and "/Rampart.app/" anywhere in the path used to exempt a process, so malware called `rampartd` or
+        // run from ~/Downloads/Rampart.app/ was never frozen. Only RamPart's installed locations count now (the daemon
+        // also re-checks each pid against its verified own executables before signalling).
+        if isInstalledRamPart(path) { return true }
+        if neverSignal.contains((path as NSString).lastPathComponent), protectedPrefixes.contains(where: { path.hasPrefix($0) }) { return true }
         return isPlatformBinary(pid)
+    }
+
+    /// RamPart's own install locations (root-owned): the app bundle in /Applications and the system service binaries.
+    public static func isInstalledRamPart(_ path: String) -> Bool {
+        let l = (path as NSString).standardizingPath.lowercased()
+        return l.hasPrefix("/applications/\(Product.name.lowercased()).app/") || l.hasPrefix("/library/privilegedhelpertools/\(Product.bundlePrefix).")
     }
 }
 
@@ -226,6 +235,18 @@ public struct EmergencyContext: Sendable {
 public enum EmergencyPlanner {
     public static let tmutil = "/usr/bin/tmutil", launchctl = "/bin/launchctl", kill = "/bin/kill"
 
+    /// wms-o7: RamPart's own launch items are never paused, but only its real ones: a known label in a root-owned system
+    /// folder or inside the installed app bundle. Any "app.rampart.*" label used to be exempt, so malware persisting as
+    /// ~/Library/LaunchAgents/app.rampart.update.plist escaped "Pause newly added startup items".
+    public static func isOwnLaunchItem(label: String, location: String) -> Bool {
+        let p = GuardPaths.standard
+        let labels = Set(p.labels + [Product.bundlePrefix + ".userdaemon"])
+        guard labels.contains(label) else { return false }
+        let l = (location as NSString).standardizingPath.lowercased()
+        return l == "/library/launchagents/\(label.lowercased()).plist" || l == "/library/launchdaemons/\(label.lowercased()).plist"
+            || l == "/applications/\(Product.name.lowercased()).app/contents/library/launchagents/\(label.lowercased()).plist"
+    }
+
     /// `containNetwork` false (an automatic trigger without high-confidence active-attack evidence): only the
     /// non-disruptive steps run (alert, freeze, quarantine, snapshot, vault lock); network, clipboard, remote-access
     /// and startup-item steps are planned as skipped.
@@ -282,7 +303,7 @@ public enum EmergencyPlanner {
         var lc: [GuardCommand] = [], undo: [GuardCommand] = [], items: [String] = []
         for i in c.newLaunchItems where i.kind == .launchAgent || i.kind == .launchDaemon {
             let label = i.label.filter { $0.isLetter || $0.isNumber || ".-_".contains($0) }
-            guard !label.isEmpty, !label.hasPrefix("com.apple."), !label.hasPrefix(Product.bundlePrefix) else { continue }
+            guard !label.isEmpty, !label.hasPrefix("com.apple."), !isOwnLaunchItem(label: label, location: i.location) else { continue }
             let domain = i.kind == .launchDaemon ? "system" : "gui/\(c.uid)"
             lc.append(GuardCommand(launchctl, ["bootout", "\(domain)/\(label)"], requiresRoot: domain == "system", acceptableExitCodes: [3, 113]))
             lc.append(GuardCommand(launchctl, ["disable", "\(domain)/\(label)"], requiresRoot: domain == "system"))
@@ -386,6 +407,8 @@ public enum EmergencyNetworkPolicy {
     public static let liftCooldown: TimeInterval = 1800
     /// Automatic network containment expires on its own after this long unless the user confirms "Keep blocking".
     public static let autoNetworkLifetime: TimeInterval = 600
+    /// Signals that are evidence of a threat in their own right (not cheap to produce without one).
+    public static let threatKinds: Set<EmergencyTriggerReason.Kind> = [.confirmedMalware, .credentialTheft, .ransomware, .exfiltration]
 
     public static func assess(_ r: EmergencyTriggerReason, recent: [EmergencySignal], now: Date, liftedAt: Date? = nil) -> EmergencyAssessment {
         if r.kind == .manual { return EmergencyAssessment(engage: true, containNetwork: true, why: "You turned on Emergency Lockdown.") }
@@ -400,7 +423,14 @@ public enum EmergencyNetworkPolicy {
             if cooling || !independent {
                 return EmergencyAssessment(engage: false, containNetwork: false, why: "A single \(r.kind == .tampering ? "tamper" : "decoy") signal is only reported; it needs a second, independent signal.")
             }
-            return EmergencyAssessment(engage: true, containNetwork: true, why: "Two independent signals: \(kinds.map(\.rawValue).sorted().joined(separator: " + ")).")
+            // wms-o7: any local program can produce a tamper signal (`pkill rampartd`, `rm` on a RamPart file) and a decoy
+            // signal (open a decoy file) without being malware. Those two together used to cut the internet, and again
+            // after every 10-minute expiry: a free, repeatable denial of service. The network is cut only when at least one
+            // of the signals is evidence of an actual threat (malware, credential theft, ransomware, exfiltration).
+            let threat = live.contains { Self.threatKinds.contains($0.kind) }
+            return EmergencyAssessment(engage: true, containNetwork: threat,
+                                       why: threat ? "Two independent signals: \(kinds.map(\.rawValue).sorted().joined(separator: " + "))."
+                                                   : "Tamper and decoy signals are watched closely, but they don't cut the internet without evidence of an actual threat.")
         case .exfiltration:
             let malicious = live.contains { [.confirmedMalware, .credentialTheft, .ransomware].contains($0.kind) }
             let net = !cooling && (malicious || independent)

@@ -150,6 +150,8 @@ final class LauncherModel {
 
     func togglePin(_ app: LauncherApp) { var l = layout; l.toggle(app.path); setLayout(l) }
     func move(_ path: String, before target: String?, inFavorites: Bool) {
+        // o8: drops can carry any string from any app; only paths of listed apps can be pinned or moved.
+        guard apps.contains(where: { $0.path == path }) else { return }
         var l = layout
         l.move(path, before: target, inFavorites: inFavorites, allPaths: arranged.others.map(\.path))
         setLayout(l)
@@ -157,7 +159,7 @@ final class LauncherModel {
 
     /// User click only. Never called by previews or tests.
     func launch(_ app: LauncherApp) {
-        guard !Headless.active else { return }
+        guard !Headless.active, LauncherCatalog.stillSame(app) else { refreshIfStale(); return }
         NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: app.path), configuration: NSWorkspace.OpenConfiguration()) { _, _ in }
     }
     func reveal(_ app: LauncherApp) {

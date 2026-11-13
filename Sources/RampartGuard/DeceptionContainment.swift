@@ -46,6 +46,13 @@ public enum LureContainment {
     ]
 
     /// Layer 2. Deny by default; inbound on the one port only. Paths are validated (no quotes / parens injection).
+    /// Verified by running the helper under this exact profile (WMS-o9): it serves and logs, and a probe in its
+    /// place could not read, write, stat home files, fork, exec, connect out, open kernel-control / routing sockets,
+    /// list processes or read the host name.
+    /// - logging: os_log needs `com.apple.logd`; without it every attempt line was silently lost (layer 10 broken).
+    /// - metadata: only the paths the helper loads from (an unrestricted `file-read-metadata` let it stat any file).
+    /// - no `system-socket`: it allowed AF_SYSTEM (kernel control, ntstat) and AF_ROUTE sockets the lure never needs.
+    /// - sysctl: process table, host name and network sysctls are denied (information leaks after a compromise).
     public static func sandboxProfile(port: UInt16, workDir: String, helperPath: String) -> String {
         precondition(safePath(workDir) && safePath(helperPath))
         return """
@@ -60,18 +67,22 @@ public enum LureContainment {
                           (subpath "/System/Cryptexes") (literal "/") (literal "/dev/urandom") (literal "/dev/null") (literal "/private/var/db/timezone/localtime")
                           (subpath "/System/Volumes/Preboot/Cryptexes") (subpath "/private/var/db/dyld") (subpath "/System/Library/dyld")
                           (literal "\(helperPath)") (subpath "\(workDir)"))
-        (allow file-read-metadata)
+        (allow file-read-metadata (literal "/") (literal "/private") (literal "/private/var") (literal "/private/var/db")
+                          (subpath "/usr/lib") (subpath "/System") (subpath "/private/var/db/dyld") (subpath "/private/var/db/timezone")
+                          (literal "/dev/urandom") (literal "/dev/null") (literal "\(helperPath)") (subpath "\(workDir)"))
         (allow sysctl-read)
-        (allow mach-lookup (global-name "com.apple.system.logger"))
+        (deny sysctl-read (sysctl-name-prefix "kern.proc") (sysctl-name "kern.hostname") (sysctl-name-prefix "net."))
+        (allow mach-lookup (global-name "com.apple.logd") (global-name "com.apple.system.logger"))
         (allow network-bind (local tcp "*:\(port)"))
         (allow network-inbound (local tcp "*:\(port)"))
-        (allow system-socket)
         """
     }
 
     /// Layer 7. Only the lure port in; nothing out from the helper's account. Layer 8 mirrored at packet level.
     public static func pfAnchor(port: UInt16, scope: LureScope, localSubnets: [String]) -> String {
-        let subnets = localSubnets.filter { LureAccessFilter.ipv4(String($0.split(separator: "/").first ?? "")) != nil }
+        // Only canonical a.b.c.d/nn survives: the old filter checked just the part before "/", so a subnet string
+        // like "192.168.1.0/24 }\npass in all" reached the root-loaded anchor (pf rule injection).
+        let subnets = localSubnets.compactMap(LureAccessFilter.canonicalCIDR)
         var r = ["# RamPart lure anchor (generated). Load: pfctl -a \(anchor) -f <file>"]
         r.append("block out quick user \(helperUser)")
         switch scope {
@@ -161,7 +172,7 @@ public struct LureHelperArgs: Equatable, Sendable {
 
     public var arguments: [String] {
         var a = ["--lure", "--port", String(port), "--scope", scope.rawValue]
-        for s in localSubnets where LureAccessFilter.ipv4(String(s.split(separator: "/").first ?? "")) != nil { a += ["--subnet", s] }
+        for s in localSubnets.compactMap(LureAccessFilter.canonicalCIDR) { a += ["--subnet", s] }
         if confirmedAnywhere && scope == .anywhere { a.append("--confirmed-anywhere") }
         return a
     }
@@ -190,9 +201,8 @@ public struct LureHelperArgs: Equatable, Sendable {
                 let v = try value(); guard let s = LureScope(rawValue: v) else { throw ParseError.bad("unknown scope \(v)") }; scope = s
             case "--subnet":
                 let v = try value()
-                let parts = v.split(separator: "/")
-                guard parts.count == 2, LureAccessFilter.ipv4(String(parts[0])) != nil, let b = Int(parts[1]), (8...32).contains(b) else { throw ParseError.bad("bad subnet \(v)") }
-                subnets.append(v)
+                guard let c = LureAccessFilter.canonicalCIDR(v) else { throw ParseError.bad("bad subnet \(SafeText.line(v, max: 40))") }
+                subnets.append(c)
             case "--confirmed-anywhere": anywhere = true
             default: throw ParseError.bad("unknown argument \(argv[i])")
             }

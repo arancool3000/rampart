@@ -1,4 +1,5 @@
 import Foundation
+import RampartShared
 
 /// Behaviour categories the local paste classifier scores.
 public enum PasteCategory: String, Codable, Sendable, CaseIterable {
@@ -71,7 +72,12 @@ public struct PasteClassifier: PasteLocalClassifier {
         let firstWord = (first.hasPrefix("/") ? (first as NSString).lastPathComponent : first).lowercased()
         if commandWords.contains(firstWord) { return true }
         if first.hasPrefix("./") || first.hasPrefix("~/") { return true }
-        return runPatterns.contains { RegexCache.shared.matches($0, t) }
+        if runPatterns.contains(where: { RegexCache.shared.matches($0, t) }) { return true }
+        // wms-o5: a zero-width character, look-alike letter or fullwidth form must not hide that it's a command.
+        let f = TextFold.forMatching(t)
+        guard f != t.lowercased() else { return false }
+        let ff = f.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).first.map(String.init) ?? ""
+        return commandWords.contains((ff as NSString).lastPathComponent) || runPatterns.contains { RegexCache.shared.matches($0, f) }
     }
 
     // MARK: de-obfuscation
@@ -159,6 +165,12 @@ public struct PasteClassifier: PasteLocalClassifier {
     /// Signature patterns per category, aligned with the behaviour rule file (R06, R07–R18, R27, R30, R34–R36, R53, R55, L01–L06).
     static let signatures: [(PasteCategory, Int, String, String)] = [
         (.downloadExecute, 70, #"\b(curl|wget)\b[^|;]*\|\s*(sudo\s+)?(/\S*/)?((ba|z|da|k)?sh|python[0-9.]*|perl|ruby|osascript|node)\b"#, "downloads code and pipes it straight into an interpreter"),
+        // wms-o5: the same through extra pipe stages (`| tee x | sh`, `| base64 -D | sh`), env/exec/xargs wrappers.
+        (.downloadExecute, 70, #"\b(curl|wget)\b[^;&\n]*\|\s*(sudo\s+(-\S+\s+)*)?(env\s+|exec\s+|command\s+|xargs\s+(-\S+\s+)*)?(/\S*/)?((ba|z|da|k|fi)?sh|python[0-9.]*|perl|ruby|osascript|node|php)\b"#, "downloads code and pipes it straight into an interpreter"),
+        (.downloadExecute, 70, #"(ba|z|da|k)?sh\s*<<<\s*["']?\$\(\s*(curl|wget)|(eval|source|(ba|z)?sh\s+-c)\s+["']?`\s*(curl|wget)"#, "runs the output of a download"),
+        (.downloadExecute, 60, #"\b(curl|wget)\b.*(-o|-O|--output|>)\s*\S+.*(&&|;|\n)\s*(sudo\s+)?(chmod|open|\./|/tmp/|(ba|z|da|k)?sh|python[0-9.]*|perl|ruby|osascript|node)\b"#, "downloads a file and then runs it"),
+        (.downloadExecute, 60, #"base64\s+(-d|--decode|-D)[^;&\n]*\|\s*(sudo\s+)?(/\S*/)?((ba|z|da|k)?sh|python[0-9.]*|perl|ruby|osascript|node)\b"#, "decodes hidden text and runs it"),
+        (.downloadExecute, 65, #"(?s)(osascript\b.*do\s+shell\s+script|doShellScript).*\b(curl|wget|base64|python[0-9.]*|nc|bash|zsh|sh)\b"#, "runs shell commands through AppleScript"),
         (.downloadExecute, 70, #"(eval|source|\.)\s+["']?\$\(\s*(curl|wget)|(ba|z)?sh\s+-c\s+["']?\$\(\s*(curl|wget)|<\(\s*(curl|wget)"#, "runs the output of a download"),
         (.downloadExecute, 60, #"\b(curl|wget)\b.*(-o|-O|>)\s*\S+.*(&&|;)\s*(chmod|open|\./|/tmp/|bash|sh)\b"#, "downloads a file and then runs it"),
         (.quarantineStrip, 45, #"xattr\s+(-[a-z]*d[a-z]*\s+com\.apple\.quarantine|-[a-z]*c)"#, "removes the download quarantine flag (skips Gatekeeper)"),
@@ -175,7 +187,9 @@ public struct PasteClassifier: PasteLocalClassifier {
     public func classify(_ text: String) -> PasteLocalResult {
         guard Self.isRunIntended(text) else { return PasteLocalResult(runIntended: false, score: 0) }
         let layers = Self.decodeLayers(text)
-        let all = [text] + layers
+        // wms-o5: also match a folded copy (zero-width splits, look-alike letters, fullwidth forms), never shown.
+        let folded = TextFold.forMatching(text)
+        let all = [text] + layers + (folded != text.lowercased() ? [folded] + Self.decodeLayers(folded) : [])
         var cats: [PasteCategory: Int] = [:]
         var reasons: [String] = []
         for (c, w, p, why) in Self.signatures where cats[c] == nil {
@@ -186,6 +200,12 @@ public struct PasteClassifier: PasteLocalClassifier {
             let w = min(45, 20 + 10 * encodedLayers)
             cats[.obfuscation] = w
             reasons.append("hides its real content (\(encodedLayers) encoded layer\(encodedLayers == 1 ? "" : "s"))")
+        }
+        // wms-o5: invisible or direction-changing characters, or a word mixing Latin and look-alike letters, have no
+        // business in a Terminal command; they exist to fool the reader (or a scanner).
+        if TextFold.hasHiddenOrBidi(text) || TextFold.hasMixedScriptWord(text) {
+            cats[.obfuscation] = max(cats[.obfuscation] ?? 0, 40)
+            reasons.append("contains hidden, reordered or look-alike characters")
         }
         // Pinned installer: only when the sole risky behaviour is download-and-run and every URL is pinned.
         let urls = all.flatMap { Self.urls(in: $0) }

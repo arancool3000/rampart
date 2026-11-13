@@ -97,6 +97,22 @@ public enum PathClass: String, Codable, Sendable, CaseIterable {
 
     /// Classes that count as "temp or hidden" for the ×1.3 multiplier and R29.
     public var isSuspiciousLocation: Bool { self == .temp || self == .hidden || self == .usersShared }
+
+    /// wms-o6: where a stand-alone Apple tool (not inside an .app bundle) has no business being: temp, hidden,
+    /// shared, Downloads, the home folder or a Library folder. Developer toolchains, simulator runtimes and Python
+    /// virtual environments (which copy the interpreter) are excluded.
+    public static func isRelocatedAppleToolPath(_ p: String) -> Bool {
+        guard p.hasPrefix("/"), !p.contains(".app/Contents/"), !p.contains(".framework/"), !p.contains("/Library/Developer/"),
+              !p.contains("/Library/Apple/"), !p.contains("/Application Support/Apple/") else { return false }
+        switch classify(p) {
+        case .temp, .hidden, .usersShared, .downloads, .home, .library: break
+        default: return false
+        }
+        if RegexCache.shared.matches("/(\\.?venv[^/]*|env|virtualenvs?/[^/]+|envs/[^/]+)/bin/[^/]+$", p) { return false }
+        let envRoot = ((p as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+        if FileManager.default.fileExists(atPath: envRoot + "/pyvenv.cfg") { return false }
+        return true
+    }
 }
 
 /// Privacy-preserving clipboard fingerprint shared by the session agent (producer) and the engine (consumer).

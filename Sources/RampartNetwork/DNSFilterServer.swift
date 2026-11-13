@@ -22,6 +22,12 @@ public struct DNSFilterConfig: Sendable {
     public var inspectCNAMEs: Bool
     /// Where learned DoH key pins persist (root-owned dir in the daemon). nil = in-memory for this run.
     public var pinStateURL: URL? = nil
+    /// o4: when listening on 127.0.0.1, also claim [::1] on the same port. DNSSwitcher points the system at both
+    /// 127.0.0.1 and ::1; macOS lets any user bind ports below 1024, so an unclaimed ::1:53 could be taken by local
+    /// malware and answer the Mac's lookups past the filter.
+    public var alsoListenIPv6Loopback: Bool = true
+    /// o4: strip private/loopback/link-local answers for public names (DNS rebinding).
+    public var blockRebinding: Bool = true
 
     /// Default: 127.0.0.1:53 as root, 127.0.0.1:5353 for development (non-root).
     public init(listenAddress: String = "127.0.0.1",
@@ -104,16 +110,27 @@ public final class DNSFilterServer: @unchecked Sendable {
     private let work = DispatchQueue(label: "app.rampart.dns.work", attributes: .concurrent)
     private let stateLock = NSLock()
     private var running = false
-    private var udpFD: Int32 = -1
-    private var tcpFD: Int32 = -1
+    private var udpFDs: [Int32] = []
+    private var tcpFDs: [Int32] = []
+    /// o4: true when the [::1] listener is up as well.
+    public private(set) var ipv6LoopbackBound = false
     private var threads: [Thread] = []
     public private(set) var boundPort: UInt16 = 0
     private var statsStore: [DNSQueryLogEntry.Verdict: Int] = [:]
 
     // Resource limits (hx4): a local flood can't exhaust threads, sockets or DoH connections.
+    /// Concurrent DoH lookups. o4: only upstream work is limited by this; blocked, canary and cached answers are
+    /// served without an upstream slot, so a random-name flood cannot starve cached names (or the watchdog probe).
     public static let maxInFlight = 256
+    /// o4: UDP datagrams queued for processing (bounds memory/threads under a flood; over the limit = drop).
+    public static let maxQueued = 2048
     public static let maxTCPConnections = 32
+    /// o4: TCP idle time between queries, and the deadline for a whole message once its length arrived.
+    public static let tcpIdleSeconds: Double = 10
+    public static let tcpMessageSeconds: Double = 5
     private var inFlight = 0
+    private var queued = 0
+    public private(set) var droppedOverload = 0
     private var tcpConnections = 0
     /// Upstream health for the DNS-restore watchdog (see `upstreamHealthy`).
     private var consecutiveUpstreamFailures = 0
@@ -127,12 +144,14 @@ public final class DNSFilterServer: @unchecked Sendable {
         set { blocklistLock.lock(); _policy = newValue; blocklistLock.unlock(); cache.clear() }
     }
 
-    public init(config: DNSFilterConfig = DNSFilterConfig(), blocklist: DomainBlocklist = DomainBlocklist()) {
+    /// `doh` injects a client (tests use a mock URLProtocol); production passes nil.
+    public init(config: DNSFilterConfig = DNSFilterConfig(), blocklist: DomainBlocklist = DomainBlocklist(),
+                doh: DoHClient? = nil) {
         self.config = config
         self._blocklist = blocklist
         self.cache = DNSResponseCache(capacity: config.cacheCapacity)
-        self.doh = DoHClient(upstreams: config.upstreams, timeout: config.upstreamTimeout,
-                             pins: DoHPinStore(stateURL: config.pinStateURL))
+        self.doh = doh ?? DoHClient(upstreams: config.upstreams, timeout: config.upstreamTimeout,
+                                    pins: DoHPinStore(stateURL: config.pinStateURL))
     }
 
     deinit { stop() }
@@ -172,10 +191,16 @@ public final class DNSFilterServer: @unchecked Sendable {
 
     private func acquireSlot() -> Bool {
         stateLock.lock(); defer { stateLock.unlock() }
-        guard inFlight < Self.maxInFlight else { return false }
+        guard inFlight < Self.maxInFlight else { droppedOverload += 1; return false }
         inFlight += 1; return true
     }
     private func releaseSlot() { stateLock.lock(); inFlight = max(0, inFlight - 1); stateLock.unlock() }
+    private func acquireQueue() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        guard queued < Self.maxQueued else { droppedOverload += 1; return false }
+        queued += 1; return true
+    }
+    private func releaseQueue() { stateLock.lock(); queued = max(0, queued - 1); stateLock.unlock() }
     private func noteUpstream(ok: Bool) {
         stateLock.lock()
         if ok { consecutiveUpstreamFailures = 0; lastUpstreamSuccess = Date() } else { consecutiveUpstreamFailures += 1 }
@@ -198,39 +223,46 @@ public final class DNSFilterServer: @unchecked Sendable {
         guard Self.isLoopbackAddress(config.listenAddress) else { throw DNSFilterServerError.notLoopback(config.listenAddress) }
         let (addr, len, family) = try Self.makeSockaddr(config.listenAddress, port: config.port)
         let u = try Self.openSocket(family: family, type: SOCK_DGRAM, addr: addr, len: len)
-        var port = Self.localPort(u)
+        let port = Self.localPort(u)
+        var tcp: [Int32] = [], udp: [Int32] = [u]
         if config.enableTCP {
-            let (addr2, len2, _) = try Self.makeSockaddr(config.listenAddress, port: port)
-            do {
-                let t = try Self.openSocket(family: family, type: SOCK_STREAM, addr: addr2, len: len2)
-                guard listen(t, 64) == 0 else { let e = errno; close(t); throw DNSFilterServerError.socket("listen", e) }
-                tcpFD = t
-            } catch { close(u); throw error }
+            do { tcp.append(try Self.openListener(config.listenAddress, port: port)) } catch { close(u); throw error }
         }
-        udpFD = u; port = Self.localPort(u); boundPort = port
+        // o4: claim [::1] on the same port too (best effort: a Mac with IPv6 off on lo0 just skips it).
+        ipv6LoopbackBound = false
+        if config.alsoListenIPv6Loopback, family == AF_INET, port != 0 {
+            do {
+                let (a6, l6, _) = try Self.makeSockaddr("::1", port: port)
+                let u6 = try Self.openSocket(family: AF_INET6, type: SOCK_DGRAM, addr: a6, len: l6)
+                udp.append(u6)
+                if config.enableTCP, let t6 = try? Self.openListener("::1", port: port) { tcp.append(t6) }
+                ipv6LoopbackBound = true
+            } catch {
+                log.error("DNS filter: could not also listen on [::1]:\(port): \(String(describing: error), privacy: .public)")
+            }
+        }
+        udpFDs = udp; tcpFDs = tcp; boundPort = port
         running = true
-        let ut = Thread { [weak self] in self?.udpLoop(fd: u) }
-        ut.name = "rampart-dns-udp"; ut.start(); threads.append(ut)
-        if tcpFD >= 0 {
-            let fd = tcpFD
+        for fd in udp {
+            let ut = Thread { [weak self] in self?.udpLoop(fd: fd) }
+            ut.name = "rampart-dns-udp"; ut.start(); threads.append(ut)
+        }
+        for fd in tcp {
             let tt = Thread { [weak self] in self?.tcpAcceptLoop(fd: fd) }
             tt.name = "rampart-dns-tcp"; tt.start(); threads.append(tt)
         }
-        log.info("DNS filter listening on \(self.config.listenAddress, privacy: .public):\(port) (tcp: \(self.tcpFD >= 0))")
+        log.info("DNS filter listening on \(self.config.listenAddress, privacy: .public):\(port) (tcp: \(!tcp.isEmpty), ::1: \(self.ipv6LoopbackBound))")
     }
 
     public func stop() {
         stateLock.lock()
         guard running else { stateLock.unlock(); return }
         running = false
-        let u = udpFD, t = tcpFD
-        udpFD = -1; tcpFD = -1; threads = []
+        let fds = udpFDs + tcpFDs
+        udpFDs = []; tcpFDs = []; threads = []; ipv6LoopbackBound = false
         stateLock.unlock()
         // Loops poll with a short timeout and exit when `running` is false; close after they notice.
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.6) {
-            if u >= 0 { close(u) }
-            if t >= 0 { close(t) }
-        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.6) { for fd in fds { close(fd) } }
     }
 
     // MARK: Socket helpers
@@ -261,6 +293,13 @@ public final class DNSFilterServer: @unchecked Sendable {
             return (ss, socklen_t(MemoryLayout<sockaddr_in6>.size), AF_INET6)
         }
         throw DNSFilterServerError.badAddress(address)
+    }
+
+    static func openListener(_ address: String, port: UInt16) throws -> Int32 {
+        let (a, l, f) = try makeSockaddr(address, port: port)
+        let t = try openSocket(family: f, type: SOCK_STREAM, addr: a, len: l)
+        guard listen(t, 64) == 0 else { let e = errno; close(t); throw DNSFilterServerError.socket("listen", e) }
+        return t
     }
 
     static func openSocket(family: Int32, type: Int32, addr: sockaddr_storage, len: socklen_t) throws -> Int32 {
@@ -319,7 +358,7 @@ public final class DNSFilterServer: @unchecked Sendable {
             guard Self.isLoopbackPeer(from) else { noteDroppedNonLocal(); continue }
             let packet = Data(buf[0..<n])
             let client = from, clientLen = fromLen
-            guard acquireSlot() else { continue }   // overloaded: drop (client retries)
+            guard acquireQueue() else { continue }   // overloaded: drop (client retries)
             work.async { [weak self] in
                 guard let self else { return }
                 self.handle(packet, client: Self.describe(client), transport: "udp") { reply, limit in
@@ -330,8 +369,8 @@ public final class DNSFilterServer: @unchecked Sendable {
                             cp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(fd, raw.baseAddress, out.count, 0, $0, clientLen) }
                         }
                     }
-                    self.releaseSlot()
-                } dropped: { self.releaseSlot() }
+                    self.releaseQueue()
+                } dropped: { self.releaseQueue() }
             }
         }
     }
@@ -366,9 +405,17 @@ public final class DNSFilterServer: @unchecked Sendable {
         }
     }
 
-    private func readExactly(_ fd: Int32, _ n: Int) -> Data? {
+    /// o4: reads exactly `n` bytes before an absolute deadline. SO_RCVTIMEO alone restarts on every byte, so a
+    /// slow-loris client trickling one byte every few seconds could hold all 32 TCP slots forever.
+    static func readExactly(_ fd: Int32, _ n: Int, deadline: Date) -> Data? {
         var buf = [UInt8](repeating: 0, count: n); var got = 0
         while got < n {
+            let ms = Int32(max(0, min(60_000, deadline.timeIntervalSinceNow * 1000)))
+            guard ms > 0 else { return nil }
+            var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let pr = poll(&p, 1, ms)
+            if pr < 0 && errno == EINTR { continue }
+            guard pr > 0 else { return nil }
             let r = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress! + got, n - got) }
             if r <= 0 { return nil }
             got += r
@@ -376,10 +423,13 @@ public final class DNSFilterServer: @unchecked Sendable {
         return Data(buf)
     }
 
+    /// Test hook for the slow-loris deadline (selftest has no @testable import).
+    public static func readExactlyForTest(_ fd: Int32, _ n: Int, deadline: Date) -> Data? { readExactly(fd, n, deadline: deadline) }
+
     private func tcpConnection(_ fd: Int32, client: String) {
-        while isRunning, let head = readExactly(fd, 2) {
+        while isRunning, let head = Self.readExactly(fd, 2, deadline: Date().addingTimeInterval(Self.tcpIdleSeconds)) {
             let len = Int(head[0]) << 8 | Int(head[1])
-            guard len >= 12, let msg = readExactly(fd, len) else { return }
+            guard len >= 12, let msg = Self.readExactly(fd, len, deadline: Date().addingTimeInterval(Self.tcpMessageSeconds)) else { return }
             let sem = DispatchSemaphore(value: 0)
             let box = ReplyBox()
             handle(msg, client: client, transport: "tcp", respond: { reply, _ in box.data = reply.data; sem.signal() },
@@ -428,7 +478,7 @@ public final class DNSFilterServer: @unchecked Sendable {
             return
         }
         let udpLimit: Int? = transport == "udp" ? (query.ednsPayloadSize ?? 512) : nil
-        guard let q = query.questions.first, query.questions.count == 1, query.opcode == 0 else {
+        guard let q = query.questions.first, query.questions.count == 1, query.opcode == 0, query.isWellFormedQuery else {
             let rc = query.opcode != 0 ? DNSRCode.notImp : DNSRCode.formErr
             respond(Reply(data: DNSWire.buildError(for: query, rcode: rc), query: query), udpLimit)
             return
@@ -491,12 +541,27 @@ public final class DNSFilterServer: @unchecked Sendable {
             finish(hit, allowRule == nil ? .cached : .allowlisted, rule: allowRule, list: allowRule == nil ? nil : "allowlist")
             return
         }
-        // 4. DoH upstream.
-        doh.resolve(packet) { [weak self] result in
+        // 4. DoH upstream (o4: needs an upstream slot; the query sent is rebuilt from the question, see
+        //    `DNSWire.upstreamQuery`, so client EDNS options, CD and stray records never reach the upstream).
+        guard acquireSlot() else {
+            if transport == "udp" { dropped() }   // the stub retries
+            else { finish(DNSWire.buildError(for: query, rcode: DNSRCode.servFail), .servfail, error: "overloaded") }
+            return
+        }
+        doh.resolve(DNSWire.upstreamQuery(for: query)) { [weak self] result in
             guard let self else { return }
+            self.releaseSlot()
             switch result {
-            case .success(let (data, url)):
+            case .success(let (rawData, url)):
                 self.noteUpstream(ok: true)
+                let data = rawData
+                // o4: DNS rebinding. A public name answered with a private/loopback address is stripped.
+                if allowRule == nil, self.config.blockRebinding, let (clean, gone) = DNSRebindGuard.strip(rawData, question: q) {
+                    self.log.error("DNS rebinding blocked for \(q.name, privacy: .public): \(gone.joined(separator: ","), privacy: .public)")
+                    self.cache.store(clean, for: q)
+                    finish(clean, .blocked, rule: "rebind:" + (gone.first ?? "private"), list: "rebind-guard")
+                    return
+                }
                 if allowRule == nil, self.config.inspectCNAMEs, let m = try? DNSMessage.parse(data) {
                     for rr in m.answers where rr.type == DNSType.cname {
                         if let target = rr.value, case .blocked(let rule, let src) = self.blocklist.verdict(for: target) {
@@ -529,8 +594,12 @@ public final class DNSFilterServer: @unchecked Sendable {
         r.answers.append(DNSResourceRecord(name: q.name, type: DNSType.cname, ttl: 300,
                                            rdata: Data(DNSWire.encodeName(target)), value: target))
         let base = r
+        guard acquireSlot() else {
+            finish(DNSWire.buildError(for: query, rcode: DNSRCode.servFail), .servfail, rule, "safesearch", nil, "overloaded"); return
+        }
         doh.resolve(DNSWire.buildQuery(name: target, type: q.type)) { [weak self] result in
             guard let self else { return }
+            self.releaseSlot()
             switch result {
             case .success(let (data, url)):
                 self.noteUpstream(ok: true)

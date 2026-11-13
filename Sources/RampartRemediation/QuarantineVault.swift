@@ -46,6 +46,14 @@ public final class QuarantineVault: @unchecked Sendable {
     public var allowlistHandler: ((String, String) -> Void)?
     /// Refuse items on SIP/system paths. Tests can turn it off only for paths they create.
     public var enforceProtectedPaths: Bool = true
+    /// wms-o2 vault exhaustion limits. One item is held in memory several times (plain, compressed, sealed, verify),
+    /// so a single huge file could exhaust the root daemon's memory; many items could fill the startup disk.
+    public var maxItemBytes: UInt64 = 1 << 30            // 1 GiB per file or folder
+    public var maxVaultBytes: UInt64 = 20 << 30          // 20 GiB of encrypted items in total
+    public var maxItemCount: Int = 20_000
+    public var minFreeBytes: UInt64 = 2 << 30            // never leave less than 2 GiB free on the vault's volume
+    /// Cap on the extended attributes kept with one item (they live in the signed sidecar).
+    static let maxXattrBytes = 4 << 20, maxXattrCount = 256
     private let log = RLog.logger("quarantine")
 
     /// Default production location: `Paths.effectiveRoot/Quarantine`.
@@ -104,9 +112,13 @@ public final class QuarantineVault: @unchecked Sendable {
     /// (no symlink in any component), the file is opened with O_NOFOLLOW and must be the inode that was checked,
     /// chmod/chflags go through that descriptor, and foreign hard links (a link to a file owned by someone else,
     /// e.g. a root-only file) are refused so root never reads, chmods or archives another user's data.
+    /// wms-o2: when `expectedSHA256` is given (the hash the scanner saw), a regular file is only taken if its
+    /// contents still hash to it. A rename-swap between scan and quarantine therefore can't make RamPart lock up a
+    /// different (e.g. the victim's own) file and report the threat as handled while the real one sits elsewhere.
     @discardableResult
-    public func quarantine(path: String, detectionName: String) throws -> QuarantineRecord {
+    public func quarantine(path: String, detectionName: String, expectedSHA256: String? = nil) throws -> QuarantineRecord {
         lock.lock(); defer { lock.unlock() }
+        try checkCapacity(adding: 0)
         let p = normalizePath(path)
         if enforceProtectedPaths && ProtectedPaths.isProtected(p) { throw RemediationError.protectedPath(p) }
         if p.hasPrefix(root.path + "/") { throw RemediationError.protectedPath(p) }
@@ -134,7 +146,10 @@ public final class QuarantineVault: @unchecked Sendable {
         if isDir {
             let s = try stageDirectory(dir: dir, name: name, expected: st, id: id)
             staged = s
-            do { plain = try archiveDirectory(s.path, id: id) }
+            do {
+                try checkTreeSize(s.dir, name: name)
+                plain = try archiveDirectory(s.path, id: id)
+            }
             catch { unstage(s.dir, name: name, back: dir); throw error }
             xattrs = [:]
         } else {
@@ -148,14 +163,22 @@ public final class QuarantineVault: @unchecked Sendable {
             guard fstat(fd, &fst) == 0, fst.st_dev == st.st_dev, fst.st_ino == st.st_ino, fst.st_mode & S_IFMT == S_IFREG else {
                 throw RemediationError.integrityFailure("\(p) changed while it was being quarantined")
             }
+            if UInt64(max(0, fst.st_size)) > maxItemBytes {
+                throw RemediationError.unsupported("\(p) is larger than \(maxItemBytes >> 20) MB; too big for the quarantine vault")
+            }
+            try checkCapacity(adding: UInt64(max(0, fst.st_size)))
             // Clear immutable flags where permitted, then strip exec/setuid bits so nothing can run it mid-move.
             if fst.st_flags & UInt32(UF_IMMUTABLE | UF_APPEND) != 0 { fchflags(fd, fst.st_flags & ~UInt32(UF_IMMUTABLE | UF_APPEND)) }
             fchmod(fd, (fst.st_mode & 0o666 & ~0o022) | 0o400)
             xattrs = Xattr.all(fd: fd)
-            guard let d = Self.readAll(fd: fd, max: 4 << 30) else { throw RemediationError.ioError("cannot read \(p)") }
+            guard let d = Self.readAll(fd: fd, max: Int(maxItemBytes)) else { throw RemediationError.ioError("cannot read \(p)") }
             plain = d
         }
         let sha = SHA256.hash(data: plain).hex
+        if !isDir, let want = expectedSHA256?.lowercased(), !want.isEmpty, want != sha {
+            throw RemediationError.integrityFailure("\(p) changed since it was scanned; scan it again")
+        }
+        if isDir { try checkCapacity(adding: UInt64(plain.count)) }
         let compressedData = (try? (plain as NSData).compressed(using: .lzfse) as Data)
         let useCompressed = compressedData != nil && compressedData!.count < plain.count
         let payload = useCompressed ? compressedData! : plain
@@ -285,9 +308,11 @@ public final class QuarantineVault: @unchecked Sendable {
         guard SHA256.hash(data: plain).hex == meta.record.sha256 else { throw RemediationError.integrityFailure("sha256 mismatch") }
 
         let parent = (dest as NSString).deletingLastPathComponent
-        if !FileManager.default.fileExists(atPath: parent) {
-            try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-        }
+        let owner: (uid_t, gid_t) = (options.ownerUID ?? meta.record.ownerUID, options.ownerGID ?? meta.groupID)
+        // wms-o2: missing folders are created one at a time relative to a pinned, link-free ancestor (FileManager
+        // follows links, so as root it could create folders inside e.g. /Library/LaunchDaemons via a swapped link),
+        // owned by the item's owner, never on a protected path.
+        try SafeFS.makeParents(parent, owner: owner, isProtected: { [enforceProtectedPaths] in enforceProtectedPaths && ProtectedPaths.isProtected($0) })
         // Pin the destination folder (red-team fix): open it once, refuse if it resolves anywhere other than the
         // path that was checked (a symlink swapped in after the caller's checks, e.g. to /Library/LaunchDaemons),
         // and do the final create/rename relative to that descriptor so later swaps cannot redirect the write.
@@ -303,10 +328,15 @@ public final class QuarantineVault: @unchecked Sendable {
             guard let pst = pinned.stat(), pst.st_uid == want else {
                 throw RemediationError.ioError("you don't own the folder \(realParent)")
             }
+        } else if getuid() == 0, options.alternatePath == nil {
+            // wms-o2: back to the original place as root: only into a folder owned by the item's owner or by root, never
+            // into a folder someone else now owns (that would plant a file in their space under the original name).
+            guard let pst = pinned.stat(), pst.st_uid == meta.record.ownerUID || pst.st_uid == 0 else {
+                throw RemediationError.ioError("the folder \(realParent) now belongs to someone else; restore it somewhere else")
+            }
         }
         // hx3: anywhere other than the original place, or for a different owner, setuid/setgid bits are dropped.
         let keepSpecial = options.alternatePath == nil && options.ownerUID == nil
-        let owner: (uid_t, gid_t) = (options.ownerUID ?? meta.record.ownerUID, options.ownerGID ?? meta.groupID)
         let tmpName = ".rampart-restore-\(id.uuidString)"
         if meta.isDirectory {
             // Root-only private folder inside the destination: the user can't enter it while ditto writes.
@@ -482,6 +512,50 @@ public final class QuarantineVault: @unchecked Sendable {
         return d
     }
 
+    /// Bytes and count of the encrypted items currently in the vault (blobs only; sidecars are small).
+    public func usage() -> (bytes: UInt64, items: Int) {
+        let d = opendir(itemsDir.path)
+        guard let d else { return (0, 0) }
+        defer { closedir(d) }
+        var bytes: UInt64 = 0, items = 0
+        let dfd = dirfd(d)
+        while let e = readdir(d) {
+            let n = withUnsafePointer(to: e.pointee.d_name) { $0.withMemoryRebound(to: CChar.self, capacity: 1024) { String(cString: $0) } }
+            guard n.hasSuffix(".rqf") else { continue }
+            var st = stat()
+            if fstatat(dfd, n, &st, AT_SYMLINK_NOFOLLOW) == 0 { bytes += UInt64(max(0, st.st_blocks)) * 512; items += 1 }
+        }
+        return (bytes, items)
+    }
+
+    /// Refuses when adding `bytes` would break a vault limit or leave too little free space.
+    func checkCapacity(adding bytes: UInt64) throws {
+        let u = usage()
+        if u.items >= maxItemCount { throw RemediationError.unsupported("the quarantine vault is full (\(u.items) items); delete old items first") }
+        if u.bytes + bytes > maxVaultBytes {
+            throw RemediationError.unsupported("the quarantine vault would exceed \(maxVaultBytes >> 30) GB; delete old items first")
+        }
+        var fs = statfs()
+        if statfs(itemsDir.path, &fs) == 0 {
+            let free = UInt64(fs.f_bavail) * UInt64(fs.f_bsize)
+            if free < bytes + minFreeBytes { throw RemediationError.unsupported("not enough free disk space to quarantine safely") }
+        }
+    }
+
+    /// Total size of a staged folder (never following links); refuses beyond `maxItemBytes`.
+    private func checkTreeSize(_ dir: SafeFS.PinnedDir, name: String) throws {
+        let top = openat(dir.fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard top >= 0 else { throw RemediationError.ioError("open staged folder") }
+        defer { close(top) }
+        var total: UInt64 = 0
+        let limit = maxItemBytes
+        try SafeFS.walkTree(dirfd: top) { _, _, st in
+            total += UInt64(max(0, st.st_size))
+            if total > limit { throw RemediationError.unsupported("folder is larger than \(limit >> 20) MB; too big for the quarantine vault") }
+        }
+        try checkCapacity(adding: total)
+    }
+
     private func writeAtomically(_ data: Data, to url: URL, mode: mode_t) throws {
         let tmp = url.path + ".tmp-\(UUID().uuidString)"
         let fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode)
@@ -501,11 +575,14 @@ enum Xattr {
         var buf = [CChar](repeating: 0, count: size)
         guard flistxattr(fd, &buf, size, 0) == size else { return [:] }
         var out: [String: Data] = [:]
+        var total = 0
         for n in buf.split(separator: 0).map({ String(cString: Array($0) + [0]) }) {
+            // wms-o2: bounded so a file with thousands of large xattrs can't bloat the sidecar every listing reads.
+            guard out.count < QuarantineVault.maxXattrCount else { break }
             let len = fgetxattr(fd, n, nil, 0, 0, 0)
-            guard len >= 0, len <= 1 << 20 else { continue }
+            guard len >= 0, len <= 1 << 20, total + len <= QuarantineVault.maxXattrBytes else { continue }
             var v = [UInt8](repeating: 0, count: len)
-            if len == 0 || fgetxattr(fd, n, &v, len, 0, 0) == len { out[n] = Data(v) }
+            if len == 0 || fgetxattr(fd, n, &v, len, 0, 0) == len { out[n] = Data(v); total += len }
         }
         return out
     }

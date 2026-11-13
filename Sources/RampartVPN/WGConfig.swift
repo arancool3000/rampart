@@ -84,15 +84,20 @@ public struct WGQuickConfig: Equatable {
 
         var c = WGQuickConfig(privateKey: pk, peerPublicKey: pub, endpointHost: ep.host, endpointPort: ep.port)
         c.warnings = warnings
+        // Every value that reaches ifconfig / route / scutil / pf must be a plain literal: `IPPrefix.parseAddress`
+        // alone accepted "1.2.3.4%anything here" (zone suffix) and kept the raw text, which then went into the
+        // kill-switch pf rule and the scutil script (WMS-o9). Counts are capped (each route is a process spawn).
+        guard (iface["address"] ?? []).count <= Self.maxAddresses, (iface["dns"] ?? []).count <= Self.maxDNS,
+              (peer["allowedips"] ?? []).count <= Self.maxAllowedIPs else { throw ParseError.invalid("size") }
         for a in iface["address"] ?? [] {
-            guard IPPrefix.hostAddress(a) != nil else { throw ParseError.invalid("Address \(a)") }
+            guard IPPrefix.isStrictPrefix(a), IPPrefix.hostAddress(a) != nil else { throw ParseError.invalid("Address \(Self.shown(a))") }
             c.addresses.append(a)
         }
         guard !c.addresses.isEmpty else { throw ParseError.missing("Address") }
         for d in iface["dns"] ?? [] {
-            if IPPrefix.parseAddress(d) != nil { c.dnsServers.append(d) }
+            if let ip = IPPrefix.strictLiteral(d) { c.dnsServers.append(IPPrefix.format(ip)) }
             else if isHostname(d) { c.dnsSearch.append(d) }
-            else { throw ParseError.invalid("DNS \(d)") }
+            else { throw ParseError.invalid("DNS \(Self.shown(d))") }
         }
         if let m = iface["mtu"]?.first {
             guard let v = Int(m), (576...9000).contains(v) else { throw ParseError.invalid("MTU") }
@@ -107,7 +112,7 @@ public struct WGQuickConfig: Equatable {
             c.presharedKey = k
         }
         for a in peer["allowedips"] ?? [] {
-            guard IPPrefix(a) != nil else { throw ParseError.invalid("AllowedIPs \(a)") }
+            guard IPPrefix.isStrictPrefix(a), IPPrefix(a) != nil else { throw ParseError.invalid("AllowedIPs \(Self.shown(a))") }
             c.allowedIPs.append(a)
         }
         guard !c.allowedIPs.isEmpty else { throw ParseError.missing("AllowedIPs") }
@@ -124,19 +129,34 @@ public struct WGQuickConfig: Equatable {
         return c
     }
 
+    static let maxAddresses = 16, maxDNS = 16, maxAllowedIPs = 256
+
+    /// Error text: never echo a long or control-character-laden value back.
+    static func shown(_ s: String) -> String {
+        String(String.UnicodeScalarView(s.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F }).prefix(40))
+    }
+
+    /// Port: 1-65535, ASCII digits only (UInt16("+1") would parse).
+    static func strictPort<S: StringProtocol>(_ s: S) -> UInt16? {
+        guard (1...5).contains(s.count), s.allSatisfy({ $0.isASCII && $0.isNumber }), let p = UInt16(s), p > 0 else { return nil }
+        return p
+    }
+
+    /// Host is either a strict IP literal (returned in canonical form) or a DNS name.
     public static func parseEndpoint(_ s: String) -> (host: String, port: UInt16)? {
         let t = s.trimmingCharacters(in: .whitespaces)
         if t.hasPrefix("[") {
             guard let close = t.firstIndex(of: "]"), t[t.index(after: close)...].hasPrefix(":"),
-                  let port = UInt16(t[t.index(close, offsetBy: 2)...]), port > 0 else { return nil }
+                  let port = strictPort(t[t.index(close, offsetBy: 2)...]) else { return nil }
             let host = String(t[t.index(after: t.startIndex)..<close])
-            guard IPPrefix.parseAddress(host)?.count == 16 else { return nil }
-            return (host, port)
+            guard let ip = IPPrefix.strictLiteral(host), ip.count == 16 else { return nil }
+            return (IPPrefix.format(ip), port)
         }
-        guard let colon = t.lastIndex(of: ":"), let port = UInt16(t[t.index(after: colon)...]), port > 0 else { return nil }
+        guard let colon = t.lastIndex(of: ":"), let port = strictPort(t[t.index(after: colon)...]) else { return nil }
         let host = String(t[..<colon])
-        guard !host.contains(":"), IPPrefix.parseAddress(host) != nil || isHostname(host) else { return nil }
-        return (host, port)
+        guard !host.contains(":") else { return nil }
+        if let ip = IPPrefix.strictLiteral(host) { return (IPPrefix.format(ip), port) }
+        return isHostname(host) && !host.allSatisfy({ $0.isNumber || $0 == "." }) ? (host, port) : nil
     }
 
     public static func isHostname(_ s: String) -> Bool {
@@ -208,5 +228,19 @@ public struct VPNProfile: Codable, Equatable, Sendable {
         c.addresses = addresses; c.dnsServers = dnsServers; c.dnsSearch = dnsSearch; c.mtu = mtu; c.listenPort = listenPort
         c.presharedKey = presharedKey; c.allowedIPs = allowedIPs; c.persistentKeepalive = persistentKeepalive
         return c
+    }
+}
+
+extension IPPrefix {
+    /// An IPv4 / IPv6 literal made only of hex digits, '.' and ':' (no zone "%...", brackets or spaces), or nil.
+    public static func strictLiteral(_ s: String) -> [UInt8]? {
+        guard !s.isEmpty, s.utf8.count <= 45, s.allSatisfy({ $0.isASCII && ($0.isHexDigit || $0 == "." || $0 == ":") }) else { return nil }
+        return parseAddress(s)
+    }
+    /// "literal" or "literal/len" with a plain decimal length.
+    public static func isStrictPrefix(_ s: String) -> Bool {
+        let parts = s.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let first = parts.first, strictLiteral(String(first)) != nil else { return false }
+        return parts.count == 1 || ((1...3).contains(parts[1].count) && parts[1].allSatisfy { $0.isASCII && $0.isNumber })
     }
 }

@@ -8,9 +8,13 @@
 // any page script has run, so it is the first one in the queue; we accept exactly one handshake,
 // hide it from page listeners (our capture listener was registered first), and from then on only
 // listen on the private port. Every port message also carries the bridge's nonce.
+//
+// wms-o3 (fingerprinting): no named global marks the page any more (`"__rampartClipboardHooked" in window`
+// identified every RamPart user to any site), and the hooks are Proxies around the native functions, so
+// `Clipboard.prototype.writeText.toString()` no longer prints RamPart's source. A second injection is
+// harmless: the prototypes are already locked, so its defineProperty calls fail and it changes nothing.
+// Honest limit: the locked (non-configurable) descriptor is still observable; it is what stops `delete`.
 (() => {
-  if (window.__rampartClipboardHooked) return;
-  try { Object.defineProperty(window, "__rampartClipboardHooked", { value: true, configurable: false, writable: false, enumerable: false }); } catch { return; }
 
   const NONCE_RE = /^[0-9a-f]{32}$/;
   let port = null, nonce = null;
@@ -59,32 +63,33 @@
   function lock(obj, name, value) {
     try { Object.defineProperty(obj, name, { configurable: false, writable: false, enumerable: true, value }); } catch {}
   }
+  const apply = Reflect.apply;
+  const wrap = (orig, fn) => new Proxy(orig, { apply: (target, self, args) => fn(self, args) });
   const CP = typeof Clipboard !== "undefined" ? Clipboard.prototype : null;
   if (CP && CP.writeText) {
     const orig = CP.writeText;
-    lock(CP, "writeText", function writeText(text) { const self = this; return screen(text).then(() => orig.call(self, text)); });
+    lock(CP, "writeText", wrap(orig, (self, args) => screen(args[0]).then(() => apply(orig, self, args))));
   }
   if (CP && CP.write) {
     const origW = CP.write;
-    lock(CP, "write", async function write(items) {
-      const self = this;
+    lock(CP, "write", wrap(origW, (self, args) => (async () => {
       let text = "";
-      try { for (const it of items) if (it.types && it.types.includes("text/plain")) text += await (await it.getType("text/plain")).text(); } catch {}
-      return screen(text).then(() => origW.call(self, items));
-    });
+      try { for (const it of args[0]) if (it.types && it.types.includes("text/plain")) text += await (await it.getType("text/plain")).text(); } catch {}
+      return screen(text).then(() => apply(origW, self, args));
+    })()));
   }
   const DP = Document.prototype;
   if (DP.execCommand) {
     const origExec = DP.execCommand;
-    lock(DP, "execCommand", function execCommand(cmd, ...rest) {
-      if (String(cmd).toLowerCase() === "copy") {
+    lock(DP, "execCommand", wrap(origExec, (self, args) => {
+      if (String(args[0]).toLowerCase() === "copy") {
         const sel = String(getSelection() || "");
         const active = document.activeElement;
         const text = sel || (active && "value" in active ? String(active.value) : "");
         // execCommand is synchronous: report it; the content script's capture-phase copy handler decides.
         send({ type: "clipboardWrite", id: ++seq, text: text.slice(0, 5000), sync: true });
       }
-      return origExec.call(this, cmd, ...rest);
-    });
+      return apply(origExec, self, args);
+    }));
   }
 })();

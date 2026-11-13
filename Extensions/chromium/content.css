@@ -1,4 +1,4 @@
-/* RamPart Web Protection: page-level styles. All RamPart UI is drawn inside a closed shadow root
-   (content.js, harden-hx6 N1) with its own stylesheet; the only thing left here is the scroll lock
-   while the full-page warning is up. */
-html.rampart-locked { overflow: hidden !important; }
+/* RamPart Web Protection: intentionally empty and no longer listed in the manifests (wms-o3).
+   A stylesheet injected into every page is a fingerprint: a site could add the class it targets to
+   <html> and see the extension's !important rule apply. The scroll lock is now an inline style that
+   content.js sets only while the full-page warning is up (lockScroll / unlockScroll). */

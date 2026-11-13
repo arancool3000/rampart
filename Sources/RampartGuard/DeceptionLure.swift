@@ -126,18 +126,51 @@ public struct LureStateMachine: Sendable {
 }
 
 /// Containment layer 6 (rate caps): sliding one-minute window per peer address, bounded table.
+/// The table is hard-capped: a LAN attacker cycling through thousands of source addresses inside one minute used to
+/// grow it without bound (the prune only dropped expired peers). When it is full of live peers, new peers are
+/// refused (fail closed) until entries expire.
 public final class LureRateLimiter: @unchecked Sendable {
     private let lock = NSLock()
     private var hits: [String: [Date]] = [:]
     public let perMinute: Int
-    public init(perMinute: Int) { self.perMinute = max(1, perMinute) }
+    public let maxPeers: Int
+    public init(perMinute: Int, maxPeers: Int = 2048) { self.perMinute = max(1, perMinute); self.maxPeers = max(1, maxPeers) }
+    public var trackedPeers: Int { lock.lock(); defer { lock.unlock() }; return hits.count }
     public func allow(_ peer: String, now: Date = Date()) -> Bool {
         lock.lock(); defer { lock.unlock() }
         var h = (hits[peer] ?? []).filter { now.timeIntervalSince($0) < 60 }
         guard h.count < perMinute else { hits[peer] = h; return false }
+        if hits[peer] == nil && hits.count >= maxPeers {
+            hits = hits.filter { $0.value.contains { now.timeIntervalSince($0) < 60 } }
+            if hits.count >= maxPeers { return false }
+        }
         h.append(now); hits[peer] = h
-        if hits.count > 2048 { hits = hits.filter { $0.value.contains { now.timeIntervalSince($0) < 60 } } }
         return true
+    }
+}
+
+/// Refused connections (scope / rate / concurrency) are recorded, logged and alerted; without a cap a connect flood
+/// turned into a log line, a tarpit.json rewrite and an alert per SYN. At most one record per peer per minute and
+/// `globalPerMinute` in total; the rest are counted and folded into the next record that gets through.
+public final class LureRefusalThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastByPeer: [String: Date] = [:]
+    private var window: (start: Date, count: Int) = (.distantPast, 0)
+    private var suppressed = 0
+    public let globalPerMinute: Int
+    public let maxPeers: Int
+    public init(globalPerMinute: Int = 20, maxPeers: Int = 1024) { self.globalPerMinute = max(1, globalPerMinute); self.maxPeers = max(1, maxPeers) }
+    /// nil = drop silently (counted); otherwise the number of refusals suppressed since the last recorded one.
+    public func admit(_ peer: String, now: Date = Date()) -> Int? {
+        lock.lock(); defer { lock.unlock() }
+        if now.timeIntervalSince(window.start) >= 60 { window = (now, 0) }
+        if let last = lastByPeer[peer], now.timeIntervalSince(last) < 60 { suppressed += 1; return nil }
+        guard window.count < globalPerMinute else { suppressed += 1; return nil }
+        if lastByPeer.count >= maxPeers { lastByPeer = lastByPeer.filter { now.timeIntervalSince($0.value) < 60 } }
+        if lastByPeer.count >= maxPeers { suppressed += 1; return nil }
+        lastByPeer[peer] = now; window.count += 1
+        defer { suppressed = 0 }
+        return suppressed
     }
 }
 
@@ -161,11 +194,20 @@ public enum LureAccessFilter {
             }
         }
     }
+    /// Strict "a.b.c.d/nn" (nn 8...32) in canonical form (network bits only), or nil. Used for everything that ends
+    /// up in the pf anchor or the helper's command line.
+    public static func canonicalCIDR(_ s: String) -> String? {
+        let parts = s.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2, let ip = ipv4(String(parts[0])), parts[1].count <= 2, parts[1].allSatisfy({ $0.isASCII && $0.isNumber }),
+              let bits = UInt32(parts[1]), (8...32).contains(bits) else { return nil }
+        let net = ip & (bits == 32 ? .max : ~(UInt32.max >> bits))
+        return "\(net >> 24).\((net >> 16) & 255).\((net >> 8) & 255).\(net & 255)/\(bits)"
+    }
     static func ipv4(_ s: String) -> UInt32? {
         let o = s.split(separator: ".", omittingEmptySubsequences: false)
         guard o.count == 4 else { return nil }
         var v: UInt32 = 0
-        for x in o { guard x.count <= 3, let b = UInt8(x) else { return nil }; v = v << 8 | UInt32(b) }
+        for x in o { guard (1...3).contains(x.count), x.allSatisfy({ $0.isASCII && $0.isNumber }), let b = UInt8(x) else { return nil }; v = v << 8 | UInt32(b) }
         return v
     }
 }

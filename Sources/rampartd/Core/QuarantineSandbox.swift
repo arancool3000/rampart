@@ -55,7 +55,8 @@ enum QuarantineSandbox {
         let gid = getpwuid(peer.uid)?.pointee.pw_gid ?? 20
         let asRoot = getuid() == 0
         let adminApps = peer.isAdmin && dest.hasPrefix("/Applications/")
-        let opts = QuarantineVault.RestoreOptions(alternatePath: dest, allowlist: false,
+        // wms-o2: the macOS quarantine flag comes back too, so Gatekeeper still checks the restored copy on first open.
+        let opts = QuarantineVault.RestoreOptions(alternatePath: dest, reapplyQuarantineXattr: true, allowlist: false,
                                                   ownerUID: asRoot ? peer.uid : nil, ownerGID: asRoot ? gid : nil,
                                                   requireParentOwnerUID: asRoot && !adminApps ? peer.uid : nil)
         let out = try v.restore(id: id, options: opts)

@@ -105,16 +105,23 @@ public struct MachOFile: Sendable {
     }
 
     public init(path: String) throws {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) else {
-            throw ParseError.unreadable
-        }
-        try self.init(data: data)
+        // Read through pread with bounds, never mmap: a mapped file raises SIGBUS (killing the inspector) if it
+        // is truncated while we parse it, so any binary could crash the scan by shrinking itself.
+        let fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK)
+        guard fd >= 0 else { throw ParseError.unreadable }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_size >= 0 else { throw ParseError.unreadable }
+        try self.init(reader: Reader(fd: fd, size: Int(st.st_size)))
         self.path = path
     }
 
     public init(data: Data) throws {
+        try self.init(reader: Reader(data: data))
+    }
+
+    init(reader r: Reader) throws {
         self.path = nil
-        let r = Reader(data: data)
         guard let magicBE = r.u32(0, bigEndian: true) else { throw ParseError.notMachO }
         switch magicBE {
         case 0xcafebabe, 0xcafebabf:
@@ -133,7 +140,7 @@ public struct MachOFile: Sendable {
                     guard let o = r.u32(base + 8, bigEndian: true), let s = r.u32(base + 12, bigEndian: true) else { throw ParseError.truncated }
                     off = UInt64(o); size = UInt64(s)
                 }
-                guard off < UInt64(data.count), size <= UInt64(data.count) - off, size >= 28 else {
+                guard off < UInt64(r.count), size <= UInt64(r.count) - off, size >= 28 else {
                     throw ParseError.malformed("fat arch \(i) out of bounds")
                 }
                 var s = try MachOFile.parseThin(r, at: Int(off), size: Int(size))
@@ -143,7 +150,7 @@ public struct MachOFile: Sendable {
             }
             self.isFat = true; self.slices = slices
         default:
-            let s = try MachOFile.parseThin(r, at: 0, size: data.count)
+            let s = try MachOFile.parseThin(r, at: 0, size: r.count)
             self.isFat = false; self.slices = [s]
         }
     }
@@ -258,7 +265,7 @@ public struct MachOFile: Sendable {
                 // Cap the blob before handing it to PropertyListSerialization: a crafted Mach-O can embed a
                 // huge or deeply nested entitlements plist to exhaust memory/CPU. Real entitlements are tiny.
                 if len <= 8 + 256 * 1024, let bytes = r.bytes(b + 8, Int(len) - 8),
-                   let plist = try? PropertyListSerialization.propertyList(from: Data(bytes), format: nil) as? [String: Any] {
+                   let plist = PlistGuard.propertyList(Data(bytes)) as? [String: Any] {
                     blob.entitlementKeys = Array(plist.keys.sorted().prefix(2048))
                 }
             default: break
@@ -298,24 +305,57 @@ public struct MachOFile: Sendable {
 
 // MARK: - Bounds-checked byte reader
 
-struct Reader {
-    let data: Data
+/// Reads from in-memory data or from a file descriptor (pread, 64 KB block cache). Every accessor returns nil
+/// rather than trapping when a range is out of bounds or the file shrank underneath us.
+final class Reader {
     let count: Int
-    init(data: Data) { self.data = data; self.count = data.count }
+    private let data: Data?
+    private let fd: Int32
+    private var blockStart = -1
+    private var block: [UInt8] = []
+    private static let blockSize = 64 << 10
+
+    init(data: Data) { self.data = data; self.fd = -1; self.count = data.count }
+    init(fd: Int32, size: Int) { self.data = nil; self.fd = fd; self.count = size }
+
+    private func pread(_ off: Int, _ n: Int) -> [UInt8]? {
+        var buf = [UInt8](repeating: 0, count: n)
+        var got = 0
+        while got < n {
+            let r = buf.withUnsafeMutableBytes { Darwin.pread(fd, $0.baseAddress! + got, n - got, off_t(off + got)) }
+            if r < 0 && errno == EINTR { continue }
+            if r <= 0 { return nil }
+            got += r
+        }
+        return buf
+    }
 
     func bytes(_ off: Int, _ n: Int) -> [UInt8]? {
         guard off >= 0, n >= 0, off <= count, n <= count - off else { return nil }
-        let start = data.startIndex + off
-        return [UInt8](data[start..<start + n])
+        if n == 0 { return [] }
+        if let data {
+            let start = data.startIndex + off
+            return [UInt8](data[start..<start + n])
+        }
+        // Small reads go through the block cache; large ones (signature blobs) read directly.
+        if n <= 4096 {
+            let bs = (off / Self.blockSize) * Self.blockSize
+            if off + n <= bs + Self.blockSize {
+                if bs != blockStart {
+                    guard let b = pread(bs, min(Self.blockSize, count - bs)) else { return nil }
+                    block = b; blockStart = bs
+                }
+                let o = off - bs
+                guard o + n <= block.count else { return nil }
+                return Array(block[o..<(o + n)])
+            }
+        }
+        return pread(off, n)
     }
-    func u8(_ off: Int) -> UInt8? {
-        guard off >= 0, off < count else { return nil }
-        return data[data.startIndex + off]
-    }
+    func u8(_ off: Int) -> UInt8? { bytes(off, 1)?.first }
     func u32(_ off: Int, bigEndian: Bool) -> UInt32? {
-        guard off >= 0, off + 4 <= count else { return nil }
-        let s = data.startIndex + off
-        let b0 = UInt32(data[s]), b1 = UInt32(data[s + 1]), b2 = UInt32(data[s + 2]), b3 = UInt32(data[s + 3])
+        guard let b = bytes(off, 4) else { return nil }
+        let b0 = UInt32(b[0]), b1 = UInt32(b[1]), b2 = UInt32(b[2]), b3 = UInt32(b[3])
         return bigEndian ? (b0 << 24 | b1 << 16 | b2 << 8 | b3) : (b3 << 24 | b2 << 16 | b1 << 8 | b0)
     }
     func u64(_ off: Int, bigEndian: Bool) -> UInt64? {
@@ -324,12 +364,9 @@ struct Reader {
     }
     /// NUL-terminated string starting at `off`, not reading past `limit` (exclusive) or 4096 bytes.
     func cString(_ off: Int, limit: Int) -> String? {
-        let end = min(limit, count, off + 4096)
-        guard off >= 0, off < end else { return nil }
-        var i = off
-        while i < end && data[data.startIndex + i] != 0 { i += 1 }
-        let s = data.startIndex
-        return String(decoding: data[(s + off)..<(s + i)], as: UTF8.self)
+        let end = min(limit, count, off &+ 4096)
+        guard off >= 0, off < end, let b = bytes(off, end - off) else { return nil }
+        return String(decoding: b.prefix { $0 != 0 }, as: UTF8.self)
     }
     func fixedString(_ off: Int, length: Int) -> String? {
         guard let b = bytes(off, length) else { return nil }

@@ -216,15 +216,27 @@ public final class GeminiClient: @unchecked Sendable {
     }
 
     /// The HTTP request. The key goes in the `x-goog-api-key` header only; never in the URL.
+    /// wms-o5: largest request body sent (prompts are capped per block; this bounds everything else, e.g. history).
+    public static let maxRequestBytes = 512 * 1024
+    /// wms-o5: hard ceiling on one generate() call including retries and back-off.
+    public var overallDeadline: TimeInterval = 120
+
     public static func urlRequest(model: String, body: GeminiRequest, key: String, timeout: TimeInterval) throws -> URLRequest {
         guard GeminiModel.isValidID(model) else { throw GeminiError.invalidModel }
+        // wms-o5: the key goes only into one header; refuse anything that could split the header or isn't a key
+        // (the key provider is injectable, so the store's validation alone isn't enough).
+        guard GeminiKeyStore.isPlausibleKey(key) else { throw GeminiError.noKey(GeminiKeyStore.KeyError.invalidFormat.description) }
+        guard timeout.isFinite, timeout > 0 else { throw GeminiError.network("invalid timeout") }
         let url = apiBase.appendingPathComponent("\(model):generateContent")
         guard url.host == host, url.scheme == "https" else { throw GeminiError.invalidModel }
         var r = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         r.httpMethod = "POST"
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.setValue(key, forHTTPHeaderField: "x-goog-api-key")
-        r.httpBody = try JSONEncoder().encode(body)
+        let data = try JSONEncoder().encode(body)
+        guard data.count <= maxRequestBytes else { throw GeminiError.validation("the request was too large to send") }
+        r.httpBody = data
+        r.timeoutInterval = min(timeout, 120)
         return r
     }
 
@@ -245,6 +257,7 @@ public final class GeminiClient: @unchecked Sendable {
         while true {
             attempt += 1
             if Task.isCancelled { throw GeminiError.cancelled }
+            if Date().timeIntervalSince(start) > overallDeadline { throw GeminiError.network("the request timed out") }
             var retryAfter: TimeInterval?
             let failure: GeminiError
             do {

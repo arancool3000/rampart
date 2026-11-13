@@ -95,8 +95,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     func catMouse(_ a: CatMouseAlert) {
         guard let center else { return }
         let c = UNMutableNotificationContent()
-        c.title = a.title
-        c.body = a.body
+        c.title = SafeText.line(a.title, max: 120)   // o8: process and file names inside come from the attacker
+        c.body = SafeText.line(a.body, max: 400)
         c.threadIdentifier = Category.catMouse.rawValue
         let running = a.pid.map { $0 > 1 && kill($0, 0) == 0 } ?? false
         c.categoryIdentifier = (running && !a.calm ? Category.catMouseContain : Category.catMouse).rawValue
@@ -121,8 +121,10 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
         guard let center else { return }
         let c = UNMutableNotificationContent()
-        c.title = title
-        c.body = body
+        // o8: defence in depth; every caller already cleans the untrusted part, this keeps a forgotten one from
+        // adding a fake second line ("All clear") or bidi tricks to the banner.
+        c.title = SafeText.line(title, max: 120)
+        c.body = SafeText.line(body, max: 400)
         c.threadIdentifier = cat.rawValue
         c.categoryIdentifier = cat.rawValue
         if !userInfo.isEmpty { c.userInfo = userInfo }

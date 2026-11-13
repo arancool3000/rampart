@@ -73,18 +73,52 @@ public final class TouchIDUnlock: @unchecked Sendable {
                             deviceOwnerAuthAvailable: ownerOK, reason: bio ? nil : reason)
     }
 
-    struct Record: Codable {
-        var version = 1
-        var vaultID: UUID
-        var mode: Mode
-        var seKey: Data?
-        var ephemeralPublic: Data?
-        var wrapped: Data?
-        var domainState: Data?
+    /// `touchid.json`. wms-fb: `mac` = HMAC-SHA256 over every other field under a key derived from the vault key,
+    /// checked once the vault key has been recovered. Without it, same-user code could rewrite `domainState`
+    /// (its current value is readable by any process) and defeat the enrolment-change check in compatibility
+    /// mode. Secure Enclave mode is enforced by hardware (`.biometryCurrentSet`), so a legacy SE record without
+    /// `mac` is still accepted; a compatibility-mode record without one is not.
+    public struct Record: Codable {
+        public var version = 1
+        public var vaultID: UUID
+        public var mode: Mode
+        public var seKey: Data?
+        public var ephemeralPublic: Data?
+        public var wrapped: Data?
+        public var domainState: Data?
+        public var mac: Data?
+        public init(vaultID: UUID, mode: Mode, seKey: Data? = nil, ephemeralPublic: Data? = nil, wrapped: Data? = nil, domainState: Data? = nil, mac: Data? = nil) {
+            self.vaultID = vaultID; self.mode = mode; self.seKey = seKey; self.ephemeralPublic = ephemeralPublic
+            self.wrapped = wrapped; self.domainState = domainState; self.mac = mac
+        }
+    }
+
+    static func recordKey(_ vaultKey: SecretKeyBytes, _ id: UUID) -> SymmetricKey {
+        VaultCrypto.hkdf(vaultKey, salt: Data(id.uuidString.utf8), info: "rampart.vault.v1.touchid-record")
+    }
+    static func recordMessage(_ r: Record) -> Data {
+        func f(_ d: Data?) -> String { d.map { "set:" + $0.base64EncodedString() } ?? "none" }
+        return Data(["rampart.vault.v1|touchid-record", String(r.version), r.vaultID.uuidString, r.mode.rawValue,
+                     f(r.seKey), f(r.ephemeralPublic), f(r.wrapped), f(r.domainState)].joined(separator: "|").utf8)
+    }
+    /// The record with its integrity tag filled in.
+    public static func sealed(_ r: Record, vaultKey: SecretKeyBytes) -> Record {
+        var out = r
+        out.mac = Data(HMAC<SHA256>.authenticationCode(for: recordMessage(r), using: recordKey(vaultKey, r.vaultID)))
+        return out
+    }
+    /// True when `mac` is present and matches every other field under this vault key.
+    public static func isAuthentic(_ r: Record, vaultKey: SecretKeyBytes) -> Bool {
+        guard let mac = r.mac else { return false }
+        return HMAC<SHA256>.isValidAuthenticationCode(mac, authenticating: recordMessage(r), using: recordKey(vaultKey, r.vaultID))
     }
 
     public let store: VaultStore
-    public init(store: VaultStore) { self.store = store }
+    public init(store: VaultStore) {
+        self.store = store
+        // wms-fb: a master-password change rotates the vault key; re-wrap it for Touch ID without a prompt.
+        store.addKeyRotationObserver { [weak self] in self?.refreshWrap() }
+    }
 
     var recordURL: URL { store.directory.appendingPathComponent("touchid.json") }
 
@@ -146,13 +180,48 @@ public final class TouchIDUnlock: @unchecked Sendable {
             }
         }
         if mode == .keychainGated {
+            // wms-fb: compatibility mode relies on the enrolment hash; without one there is nothing to compare.
+            guard state != nil else { throw VaultError.biometry("macOS didn't report the Touch ID enrolment state, so compatibility mode can't be set up safely.") }
             try key.withBytes { try Keychain.setGeneric(service: Self.keychainService, account: id.uuidString, data: Data($0), label: "RamPart vault key") }
         }
+        try writeRecord(Self.sealed(record, vaultKey: key))
+        return mode
+    }
+
+    private func writeRecord(_ record: Record) throws {
         let data = try JSONEncoder().encode(record)
         try FileManager.default.createDirectory(at: store.directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try data.write(to: recordURL, options: .atomic)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: recordURL.path)
-        return mode
+    }
+
+    /// wms-fb: re-wraps the vault's CURRENT key for the existing Touch ID setup, without any prompt. Secure
+    /// Enclave mode needs only the SE key's public half (a fresh ephemeral ECDH); compatibility mode updates the
+    /// keychain item. Called after a master-password change rotated the vault key. If anything fails, Touch ID
+    /// is turned off rather than left pointing at a key that no longer opens the vault.
+    @discardableResult
+    public func refreshWrap() -> Bool {
+        guard let r = readRecord(), let key = try? store.currentKey() else { return false }
+        defer { key.wipe() }
+        var record = r
+        do {
+            switch r.mode {
+            case .secureEnclave:
+                guard let blob = r.seKey else { throw VaultError.biometryChanged }
+                let se = try SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: blob)
+                let eph = P256.KeyAgreement.PrivateKey()
+                let kek = Self.kek(shared: try eph.sharedSecretFromKeyAgreement(with: se.publicKey), ephemeral: eph.publicKey, se: se.publicKey)
+                record.ephemeralPublic = eph.publicKey.x963Representation
+                record.wrapped = try key.withBytes { try AES.GCM.seal(Data($0), using: kek, authenticating: Self.aad(r.vaultID)).combined }
+            case .keychainGated:
+                try key.withBytes { try Keychain.setGeneric(service: Self.keychainService, account: r.vaultID.uuidString, data: Data($0), label: "RamPart vault key") }
+            }
+            try writeRecord(Self.sealed(record, vaultKey: key))
+            return true
+        } catch {
+            disable()
+            return false
+        }
     }
 
     public func disable() {
@@ -185,6 +254,9 @@ public final class TouchIDUnlock: @unchecked Sendable {
         if let saved = r.domainState, let now = Self.domainState(ctx), saved != now {
             disable(); throw VaultError.biometryChanged
         }
+        // wms-fb: compatibility mode is only as good as this comparison, so a record without an enrolment
+        // hash (stripped, or written before the check existed) is treated as changed.
+        if r.mode == .keychainGated, r.domainState == nil { disable(); throw VaultError.biometryChanged }
 
         let key: SecretKeyBytes
         switch r.mode {
@@ -212,6 +284,11 @@ public final class TouchIDUnlock: @unchecked Sendable {
             }
             key = SecretKeyBytes(data: raw)
             secureZero(&raw)
+        }
+        // wms-fb: the record must be the one RamPart wrote for this vault key (legacy SE records excepted).
+        guard Self.isAuthentic(r, vaultKey: key) || (r.mode == .secureEnclave && r.mac == nil) else {
+            key.wipe(); disable()
+            throw VaultError.biometry("The vault's Touch ID settings file was altered, so Touch ID unlock was turned off. Unlock with your master password and turn it on again.")
         }
         try store.unlock(vaultKey: key)
     }

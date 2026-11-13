@@ -59,6 +59,8 @@ private struct RegexParser {
     var i = 0
     let nocase: Bool
     let dotall: Bool
+    /// Group nesting so far (bounded: deep nesting would overflow the stack in the parser and tree walks).
+    var depth = 0
 
     init(_ s: [UInt8], nocase: Bool, dotall: Bool) { self.s = s; self.nocase = nocase; self.dotall = dotall }
 
@@ -136,6 +138,9 @@ private struct RegexParser {
                 guard i + 1 < s.count, s[i + 1] == UInt8(ascii: ":") else { throw RegexError(description: "unsupported group extension") }
                 i += 2
             }
+            depth += 1
+            defer { depth -= 1 }
+            if depth > 64 { throw RegexError(description: "groups nested too deeply") }
             let inner = try parseAlt()
             guard peek() == UInt8(ascii: ")") else { throw RegexError(description: "missing )") }
             i += 1

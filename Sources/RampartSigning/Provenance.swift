@@ -51,7 +51,7 @@ public struct Provenance: Codable, Hashable, Sendable {
     }
 
     public static func parseWhereFroms(_ d: Data) -> [String] {
-        guard let obj = try? PropertyListSerialization.propertyList(from: d, format: nil) else { return [] }
+        guard let obj = PlistGuard.propertyList(d) else { return [] }   // xattr is attacker-controlled: depth-checked
         if let a = obj as? [String] { return a.filter { !$0.isEmpty } }
         if let s = obj as? String { return [s] }
         return []

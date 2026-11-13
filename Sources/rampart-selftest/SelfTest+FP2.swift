@@ -148,7 +148,11 @@ extension SelfTest {
         let base = SelfTest.fixtureTempDir + "rampart.test.owndata-\(getpid())"
         let own = base + "/home/Library/Application Support/Rampart/Quarantine"
         let other = base + "/elsewhere"
-        defer { try? fm.removeItem(atPath: base) }
+        // wms-o10: a home-shaped folder in temp is no longer own data by shape alone (that let malware hide in
+        // /tmp/x/Library/Application Support/Rampart). The fixture registers it as a data root instead; the
+        // stricter "unregistered look-alike IS scanned" check lives in SelfTest+WMSo10.swift.
+        OwnData.register(root: base + "/home/Library/Application Support/Rampart")
+        defer { OwnData.unregister(root: base + "/home/Library/Application Support/Rampart"); try? fm.removeItem(atPath: base) }
         try? fm.createDirectory(atPath: own, withIntermediateDirectories: true)
         try? fm.createDirectory(atPath: other, withIntermediateDirectories: true)
         let eicar = Data((["X5O!P%@AP[4\\PZX54(P^)7CC)7}$", "EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"]).joined().utf8)

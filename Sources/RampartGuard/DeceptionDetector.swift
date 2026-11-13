@@ -71,9 +71,21 @@ public enum DeceptionBenign {
         "/System/Library/PrivateFrameworks/GenerationalStorage.framework/Versions/A/Support/revisiond",
     ]
 
+    /// Command-line tools in the benign set that a script can run on demand (mdimport -d3 / qlmanage -p print or
+    /// render a file's contents). They are only benign when macOS itself started them (parent launchd).
+    public static let onDemandTools: Set<String> = ["/usr/bin/qlmanage", "/usr/bin/mdimport", "com.apple.qlmanage", "com.apple.mdimport"]
+
+    static func isSystemLocation(_ path: String) -> Bool {
+        ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"].contains { path.hasPrefix($0) } && !path.hasPrefix("/usr/local/")
+    }
+
     public static func isBenign(_ p: ProcessInfoLite, ownPaths: [String] = []) -> Bool {
         if ownPaths.contains(where: { !$0.isEmpty && (p.path == $0 || p.path.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/")) }) { return true }
-        if p.isPlatformBinary, let s = p.signingID, signingIDs.contains(s) { return true }
+        // wms-o6: a script driving an on-demand Apple tool (or a copy of one) to read the decoy is still a catch.
+        if onDemandTools.contains(p.path) || p.signingID.map(onDemandTools.contains) == true, p.ppid != 1 { return false }
+        // Signing ID AND platform binary AND still in a system location: an Apple indexer binary copied to /tmp (it
+        // keeps its Apple signature) is not exempt.
+        if p.isPlatformBinary, let s = p.signingID, signingIDs.contains(s), isSystemLocation(p.path) { return true }
         // System paths are on the sealed system volume: a path match there cannot be forged by user-level malware.
         if exactPaths.contains(p.path) { return true }
         if p.path.hasPrefix("/System/") || p.path.hasPrefix("/Library/Apple/") {
@@ -128,7 +140,9 @@ public final class DeceptionDetector: @unchecked Sendable {
         case .xattrDelete: return .xattr
         case .other:
             switch e.detail["es_event"] ?? e.detail["op"] {
-            case "open", "read", "mmap", "clone", "copyfile", "readdir", "lookup", "stat": return .read
+            case "open", "read", "mmap", "readdir", "lookup", "stat": return .read
+            // A clone, copy or hard link gives the decoy a second name that later reads would go through (wms-o6).
+            case "clone", "copyfile", "link": return .copy
             case "setextattr": return .xattr
             default: return nil
             }

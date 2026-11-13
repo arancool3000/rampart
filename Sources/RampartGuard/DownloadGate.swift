@@ -42,6 +42,9 @@ public struct GateItem: Codable, Hashable, Sendable, Identifiable {
     public var quarantineFlagAdded: Bool = false
     /// Execute bits RamPart removed: path → original mode. Restored on Cleared / Allow.
     public var strippedModes: [String: UInt16] = [:]
+    /// wms-o2: identity ("dev:ino") of each file whose execute bits were removed. Allow only restores the bits on that
+    /// same inode, so a file swapped in under the same name after the check never gets them.
+    public var strippedIDs: [String: String]? = nil
     public var threat: String?
     public var detectionID: UUID?
 
@@ -110,6 +113,7 @@ public final class DownloadGateService: @unchecked Sendable {
     private var decided: [String: String] = [:]
     private var watcher: GateFSWatcher?
     private var timer: DispatchSourceTimer?
+    private var ticks = 0
     private var lastError: String?
 
     public init(directory: URL, home: String = NSHomeDirectory(), signer: DownloadGateSigning = SecDownloadGateSigning(),
@@ -265,6 +269,8 @@ public final class DownloadGateService: @unchecked Sendable {
     }
 
     private func tickLocked(now: Date) {
+        ticks += 1
+        if ticks % 8 == 0 { reverifyLocked() }   // about every 2 s
         for (path, p) in pending {
             guard let st = Self.stat(path) else { pending[path] = nil; continue }
             if st.size != p.size || st.mtime != p.mtime { pending[path] = (st.size, st.mtime, now, p.first); continue }
@@ -291,14 +297,23 @@ public final class DownloadGateService: @unchecked Sendable {
         let kind = GateFileKind.classify(path: path)
         let isDir = (lst.st_mode & S_IFMT) == S_IFDIR
         if isDir && kind != .app && kind != .installer { return nil }
+        // wms-o2: a link anywhere in the path (e.g. a swapped parent folder) means it isn't really in the watched folder.
+        guard GateFS.lstatStrict(path) != nil else { return nil }
         var item = GateItem(path: path, name: (path as NSString).lastPathComponent, folder: root.name, kind: kind, verdict: .cleared,
                             reason: "", arrived: firstSeen, checked: Date(), secondsToCheck: 0, size: Self.stat(path)?.size ?? 0)
         // 1. Gatekeeper must check it on first open.
         item.quarantineFlagAdded = Self.ensureQuarantineFlag(path)
         // 2. No execute permission until it has been checked.
-        if kind.isCode { item.strippedModes = Self.stripExecute(subject: path, kind: kind) }
+        var afterStrip: [String: Darwin.stat] = [:]
+        if kind.isCode {
+            let s = Self.stripExecuteFiles(subject: path, kind: kind)
+            item.strippedModes = s.modes; item.strippedIDs = s.ids; afterStrip = s.after
+        }
         // 3. Scan (the app bundle's executables, or the file; archives are unpacked by the engine).
-        let targets = kind == .app ? Self.bundleExecutables(path) : [path]
+        let main: (path: String?, anomaly: Bool) = kind == .app ? GateFS.mainExecutable(path) : (nil, false)
+        var targets = kind == .app ? Self.bundleExecutables(path) : [path]
+        if let m = main.path, !targets.contains(m), GateFS.lstatStrict(m) != nil { targets.insert(m, at: 0) }
+        if kind == .app { for f in item.strippedModes.keys.sorted() where !targets.contains(f) && targets.count < 256 { targets.append(f) } }
         var finding: Detection?
         for t in targets { if let d = scan(t), isMalicious(d) { finding = d; break } }
         if var d = finding {
@@ -313,10 +328,22 @@ public final class DownloadGateService: @unchecked Sendable {
         } else if kind.isCode {
             let sig = signer.assess(path: path, kind: kind)
             item.signature = sig
+            // wms-o2: things that make a good signature meaningless for this copy.
+            let changed = afterStrip.contains { f, before in
+                guard let now = GateFS.lstatStrict(f) else { return true }
+                return now.st_ino != before.st_ino || now.st_dev != before.st_dev || now.st_size != before.st_size
+                    || now.st_ctimespec.tv_sec != before.st_ctimespec.tv_sec || now.st_ctimespec.tv_nsec != before.st_ctimespec.tv_nsec
+            }
+            let hardLinked = !isDir && lst.st_nlink > 1
             if kind == .script && item.strippedModes.isEmpty {
                 item.reason = "No threats found. It's a script without permission to run, so it opens as text."
+            } else if main.anomaly || changed || hardLinked {
+                item.verdict = .held
+                item.reason = main.anomaly ? "Its Info.plist points the app at a program outside Contents/MacOS, so RamPart can't vouch for it."
+                    : changed ? "It changed while RamPart was checking it, so it can't run until you allow it."
+                    : "It has a second name (hard link) somewhere else on disk, so RamPart can't vouch for it. It can't run until you allow it."
             } else if sig.isTrustedToRun {
-                Self.restore(item.strippedModes)
+                Self.restore(item.strippedModes, ids: item.strippedIDs)
                 item.reason = "No threats found. \(sig.summary)" + (sig.gatekeeperAccepted == true ? "; Gatekeeper accepts it." : ".")
             } else {
                 item.verdict = .held
@@ -330,6 +357,18 @@ public final class DownloadGateService: @unchecked Sendable {
             case .installer: item.reason = "No threats found. macOS checks the installer's signature when you open it."
             default: item.reason = "No threats found."
             }
+        }
+        // wms-o2: re-gating a held item (e.g. after someone put an execute bit back) must keep the original modes, so
+        // the periodic re-check and Allow still know which files were stripped.
+        if item.verdict == .held || item.verdict == .blocked, let old = items.first(where: { $0.path == path }),
+           old.verdict == .held || old.verdict == .blocked {
+            var ids = item.strippedIDs ?? [:]
+            for (f, m) in old.strippedModes where item.strippedModes[f] == nil {
+                guard let now = GateFS.lstatStrict(f), old.strippedIDs?[f] == nil || old.strippedIDs?[f] == GateFS.id(now) else { continue }
+                item.strippedModes[f] = m
+                if let i = old.strippedIDs?[f] { ids[f] = i }
+            }
+            item.strippedIDs = ids
         }
         item.checked = Date()
         item.secondsToCheck = max(0, item.checked.timeIntervalSince(firstSeen))
@@ -347,6 +386,33 @@ public final class DownloadGateService: @unchecked Sendable {
         if let d = try? JSONEncoder.rampart.encode(items) { try? d.write(to: itemsURL, options: .atomic) }
     }
 
+    /// wms-o2: re-checks every held or blocked item. If something put an execute bit back (chmod, possibly through
+    /// another hard link that FSEvents reports under a different path) or removed the quarantine flag, the gate takes
+    /// it away / adds it again. Returns the number of repairs.
+    @discardableResult
+    public func reverify() -> Int { queue.sync { reverifyLocked() } }
+
+    @discardableResult
+    private func reverifyLocked() -> Int {
+        var repairs = 0
+        for i in items.indices where items[i].verdict == .held || items[i].verdict == .blocked {
+            let item = items[i]
+            guard root(of: item.path) != nil, GateFS.lstatStrict(item.path) != nil else { continue }
+            for (f, _) in item.strippedModes {
+                let want = item.strippedIDs?[f]
+                if GateFS.setMode(f, expectID: want, { m in m & 0o111 != 0 ? m & ~0o111 & ~0o6000 : nil }).map({ $0.st_mode & 0o111 != 0 }) == true {
+                    repairs += 1
+                }
+            }
+            if item.kind.isCode || item.verdict == .blocked {
+                let value = String(format: "0081;%08x;RamPart Download Gate;%@", Int(Date().timeIntervalSince1970), UUID().uuidString)
+                if GateFS.addXattrIfMissing(item.path, Self.quarantineAttr, value) { repairs += 1 }
+            }
+            if let st = Self.stat(item.path) { decided[item.path] = st.fingerprint }
+        }
+        return repairs
+    }
+
     // MARK: decisions
 
     /// "Allow" gives a held item its execute permission back; "Delete" moves it to the Trash.
@@ -360,7 +426,7 @@ public final class DownloadGateService: @unchecked Sendable {
             if lstat(item.path, &st) != 0 {
                 item.verdict = .deleted; item.reason = "It's no longer there."
             } else if allow {
-                Self.restore(item.strippedModes)
+                Self.restore(item.strippedModes, ids: item.strippedIDs)
                 item.verdict = .allowed
                 item.reason = "You allowed it. Its permission to run was restored."
             } else {
@@ -383,11 +449,16 @@ public final class DownloadGateService: @unchecked Sendable {
     struct Stat { var size: Int64; var mtime: Double; var fingerprint: String }
 
     /// Size + mtime; for an .app bundle the sum over its files (so a bundle still being unpacked isn't "stable").
+    /// wms-o2: the fingerprint also covers what an attacker can change without touching size or mtime: execute bits
+    /// put back with chmod, the quarantine flag removed, and (for apps) the Info.plist's inode change time, which
+    /// `touch -r` can't reset. A change to any of them re-gates the item.
     static func stat(_ path: String) -> Stat? {
         var st = Darwin.stat()
         guard lstat(path, &st) == 0 else { return nil }
         var size = Int64(st.st_size)
         var mtime = Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9
+        var execs = (st.st_mode & S_IFMT) == S_IFREG && st.st_mode & 0o111 != 0 ? 1 : 0
+        var plist = ""
         if (st.st_mode & S_IFMT) == S_IFDIR, let e = FileManager.default.enumerator(atPath: path) {
             var n = 0
             while let rel = e.nextObject() as? String, n < 20_000 {
@@ -396,21 +467,24 @@ public final class DownloadGateService: @unchecked Sendable {
                 if lstat(path + "/" + rel, &s2) == 0 {
                     size += Int64(s2.st_size)
                     mtime = max(mtime, Double(s2.st_mtimespec.tv_sec) + Double(s2.st_mtimespec.tv_nsec) / 1e9)
+                    if (s2.st_mode & S_IFMT) == S_IFREG && s2.st_mode & 0o111 != 0 { execs += 1 }
+                    if rel == "Contents/Info.plist" { plist = "\(s2.st_ino).\(s2.st_ctimespec.tv_sec).\(s2.st_ctimespec.tv_nsec)" }
                 }
             }
         }
-        return Stat(size: size, mtime: mtime, fingerprint: "\(st.st_dev):\(st.st_ino):\(size):\(mtime)")
+        let q = hasQuarantineFlag(path) ? 1 : 0
+        return Stat(size: size, mtime: mtime, fingerprint: "\(st.st_dev):\(st.st_ino):\(size):\(mtime):x\(execs):q\(q):p\(plist)")
     }
 
     /// Adds com.apple.quarantine when missing (never replaces an existing one). Returns true when it added it.
+    /// wms-o2: through a descriptor, never following a link in any path component.
     static func ensureQuarantineFlag(_ path: String) -> Bool {
-        if getxattr(path, quarantineAttr, nil, 0, 0, XATTR_NOFOLLOW) >= 0 { return false }
         // flags;hex-time;agent;uuid — 0081 = downloaded, not yet approved by the user.
         let value = String(format: "0081;%08x;RamPart Download Gate;%@", Int(Date().timeIntervalSince1970), UUID().uuidString)
-        return value.withCString { setxattr(path, quarantineAttr, $0, strlen($0), 0, XATTR_NOFOLLOW) } == 0
+        return GateFS.addXattrIfMissing(path, quarantineAttr, value)
     }
 
-    public static func hasQuarantineFlag(_ path: String) -> Bool { getxattr(path, quarantineAttr, nil, 0, 0, XATTR_NOFOLLOW) >= 0 }
+    public static func hasQuarantineFlag(_ path: String) -> Bool { GateFS.hasXattr(path, quarantineAttr) }
 
     /// The executables of an app bundle: everything regular in Contents/MacOS (and Contents/Helpers).
     static func bundleExecutables(_ app: String) -> [String] {
@@ -427,23 +501,29 @@ public final class DownloadGateService: @unchecked Sendable {
 
     /// Clears every execute bit; returns path → original mode for the files it changed.
     static func stripExecute(subject: String, kind: GateFileKind) -> [String: UInt16] {
-        let files = kind == .app ? bundleExecutables(subject) : [subject]
-        var changed: [String: UInt16] = [:]
-        for f in files {
-            var st = Darwin.stat()
-            guard lstat(f, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
-            let mode = UInt16(st.st_mode & 0o7777)
-            guard mode & 0o111 != 0 else { continue }
-            if chmod(f, mode_t(mode & ~0o111 & ~0o6000)) == 0 { changed[f] = mode }   // also drops setuid/setgid
-        }
-        return changed
+        stripExecuteFiles(subject: subject, kind: kind).modes
     }
 
-    static func restore(_ modes: [String: UInt16]) {
+    /// wms-o2: for an app, every executable file anywhere in the bundle (a payload in Contents/Resources runs just as
+    /// well as one in Contents/MacOS). Each chmod goes through a descriptor, never through a link. Also returns each
+    /// file's identity and its stat right after the change (to notice a rewrite while the signature is checked).
+    static func stripExecuteFiles(subject: String, kind: GateFileKind) -> (modes: [String: UInt16], ids: [String: String], after: [String: Darwin.stat]) {
+        let files = kind == .app ? GateFS.executableFiles(under: subject) : [subject]
+        var changed: [String: UInt16] = [:], ids: [String: String] = [:], after: [String: Darwin.stat] = [:]
+        for f in files {
+            guard let before = GateFS.setMode(f, { m in m & 0o111 != 0 ? m & ~0o111 & ~0o6000 : nil }),   // also drops setuid/setgid
+                  before.st_mode & 0o111 != 0 else { continue }
+            changed[f] = UInt16(before.st_mode & 0o7777)
+            ids[f] = GateFS.id(before)
+            if let now = GateFS.lstatStrict(f) { after[f] = now }
+        }
+        return (changed, ids, after)
+    }
+
+    /// Gives back execute bits, never setuid/setgid, and (when known) only to the same inode that was stripped.
+    static func restore(_ modes: [String: UInt16], ids: [String: String]? = nil) {
         for (f, m) in modes {
-            var st = Darwin.stat()
-            guard lstat(f, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
-            _ = chmod(f, mode_t(m))
+            GateFS.setMode(f, expectID: ids?[f]) { _ in mode_t(m) & 0o1777 }
         }
     }
 }

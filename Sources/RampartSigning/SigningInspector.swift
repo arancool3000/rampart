@@ -139,6 +139,16 @@ public enum SigningInspector {
 
     // MARK: - Classification
 
+    /// True for paths whose contents only Apple can change: the sealed system volume (not the writable
+    /// /System/Volumes/Data firmlink tree), cryptexes, /usr and /bin outside /usr/local, and SIP's /Library/Apple.
+    public static func isSealedSystemLocation(_ path: String) -> Bool {
+        var p = path
+        if let r = realpath(path, nil) { p = String(cString: r); free(r) }
+        if p.hasPrefix("/System/Volumes/") { return p.hasPrefix("/System/Volumes/Preboot/Cryptexes/") }
+        if p.hasPrefix("/usr/local/") { return false }
+        return ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"].contains { p.hasPrefix($0) }
+    }
+
     private static func classify(path: String, staticCode sc: SecStaticCode, validity: OSStatus, dynamic: Bool = false,
                                  check: (SecRequirement?) -> OSStatus) -> SigningReport {
         var report = SigningReport(path: path, info: SigningInfo(status: .unknown), cdhash: nil, isPlatformBinary: false,
@@ -153,7 +163,10 @@ public enum SigningInspector {
             report.info.hardenedRuntime = report.codeFlags & 0x10000 /* kSecCodeSignatureRuntime */ != 0
             if let u = d[kSecCodeInfoUnique as String] as? Data { report.cdhash = u.map { String(format: "%02x", $0) }.joined() }
             if let ent = d[kSecCodeInfoEntitlementsDict as String] as? [String: Any] { report.info.entitlements = ent.keys.sorted() }
-            if let plat = d[kSecCodeInfoPlatformIdentifier as String] as? NSNumber, plat.intValue != 0 { report.isPlatformBinary = true }
+            // o10: the platform byte lives in the CodeDirectory, which anyone can write in an ad-hoc signature.
+            // Believe it only for code on the sealed system volume, a cryptex or SIP-protected /Library/Apple.
+            if let plat = d[kSecCodeInfoPlatformIdentifier as String] as? NSNumber, plat.intValue != 0,
+               isSealedSystemLocation(path) { report.isPlatformBinary = true }
             if let certs = d[kSecCodeInfoCertificates as String] as? [SecCertificate] {
                 report.certificateChain = certs.map { c in
                     var cn: CFString?

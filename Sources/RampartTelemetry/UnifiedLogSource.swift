@@ -6,7 +6,16 @@ import RampartShared
 public final class UnifiedLogParser {
     public private(set) var parsed = 0
     public private(set) var skipped = 0
+    /// Lines in an Apple security channel written by a non-system image (wms-o6).
+    public private(set) var spoofed = 0
     public var maxMessageLength = 2048
+
+    /// Images on the sealed system volume or SIP-protected Apple locations.
+    public static func isSystemImage(_ p: String) -> Bool {
+        guard p.hasPrefix("/"), !p.contains("/../") else { return false }
+        return p.hasPrefix("/System/") || p.hasPrefix("/usr/libexec/") || p.hasPrefix("/usr/sbin/") || p.hasPrefix("/usr/bin/")
+            || p.hasPrefix("/usr/lib/") || p.hasPrefix("/sbin/") || p.hasPrefix("/bin/") || p.hasPrefix("/Library/Apple/")
+    }
 
     public init() {}
 
@@ -47,6 +56,14 @@ public final class UnifiedLogParser {
         let lower = message.lowercased()
         var kind: SecurityEventKind = .other
         var path: String? = nil
+        // wms-o6: any process may log under any subsystem (os_log takes it as a plain string), so subsystem and
+        // message text prove nothing. `processImagePath` is filled in by the logging system and can't be forged;
+        // `senderImagePath` is the image that made the call (a system framework for in-app framework logging).
+        // Security meaning (XProtect hit, launch item added, TCC request, Gatekeeper override) is only taken from a
+        // system process. A third-party image writing Apple security log lines itself is flagged `log_spoof`.
+        let senderPath = obj["senderImagePath"] as? String
+        let trustedProcess = Self.isSystemImage(procPath)
+        let selfAuthored = !trustedProcess && senderPath.map { !Self.isSystemImage($0) } == true
 
         if subsystem.hasPrefix("com.apple.xprotect") || subsystem == "com.apple.XProtectFramework"
             || procName.hasPrefix("XProtect") || procName == "XprotectService" {
@@ -80,6 +97,16 @@ public final class UnifiedLogParser {
                 detail["type"] = "clipboardRead"
                 if let b = Self.firstBundleID(message) { detail["reader_bundle"] = b }
             }
+        }
+        if let ch = detail["channel"], !trustedProcess {
+            // Never let a non-system process manufacture a security event. Pasteboard lines are logged by the system
+            // framework inside the reading app, so they only need a system sender; a self-authored one could frame
+            // another app as a clipboard reader.
+            if ch != "pasteboard" || selfAuthored {
+                kind = .other
+                for k in ["type", "reader_bundle", "gatekeeper", "service"] { detail[k] = nil }
+            }
+            if selfAuthored { detail["log_spoof"] = "1"; detail["type"] = "logSpoof"; spoofed += 1 }
         }
         if let p = Self.firstPath(message) { path = p }
         parsed += 1

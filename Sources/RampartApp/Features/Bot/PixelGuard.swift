@@ -23,10 +23,11 @@ enum PixelGuard {
 
     /// Three head designs explored; `chosen` is the shipped mark.
     enum Variant: Int, CaseIterable {
-        case capGuard, visorSentinel, beaconBot
-        var name: String { ["Cap Guard", "Visor Sentinel", "Beacon Bot"][rawValue] }
+        case capGuard, visorSentinel, beaconBot, cyberSentinel
+        var name: String { ["Cap Guard", "Visor Sentinel", "Beacon Bot", "Cyber Sentinel"][rawValue] }
     }
-    static let chosen: Variant = .capGuard
+    /// The user found the friendly Cap Guard too cute: the shipped mark is the armoured Cyber Sentinel.
+    static let chosen: Variant = .cyberSentinel
 
     // Keys: L beacon light · s antenna stalk · C cap/helmet · G gold shield badge · B brim · H head shell ·
     // E ear guard · S face screen · T uniform · A arm · h glove · K belt · P leg · F boot. "." is empty.
@@ -63,6 +64,21 @@ enum PixelGuard {
             "...HHHHHHHHHH...",
             "....CCCCCCCC....",
         ]
+        // Cyber Sentinel keys: X cyan armour edge/crest · D gunmetal armour · d dark vents · R red sensor.
+        case .cyberSentinel: return [
+            "......XRRX......",
+            "....DDDXXDDD....",
+            "...DDDDDDDDDD...",
+            "..DDDDDGGDDDDD..",
+            ".XDDDDDDDDDDDDX.",
+            "EXSSSSSSSSSSSSXE",
+            "EXVVVVVVVVVVVVXE",
+            ".XDDDDDDDDDDDDX.",
+            ".DDdDdDDDDdDdDD.",
+            "..DDdDdDDdDdDD..",
+            "...DDDDDDDDDD...",
+            "....dddddddd....",
+        ]
         case .beaconBot: return [
             ".....LLLLLL.....",
             "....BBBBBBBB....",
@@ -82,7 +98,21 @@ enum PixelGuard {
     }
 
     /// The boxy body under the head (floating bot only).
-    static let body: [String] = [
+    static var body: [String] { chosen == .cyberSentinel ? cyberBody : guardBody }
+
+    /// Armoured torso with cyan-edged pauldrons and a red core light.
+    static let cyberBody: [String] = [
+        "....dDDDDDDd....",
+        "..XXDDDGGDDDXX..",
+        ".aaXDDDDDDDDXaa.",
+        ".aa.DDDRRDDD.aa.",
+        ".aa.DDDDDDDD.aa.",
+        ".hh.dddddddd.hh.",
+        "....DDD..DDD....",
+        "...FFFF..FFFF...",
+    ]
+
+    static let guardBody: [String] = [
         ".....TTTTTT.....",
         "...TTTTTTTTTT...",
         ".AATTTGGGGTTTAA.",
@@ -105,6 +135,7 @@ enum PixelGuard {
         switch v {
         case .capGuard: return Face(eyeL: (4, 9), eyeR: (10, 9), eyeW: 2, eyeH: 2, screenX: 3...12, screenY: 8...11, mouthY: 11, blush: [(3, 11), (12, 11)])
         case .visorSentinel: return Face(eyeL: (4, 7), eyeR: (9, 7), eyeW: 3, eyeH: 1, screenX: 3...12, screenY: 6...8, mouthY: nil, blush: [])
+        case .cyberSentinel: return Face(eyeL: (3, 5), eyeR: (10, 5), eyeW: 3, eyeH: 1, screenX: 2...13, screenY: 5...5, mouthY: nil, blush: [])
         case .beaconBot: return Face(eyeL: (4, 5), eyeR: (10, 5), eyeW: 2, eyeH: 2, screenX: 2...13, screenY: 4...8, mouthY: 8, blush: [(3, 8), (12, 8)])
         }
     }
@@ -152,6 +183,12 @@ enum PixelGuard {
             case "H", "A": return rightHalf ? PixelRGBA(0xD3DCE6) : PixelRGBA(0xF5F8FB)
             case "S": return mood == .alert ? screenAlert : screen
             case "F": return rightHalf ? PixelRGBA(0x2E3746) : PixelRGBA(0x3A4556)
+            case "D": return rightHalf ? PixelRGBA(0x3A4558) : PixelRGBA(0x4B586E)
+            case "V": return mood == .alert ? PixelRGBA(0xFF4D57, 0.55) : PixelRGBA(0x22D3EE, mood == .asleep ? 0.15 : 0.45)
+            case "d": return rightHalf ? PixelRGBA(0x121822) : PixelRGBA(0x18202C)
+            case "X": return rightHalf ? PixelRGBA(0x14A8C0) : PixelRGBA(0x22D3EE)
+            case "R": return mood == .asleep ? PixelRGBA(0x5A2A30) : PixelRGBA(0xFF3B4E)
+            case "a": return rightHalf ? PixelRGBA(0x2E3746) : PixelRGBA(0x3A4556)
             default: return PixelRGBA(0xFF00FF)
             }
         }

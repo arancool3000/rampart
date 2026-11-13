@@ -32,6 +32,18 @@ public final class ProcessNode: @unchecked Sendable {
     var trust: TrustClass?
 
     public var name: String { PathUtil.basename(path) }
+    /// wms-o6: the name an Apple platform binary was shipped under, taken from its kernel-attested signing
+    /// identifier ("com.apple.curl" -> "curl"), when the file has been renamed. Lets `process`/`parent`/`ancestor`
+    /// rules recognise a copied-and-renamed interpreter or downloader. nil unless it differs from `name`.
+    public var shippedName: String? { ProcessNode.shippedName(path: path, signingID: signingID, isPlatformBinary: isPlatformBinary) }
+
+    public static func shippedName(path: String, signingID: String?, isPlatformBinary: Bool) -> String? {
+        guard isPlatformBinary, let s = signingID, s.hasPrefix("com.apple.") else { return nil }
+        let tail = String(s.dropFirst("com.apple.".count))
+        guard !tail.isEmpty, tail.count <= 64, !tail.contains("."), !tail.contains("/") else { return nil }
+        let base = PathUtil.basename(path)
+        return tail.caseInsensitiveCompare(base) == .orderedSame ? nil : tail
+    }
     public var argvText: String { ArgvText.normalise(args.isEmpty ? [path] : args) }
     public var isLive: Bool { exitDate == nil }
 

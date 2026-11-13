@@ -8,10 +8,14 @@ public struct PersistenceSnapshot: Codable, Sendable {
     public var records: [PersistenceRecord]
     /// Kinds whose source failed during this scan (e.g. sfltool timed out).
     public var incompleteKinds: [PersistenceItem.Kind]? = nil
+    /// wms-o10: tagged collectors (`attributes["collector"]`) that ran for this snapshot. A collector missing
+    /// from the baseline (older snapshot, or newly added) only seeds the baseline: its records are not "added".
+    public var collectors: [String]? = nil
 
     public init(date: Date = Date(), records: [PersistenceRecord]) {
         self.date = date; self.records = records
         self.host = ProcessInfo.processInfo.hostName
+        self.collectors = PersistenceScanner.o10CollectorIDs
     }
 
     /// Team IDs present in the baseline (used by R26 "unfamiliar developer").
@@ -35,6 +39,7 @@ public struct PersistenceSnapshot: Codable, Sendable {
 public struct PersistenceChange: Codable, Sendable, Hashable {
     public var old: PersistenceRecord
     public var new: PersistenceRecord
+    public init(old: PersistenceRecord, new: PersistenceRecord) { self.old = old; self.new = new }
 }
 
 public struct PersistenceDiff: Codable, Sendable {
@@ -57,6 +62,9 @@ public enum PersistenceDiffer {
         var d = diff(old: baseline.records, new: current.records)
         let skip = Set(current.incompleteKinds ?? [])
         if !skip.isEmpty { d.removed.removeAll { skip.contains($0.item.kind) } }
+        // A tagged collector the baseline never ran: what it finds now is the first look, not a change.
+        let known = Set(baseline.collectors ?? [])
+        d.added.removeAll { r in r.attributes["collector"].map { !known.contains($0) } ?? false }
         return d
     }
 
@@ -146,6 +154,7 @@ public struct PersistenceAssessor: Sendable {
         if c.isSuspiciousLocation { reasons.append("location: \(c.rawValue) folder") }
         if !exists && c != .system { reasons.append("file missing (dropped later or deleted)") }
         if !exists && c == .hidden { reasons.append("hidden path") }
+        if Self.isInRampartDataFolder(path) { reasons.append("location: RamPart's private data folder") }
         guard !reasons.isEmpty, !(reasons.count == 1 && reasons[0].hasPrefix("file missing")) else { return nil }
         return reasons.joined(separator: ", ")
     }
@@ -156,7 +165,12 @@ public struct PersistenceAssessor: Sendable {
         let file = PathUtil.basename(r.item.location).lowercased()
         let targets = ([r.item.target] + r.arguments.prefix(1).map { Optional($0) }).compactMap { $0 }
         let ownTarget = targets.allSatisfy { t in
-            t.hasPrefix("/Library/PrivilegedHelperTools/app.rampart.") || t.hasPrefix("/Applications/Rampart.app/Contents/")
+            // wms-o10: no "..", "." or symlink tricks ("/Applications/Rampart.app/Contents/../../../tmp/x").
+            guard !t.split(separator: "/", omittingEmptySubsequences: false).contains(where: { $0 == ".." || $0 == "." }),
+                  !t.contains("//") else { return false }
+            var st = stat()
+            if lstat(t, &st) == 0, (st.st_mode & S_IFMT) == S_IFLNK { return false }
+            return t.hasPrefix("/Library/PrivilegedHelperTools/app.rampart.") || t.hasPrefix("/Applications/Rampart.app/Contents/")
                 || t.hasPrefix("/Applications/RamPart.app/Contents/")
         }
         return (label.hasPrefix("app.rampart.") || file.hasPrefix("app.rampart.")) && ownTarget && !targets.isEmpty
@@ -174,6 +188,7 @@ public struct PersistenceAssessor: Sendable {
     func maliciousEvidence(_ r: PersistenceRecord, target t: String) -> String? {
         let c = PathClass.classify(t)
         if c.isSuspiciousLocation || c == .downloads || c == .volume || c == .translocated { return "runs from a \(c.rawValue) folder" }
+        if Self.isInRampartDataFolder(t) { return "runs from RamPart's private data folder, where RamPart never keeps programs" }
         if !FileManager.default.fileExists(atPath: t) { return "target missing" }
         if getxattr(t, "com.apple.quarantine", nil, 0, 0, 0) >= 0 { return "target carries a download quarantine flag" }
         let label = r.item.label.lowercased()
@@ -209,6 +224,7 @@ public struct PersistenceAssessor: Sendable {
     }
 
     public func assess(_ r: PersistenceRecord, previous: PersistenceRecord? = nil) -> [PersistenceFinding] {
+        if let o10 = assessO10(r, previous: previous) { return o10 }
         var out: [PersistenceFinding] = []
         let it = r.item
         switch it.kind {
@@ -247,6 +263,9 @@ public struct PersistenceAssessor: Sendable {
                     out.append(PersistenceFinding(ruleID: "R07", detail: "Job \(it.label) runs an inline \(PathUtil.basename(t)) command that \(PersistenceScanner.shellLineReason(line)!): \(line.prefix(200))", targetPath: t))
                 }
             }
+            if out.isEmpty, r.attributes["hidden"] == "1", !Self.isRampartOwn(r) {
+                out.append(PersistenceFinding(ruleID: "RP6", detail: "Job \(it.label) is defined by a plist hidden from Finder (\(it.location)).", targetPath: it.target))
+            }
             let dyld = r.environment.keys.filter { $0.hasPrefix("DYLD_") }
             if !dyld.isEmpty {
                 out.append(PersistenceFinding(ruleID: "R09", detail: "Job \(it.label) sets \(dyld.sorted().joined(separator: ", ")) = \(dyld.compactMap { r.environment[$0] }.joined(separator: ", ")).", targetPath: it.target))
@@ -274,8 +293,10 @@ public struct PersistenceAssessor: Sendable {
         case .browserExtension:
             let perms = (r.attributes["permissions"] ?? "").components(separatedBy: ",")
             let loc = r.attributes["installLocation"] ?? ""
-            if r.attributes["fromWebstore"] == "0" || loc == "4" || loc == "5" {
-                let how = loc == "4" ? "loaded unpacked (sideloaded)" : loc == "5" ? "force-installed by policy" : "installed outside the store"
+            // wms-o10: an unpacked extension loaded from the user's own project folder is a developer's, not Adload's.
+            if r.attributes["devUnpacked"] != "1", r.attributes["fromWebstore"] == "0" || loc == "4" || loc == "5" {
+                let how = loc == "4" ? "loaded unpacked (sideloaded)" : loc == "5" ? "force-installed by policy"
+                    : loc == "external" ? "installed through External Extensions" + (r.attributes["crx"].map { " from \($0)" } ?? "") : "installed outside the store"
                 out.append(PersistenceFinding(ruleID: "R20", detail: "\(it.label) [\(r.attributes["extensionID"] ?? "")] was \(how).", targetPath: nil))
             }
             let allSites = perms.contains { $0 == "<all_urls>" || $0 == "*://*/*" || $0 == "http://*/*" || $0 == "https://*/*" }

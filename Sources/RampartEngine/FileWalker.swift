@@ -64,8 +64,9 @@ public struct WalkOptions: Sendable {
     /// True if `path` is equal to or below one of `excludedPrefixes`.
     public func isExcluded(_ path: String) -> Bool {
         // RamPart's per-user data folder in ANY user's home (the root daemon's own home is /var/root).
-        if path.range(of: "/Library/Application Support/Rampart/", options: .caseInsensitive) != nil
-            || path.lowercased().hasSuffix("/library/application support/rampart") { return true }
+        // o10: anchored to a real home; it used to match the folder name anywhere (/tmp/x/Library/Application
+        // Support/Rampart/, a USB stick, ~/Downloads/...), which let malware hide from every walk.
+        if OwnData.isOwnDataDirectory(path) { return true }
         for p in excludedPrefixes where path.hasPrefix(p) {
             let pu = p.utf8.count
             if p.hasSuffix("/") || path.utf8.count == pu || path.utf8[path.utf8.index(path.utf8.startIndex, offsetBy: pu)] == UInt8(ascii: "/") {
@@ -136,7 +137,12 @@ public enum FileWalker {
                 let name = String(cString: ent.pointee.fts_name_ptr(ent))
                 let st = ent.pointee.fts_statp.pointee
                 if level > 0 && (options.excludedNames.contains(name) || options.isExcluded(path)) {
-                    fts_set(fts, ent, FTS_SKIP); stats.skipped += 1; continue
+                    fts_set(fts, ent, FTS_SKIP); stats.skipped += 1
+                    // o10: our data folders are skipped, but RamPart never stores programs there, so anything
+                    // runnable planted inside one is still visited (and not treated as own data by the scanner).
+                    if !options.excludedNames.contains(name), OwnData.isOwnDataDirectory(path),
+                       !sweepOwnData(path, cancel: cancel, stats: &stats, visit: visit) { return stats }
+                    continue
                 }
                 if options.skipDataless && st.st_flags & kSFDataless != 0 {
                     fts_set(fts, ent, FTS_SKIP); stats.skipped += 1; continue
@@ -157,6 +163,33 @@ public enum FileWalker {
             }
         }
         return stats
+    }
+}
+
+extension FileWalker {
+    /// Visits runnable-looking regular files (see `OwnData.looksRunnable`) under one of RamPart's data folders,
+    /// skipping the vault's transient `staging/` folder. Bounded. Returns false if `visit` asked to stop.
+    static func sweepOwnData(_ dir: String, cancel: ScanCancellation?, stats: inout WalkStats, visit: (WalkedFile) -> Bool) -> Bool {
+        var cpaths: [UnsafeMutablePointer<CChar>?] = [strdup(dir), nil]
+        defer { cpaths.forEach { free($0) } }
+        guard let fts = fts_open(&cpaths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nil) else { return true }
+        defer { fts_close(fts) }
+        var seen = 0
+        while let ent = fts_read(fts) {
+            seen += 1
+            if seen > 20_000 || (seen & 0xFF == 0 && cancel?.isCancelled == true) { break }
+            let info = Int32(ent.pointee.fts_info)
+            let path = String(cString: ent.pointee.fts_path)
+            if info == FTS_D, ent.pointee.fts_level == 1, String(cString: ent.pointee.fts_name_ptr(ent)).lowercased() == "staging" {
+                fts_set(fts, ent, FTS_SKIP); continue
+            }
+            guard info == FTS_F else { continue }
+            let st = ent.pointee.fts_statp.pointee
+            guard st.st_flags & kSFDataless == 0, OwnData.looksRunnable(path) else { continue }
+            stats.files += 1
+            if !visit(WalkedFile(path: path, st: st)) { return false }
+        }
+        return true
     }
 }
 

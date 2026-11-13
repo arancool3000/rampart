@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import IOKit.ps
+import RampartShared
 
 // Desktop Mode: pure logic (no SwiftUI / AppKit). This file is also compiled into rampart-selftest
 // (Sources/rampart-selftest/DesktopLogic.swift is a symlink to it), so keep it Foundation + Darwin + IOKit only.
@@ -16,8 +17,10 @@ struct LauncherApp: Codable, Hashable, Identifiable, Sendable {
 
 enum LauncherCatalog {
     /// Where apps live, in priority order (an app found earlier wins a bundle-ID tie).
+    /// o8: Apple's sealed /System copy is listed first, so a planted /Applications/Mail.app reusing com.apple.mail
+    /// loses the bundle-ID tie to the real one.
     static var defaultRoots: [String] {
-        ["/Applications", "/System/Applications", NSHomeDirectory() + "/Applications"]
+        ["/System/Applications", "/Applications", NSHomeDirectory() + "/Applications"]
     }
     /// Apps outside the usual folders that people expect in a launcher.
     static let extras = ["/System/Library/CoreServices/Finder.app"]
@@ -38,7 +41,11 @@ enum LauncherCatalog {
             guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return }
             for n in names.sorted() where !n.hasPrefix(".") {
                 let p = (dir as NSString).appendingPathComponent(n)
-                if n.lowercased().hasSuffix(".app") { add(p); continue }
+                if n.lowercased().hasSuffix(".app") {
+                    // o8: a symlinked .app is listed only when it points into one of the app folders.
+                    if (try? fm.destinationOfSymbolicLink(atPath: p)) != nil, !trustedLocation(p, roots: roots) { continue }
+                    add(p); continue
+                }
                 guard depth < maxDepth else { continue }
                 var isDir: ObjCBool = false
                 guard fm.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue,
@@ -48,6 +55,7 @@ enum LauncherCatalog {
         }
         for r in roots { walk(r, depth: 1) }
         for e in extras where fm.fileExists(atPath: e) { add(e) }
+        out = dropLookAlikes(out)
         return out.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
@@ -60,8 +68,72 @@ enum LauncherCatalog {
         if (info["LSBackgroundOnly"] as? Bool) == true || (info["LSBackgroundOnly"] as? String) == "1" { return nil }
         let file = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
         // Finder shows the file name; fall back to the bundle's display name only if the file name is empty.
-        let name = file.isEmpty ? ((info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String) ?? "App") : file
+        let raw = file.isEmpty ? ((info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String) ?? "App") : file
+        // o8: one clean line (no bidi overrides, invisible characters or line breaks), bounded.
+        let name = SafeText.line(raw, max: 80)
+        guard !name.isEmpty else { return nil }
         return LauncherApp(path: path, name: name, bundleID: info["CFBundleIdentifier"] as? String)
+    }
+}
+
+extension LauncherCatalog {
+    /// o8: well-known apps a planted bundle would imitate, with the bundle ID the real one has (prefix match).
+    static let protectedApps: [String: String] = [
+        "safari": "com.apple.safari", "finder": "com.apple.finder", "systemsettings": "com.apple.systempreferences",
+        "rampart": "app.rampart", "googlechrome": "com.google.chrome", "firefox": "org.mozilla.firefox",
+        "mail": "com.apple.mail", "messages": "com.apple.mobilesms", "keychainaccess": "com.apple.keychainaccess",
+        "terminal": "com.apple.terminal", "1password": "com.1password", "microsoftedge": "com.microsoft.edgemac",
+    ]
+
+    /// Lower-case skeleton: diacritics folded, common Cyrillic/Greek/fullwidth look-alikes mapped to Latin,
+    /// digits that pose as letters mapped, everything that isn't a letter or digit dropped.
+    static func skeleton(_ s: String) -> String {
+        let folded = s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+        let map: [Character: Character] = ["а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i", "ј": "j",
+                                           "ѕ": "s", "ԁ": "d", "һ": "h", "ӏ": "l", "ɑ": "a", "α": "a", "ο": "o", "ρ": "p", "ε": "e",
+                                           "ι": "i", "κ": "k", "ν": "v", "τ": "t", "υ": "u", "χ": "x", "ꮪ": "s", "ı": "i"]
+        var out = ""
+        for ch in folded {
+            let c = map[ch] ?? ch
+            if c.isLetter || c.isNumber { out.append(c) }
+        }
+        return out.replacingOccurrences(of: "rn", with: "m")
+    }
+
+    static func isSystemPath(_ p: String) -> Bool { p.hasPrefix("/System/") }
+
+    /// Drops non-/System apps that look like a /System app or a well-known app but carry a different bundle ID
+    /// (fake "Safari", "Sуstem Settings" with a Cyrillic у, "RamPart" from someone else).
+    static func dropLookAlikes(_ apps: [LauncherApp]) -> [LauncherApp] {
+        var refs = protectedApps
+        for a in apps where isSystemPath(a.path) { if let id = a.bundleID?.lowercased() { refs[skeleton(a.name)] = id } }
+        return apps.filter { a in
+            if isSystemPath(a.path) { return true }
+            guard let want = refs[skeleton(a.name)] else { return true }
+            let id = a.bundleID?.lowercased() ?? ""
+            return id == want || id.hasPrefix(want + ".")
+        }
+    }
+
+    /// The real location of `path` is inside one of the app folders (or /System).
+    static func trustedLocation(_ path: String, roots: [String] = defaultRoots) -> Bool {
+        guard let r = realpath(path, nil) else { return false }
+        defer { free(r) }
+        let real = String(cString: r)
+        if real.hasPrefix("/System/") { return true }
+        return roots.contains { root in
+            guard let rr = realpath(root, nil) else { return false }
+            defer { free(rr) }
+            return real.hasPrefix(String(cString: rr) + "/")
+        }
+    }
+
+    /// o8: re-checked at click time, so a bundle swapped after discovery (other bundle ID, now a symlink elsewhere,
+    /// or gone) is not launched.
+    static func stillSame(_ app: LauncherApp, roots: [String] = defaultRoots, extras: [String] = extras) -> Bool {
+        guard extras.contains(app.path) || trustedLocation(app.path, roots: roots),
+              let now = describe(appAt: app.path) else { return false }
+        return now.bundleID?.lowercased() == app.bundleID?.lowercased() && !dropLookAlikes([now]).isEmpty
     }
 }
 

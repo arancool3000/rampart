@@ -158,8 +158,8 @@ enum MediaGuardNotifications {
             }
         }
         let c = UNMutableNotificationContent()
-        c.title = a.title
-        c.body = a.body
+        c.title = SafeText.line(a.title, max: 120)   // o8: the app name inside is chosen by whoever built that app
+        c.body = SafeText.line(a.body, max: 400)
         c.threadIdentifier = category
         c.categoryIdentifier = a.canStop ? categoryStop : category
         c.userInfo = ["appID": a.appID, "route": SidebarItem.mediaGuard.rawValue]
@@ -202,7 +202,7 @@ final class MediaIndicator {
     private(set) var apps: [String] = []
     var active: Bool { camera || microphone }
     func update(_ s: MediaGuardStatus) {
-        let names = Array(Set(s.active.map(\.appName))).sorted()
+        let names = Array(Set(s.active.map { SafeText.line($0.appName, max: 40) })).sorted()
         if camera != s.cameraOn { camera = s.cameraOn }
         if microphone != s.micOn { microphone = s.micOn }
         if apps != names { apps = names }

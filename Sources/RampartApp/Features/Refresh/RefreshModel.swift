@@ -46,7 +46,9 @@ final class RefreshModel {
     /// Falls back to every decoy path in the last status when the helper predates `exclusions`.
     var cleaner: RefreshCleaner {
         let st = CatAndMouseModel.shared.status
-        return RefreshCleaner(policy: RefreshSafetyPolicy(decoyPaths: st?.exclusions ?? st?.decoys.map(\.path) ?? []))
+        // o8: without a live status, fall back to the on-disk registry + maze root (never "no decoys").
+        let live = st?.exclusions ?? st?.decoys.map(\.path)
+        return RefreshCleaner(policy: RefreshSafetyPolicy(decoyPaths: (live ?? []) + (live == nil ? RefreshSafetyPolicy.fallbackDecoyPaths() : [])))
     }
 
     // MARK: Derived

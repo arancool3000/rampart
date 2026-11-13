@@ -24,6 +24,16 @@ public enum VaultCrypto {
         (floorIterations...maximumIterations).contains(iterations) && (16...64).contains(salt.count)
     }
 
+    /// wms-fb: the master password is hashed in Unicode NFC, so "é" typed as one code point or as e + combining
+    /// accent (different keyboards, pasted text) derives the same key. Older vaults were wrapped with the raw
+    /// form; `passwordForms` gives the forms to try, canonical first.
+    public static func normalizedPassword(_ password: String) -> String { password.precomposedStringWithCanonicalMapping }
+    public static func passwordForms(_ password: String) -> [String] {
+        // Swift's String == is canonical equivalence; the KDF sees bytes, so compare UTF-8.
+        let nfc = normalizedPassword(password)
+        return Array(nfc.utf8) == Array(password.utf8) ? [nfc] : [nfc, password]
+    }
+
     public static func pbkdf2(password: String, salt: Data, iterations: Int, length: Int = 32) -> SecretKeyBytes {
         precondition(iterations > 0 && iterations <= Int(UInt32.max) && !salt.isEmpty, "PBKDF2 parameters out of range")
         var pw = Array(password.utf8)

@@ -71,24 +71,44 @@ public final class UTunDevice: TunnelPacketIO {
         name = String(cString: nameBuf)
     }
 
+    /// Packets handled per read event before yielding the queue (so a flood can't starve timers / teardown).
+    public static let maxPacketsPerEvent = 256
+
+    /// utun frame -> IP packet: the 4-byte family header must match the IP version, and the packet must hold at
+    /// least a full fixed header. Anything else (short reads, unknown families) is dropped.
+    public static func unframe(_ frame: ArraySlice<UInt8>) -> [UInt8]? {
+        guard frame.count >= 4 + 20 else { return nil }
+        let b = frame.startIndex
+        let af = UInt32(frame[b]) << 24 | UInt32(frame[b + 1]) << 16 | UInt32(frame[b + 2]) << 8 | UInt32(frame[b + 3])
+        let v = frame[b + 4] >> 4
+        guard (af == UInt32(AF_INET) && v == 4) || (af == UInt32(AF_INET6) && v == 6 && frame.count >= 4 + 40) else { return nil }
+        return Array(frame[(b + 4)...])
+    }
+
+    /// IP packet -> utun frame; nil for anything that isn't IPv4 / IPv6 (it used to be written as AF_INET).
+    public static func frame(_ packet: [UInt8]) -> [UInt8]? {
+        guard let v = packet.first.map({ $0 >> 4 }), (v == 4 && packet.count >= 20) || (v == 6 && packet.count >= 40),
+              packet.count <= 65535 + 40 else { return nil }
+        let af: UInt32 = v == 6 ? UInt32(AF_INET6) : UInt32(AF_INET)
+        return withUnsafeBytes(of: af.bigEndian) { Array($0) } + packet
+    }
+
     public func start(onPacket: @escaping ([UInt8]) -> Void) {
         let s = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        var buf = [UInt8](repeating: 0, count: 65536)
+        var buf = [UInt8](repeating: 0, count: 65536 + 4)
         s.setEventHandler { [fd] in
-            while true {
+            for _ in 0..<Self.maxPacketsPerEvent {
                 let n = read(fd, &buf, buf.count)
-                if n <= 4 { break }
-                onPacket(Array(buf[4..<n]))
+                if n < 0 { break }       // EAGAIN: drained
+                if n == 0 { break }
+                if let p = Self.unframe(buf[0..<n]) { onPacket(p) }
             }
         }
         s.resume(); source = s
     }
 
     public func write(_ packet: [UInt8]) {
-        guard let v = packet.first.map({ $0 >> 4 }) else { return }
-        let af: UInt32 = v == 6 ? UInt32(AF_INET6) : UInt32(AF_INET)
-        let hdr = withUnsafeBytes(of: af.bigEndian) { Array($0) }
-        let out = hdr + packet
+        guard let out = Self.frame(packet) else { return }
         _ = out.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
     }
 
@@ -152,10 +172,13 @@ public final class UDPSocketIO: TunnelDatagramIO {
         let s = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         var buf = [UInt8](repeating: 0, count: 65536)
         s.setEventHandler { [fd] in
-            while true {
+            // Bounded per event: a UDP flood (anyone can send to the port) must not starve the VPN queue. A
+            // zero-length datagram is skipped, not treated as "drained".
+            for _ in 0..<UTunDevice.maxPacketsPerEvent {
                 var ss = sockaddr_storage(); var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
                 let n = withUnsafeMutablePointer(to: &ss) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(fd, &buf, buf.count, 0, $0, &len) } }
-                if n <= 0 { break }
+                if n < 0 { break }
+                if n == 0 { continue }
                 if let ep = UDPSocketIO.endpoint(from: ss) { onDatagram(Array(buf[0..<n]), ep) }
             }
         }

@@ -65,6 +65,9 @@ public struct NMResponse: Codable, Sendable {
 /// Framing helpers for Chrome's stdio native messaging protocol.
 public enum NativeMessaging {
     public static let maxInbound = 64 * 1024 * 1024
+    /// wms-o3: what rampart-nmh actually accepts. The extension's largest message (checkPage) is well under
+    /// 1 MiB; Chrome's 64 MiB ceiling only gave a misbehaving sender a way to make the host allocate 64 MiB.
+    public static let hostMaxInbound = 4 * 1024 * 1024
     public static let maxOutbound = 1024 * 1024
 
     public static func frame(_ json: Data) -> Data {
@@ -82,7 +85,7 @@ public enum NativeMessaging {
     }
 
     /// Reads one framed message from a file descriptor; nil on EOF or oversize.
-    public static func readFrame(fd: Int32) -> Data? {
+    public static func readFrame(fd: Int32, maxBytes: Int = maxInbound) -> Data? {
         func readExactly(_ n: Int) -> Data? {
             var buf = [UInt8](repeating: 0, count: n); var got = 0
             while got < n {
@@ -94,7 +97,7 @@ public enum NativeMessaging {
         }
         guard let head = readExactly(4) else { return nil }
         let len = head.withUnsafeBytes { $0.load(as: UInt32.self) }
-        guard len > 0, Int(len) <= maxInbound else { return nil }
+        guard len > 0, Int(len) <= min(maxBytes, maxInbound) else { return nil }
         return readExactly(Int(len))
     }
 
@@ -107,6 +110,54 @@ public enum NativeMessaging {
             out.append(data.subdata(in: (off + 4)..<(off + 4 + len))); off += 4 + len
         }
         return out
+    }
+}
+
+/// wms-o3: validates and bounds a decoded request before WebVerdictService acts on it. The JSON comes from the
+/// extension, which relays data a hostile page shaped, so: URLs must be http(s), strings and arrays are capped,
+/// `decision` is whitelisted, `hosts` must be plain hostnames, and the id echoed back is short.
+public enum NMRequestSanitizer {
+    public static let decisions: Set<String> = ["continued", "wentBack", "dismissedBanner"]
+
+    public static func safeID(_ id: String?) -> String? {
+        guard let id, id.utf8.count <= 64 else { return nil }
+        return id
+    }
+
+    public static func isWebURL(_ s: String) -> Bool {
+        guard s.utf8.count <= 8192, let c = URLComponents(string: s), let sc = c.scheme?.lowercased(),
+              sc == "https" || sc == "http", let h = c.host, !h.isEmpty else { return false }
+        return true
+    }
+
+    /// Lowercase DNS name: letters, digits, hyphen, dots; 1-253 characters; no empty label.
+    public static func isPlainHost(_ s: String) -> Bool {
+        guard (1...253).contains(s.utf8.count), !s.hasPrefix("."), !s.hasSuffix("."), !s.contains("..") else { return false }
+        return s.utf8.allSatisfy { ($0 >= 0x61 && $0 <= 0x7a) || ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x2d || $0 == 0x2e }
+    }
+
+    static func cap(_ s: String, _ n: Int) -> String { s.count <= n ? s : String(s.prefix(n)) }
+    static func cap(_ a: [String], _ n: Int, each: Int) -> [String] { a.prefix(n).map { cap($0, each) } }
+
+    public static func clean(_ r: NMRequest) -> NMRequest? {
+        var q = r
+        if r.id != nil, safeID(r.id) == nil { return nil }
+        if let u = r.url { guard isWebURL(u) else { return nil } }
+        if let t = r.text { q.text = cap(t, 20_000) }
+        if let h = r.html { q.html = cap(h, 1_000_000) }
+        if let h = r.host { guard h.utf8.count <= 253 else { return nil }; q.host = h }
+        if let d = r.decision { guard decisions.contains(d) else { return nil } }
+        if let t = r.tamper { q.tamper = cap(t, 40, each: 300) }
+        if let hs = r.hosts { q.hosts = Array(hs.prefix(300)).map { $0.lowercased() }.filter(isPlainHost) }
+        if var s = r.signals {
+            s.title = cap(s.title, 500); s.overlayText = cap(s.overlayText, 8_000); s.visibleText = cap(s.visibleText, 20_000)
+            s.scriptSnippets = cap(s.scriptSnippets, 20, each: 8_000); s.imageAlts = cap(s.imageAlts, 60, each: 300)
+            s.externalScriptHosts = cap(s.externalScriptHosts, 60, each: 253)
+            s.forms = Array(s.forms.prefix(40)).map { var f = $0; f.action = f.action.map { cap($0, 2048) }; return f }
+            s.h1 = s.h1.map { cap($0, 300) }; s.downloadLinks = s.downloadLinks.map { cap($0, 40, each: 1000) }
+            q.signals = s
+        }
+        return q
     }
 }
 
@@ -136,7 +187,9 @@ public final class WebVerdictService: @unchecked Sendable {
         self.checker = ScamChecker(urls: URLAnalyzer(blocklists: lists, seenDomains: seenStore ?? FileSeenDomainStore(), allowlist: al))
     }
 
-    public func handle(_ req: NMRequest) -> NMResponse {
+    public func handle(_ raw: NMRequest) -> NMResponse {
+        // wms-o3: every transport (rampart-nmh had no validator; Safari has its own) goes through one cleaner.
+        guard let req = NMRequestSanitizer.clean(raw) else { return NMResponse(id: NMRequestSanitizer.safeID(raw.id), ok: false, error: "bad request") }
         let daemon = bridge?.isAvailable ?? false
         switch req.type {
         case .ping, .status:

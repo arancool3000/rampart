@@ -17,6 +17,21 @@ public struct RansomwareConfig: Sendable {
     public var sampleBytes = 64 * 1024
     public var entropyThreshold = 7.5
     public var chiSquareMax = 400.0
+    /// wms-o6 slow-and-low: one actor writing this many distinct random-looking user files within `slowWindow`
+    /// (however slowly) is still an encryption run. Catches "one file every few minutes" ransomware.
+    public var slowEncryptedCount = 25
+    public var slowWindow: TimeInterval = 4 * 3600
+    /// Across all actors that aren't the user's own signed GUI apps (one worker process per file, relaunched by a
+    /// launch item, defeats per-actor counting).
+    public var slowGlobalCount = 40
+    /// Renames that append an unfamiliar extension to the whole original name ("report.pdf.x7k2q"), counted even
+    /// when each file gets a different extension (per-file random extensions defeat R04's same-extension count).
+    public var appendRenameCount = 20
+    /// User files moved out of the protected folders into a hidden or temp folder (data held hostage without
+    /// rewriting a byte, or staged for off-machine encryption).
+    public var relocateCount = 20
+    /// Bound on every per-key table (memory under event floods).
+    public var maxKeys = 10_000
 
     public init(protectedRoots: [String]? = nil) {
         let h = PathUtil.home
@@ -41,6 +56,9 @@ public final class RansomwareDetector: @unchecked Sendable {
     private var renames: [String: [(Date, String, String)]] = [:]  // key -> (date, newExt, path)
     private var notes: [String: [(Date, String)]] = [:]           // filename -> (date, dir)
     private var writes: [String: [(Date, String)]] = [:]
+    private var slow: [String: [(Date, String)]] = [:]          // actorKey (or "*") -> distinct random outputs
+    private var appended: [String: [(Date, String)]] = [:]
+    private var relocated: [String: [(Date, String)]] = [:]
     private let lock = NSLock()
 
     public init(config: RansomwareConfig = RansomwareConfig()) { self.config = config }
@@ -107,6 +125,20 @@ public final class RansomwareDetector: @unchecked Sendable {
         }
         if !hits.isEmpty { return hits }
 
+        // R04 (wms-o6): user files moved out of the protected folders into hiding (before the in-scope guard below,
+        // which only looks at destinations inside the protected folders).
+        if e.kind == .fileRename, let dest, inScope(path), !inScope(dest), !trustedGUIActor,
+           PathClass.classify(dest).isSuspiciousLocation, !dest.contains("/.Trash/") {
+            var r = (relocated[actorKey] ?? []).filter { e.date.timeIntervalSince($0.0) <= config.renameWindow }
+            if !r.contains(where: { $0.1 == path }) { r.append((e.date, path)) }
+            relocated[actorKey] = r
+            if r.count >= config.relocateCount {
+                hits.append(RansomHit(ruleID: "R04", path: dest,
+                    detail: "\(r.count) user files were moved out of your folders into the hidden or temporary folder \(PathUtil.dirname(dest)) within \(Int(config.renameWindow)) s."))
+                relocated[actorKey] = []
+            }
+        }
+
         let written: String?
         switch e.kind {
         case .fileWrite, .fileCreate: written = path
@@ -143,6 +175,22 @@ public final class RansomwareDetector: @unchecked Sendable {
             }
         }
 
+        // R04 (wms-o6): appended unfamiliar extensions, whatever they are, and mass relocation into hiding.
+        if e.kind == .fileRename, let dest {
+            let srcName = PathUtil.basename(path), dstName = PathUtil.basename(dest)
+            let ne = PathUtil.ext(dest)
+            if dstName.count > srcName.count + 1, dstName.hasPrefix(srcName + "."), !PathUtil.ext(path).isEmpty,
+               !ne.isEmpty, !Self.commonExtensions.contains(ne.lowercased()), !Self.isAtomicSaveTemp(dest) {
+                var a = (appended[actorKey] ?? []).filter { now.timeIntervalSince($0.0) <= config.renameWindow * 5 }
+                if !a.contains(where: { $0.1 == dest }) { a.append((now, dest)) }
+                appended[actorKey] = a
+                if a.count >= config.appendRenameCount {
+                    hits.append(RansomHit(ruleID: "R04", path: dest,
+                        detail: "\(a.count) files had an unfamiliar extension appended to their full names (last: .\(ne)) within \(Int(config.renameWindow * 5)) s; ransomware often uses a different extension per file."))
+                    appended[actorKey] = []
+                }
+            }
+        }
         // R05 ransom-note pattern
         if e.kind == .fileCreate || (e.kind == .fileRename && dest != nil) {
             let name = PathUtil.basename(target)
@@ -176,12 +224,45 @@ public final class RansomwareDetector: @unchecked Sendable {
                     hits.append(RansomHit(ruleID: "R02", path: target,
                         detail: "\(enc.count) user files were written with random-looking content within \(Int(config.encryptedBurstWindow)) s (last entropy \(String(format: "%.2f", ent)) bits/byte)."))
                     encrypted[actorKey] = []
+                } else {
+                    // Slow-and-low (wms-o6): same signal over hours instead of seconds, per actor and machine-wide.
+                    for (key, need) in [(actorKey, config.slowEncryptedCount), ("*", trustedGUIActor ? Int.max : config.slowGlobalCount)] where need != Int.max {
+                        var sl = (slow[key] ?? []).filter { now.timeIntervalSince($0.0) <= config.slowWindow }
+                        if !sl.contains(where: { $0.1 == target }) { sl.append((now, target)) }
+                        if sl.count > need * 4 { sl.removeFirst(sl.count - need * 4) }
+                        slow[key] = sl
+                        if sl.count >= need {
+                            let span = max(1, Int(now.timeIntervalSince(sl.first!.0) / 60))
+                            hits.append(RansomHit(ruleID: "R02", path: target,
+                                detail: "\(sl.count) user files were rewritten with random-looking content over \(span) min\(key == "*" ? " by several processes" : ""): a slow encryption run that stays under burst limits."))
+                            slow[key] = []; slow["*"] = []; slow[actorKey] = []
+                            break
+                        }
+                    }
                 }
             }
             if let magic { headerCache[target] = magic } else if !random { headerCache[target] = nil }
             if headerCache.count > 100_000 { headerCache.removeAll(keepingCapacity: true) }
         }
+        capTables()
         return hits
+    }
+
+    private func capTables() {
+        let m = config.maxKeys
+        if writes.count > m { writes.removeAll(keepingCapacity: true) }
+        if encrypted.count > m { encrypted.removeAll(keepingCapacity: true) }
+        if renames.count > m { renames.removeAll(keepingCapacity: true) }
+        if notes.count > m { notes.removeAll(keepingCapacity: true) }
+        if appended.count > m { appended.removeAll(keepingCapacity: true) }
+        if relocated.count > m { relocated.removeAll(keepingCapacity: true) }
+        if slow.count > m { let g = slow["*"]; slow.removeAll(keepingCapacity: true); slow["*"] = g }
+    }
+
+    /// Number of keys across the per-actor tables (tests).
+    public var tableKeyCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return writes.count + encrypted.count + renames.count + notes.count + appended.count + relocated.count + slow.count
     }
 
     /// Records the current header type of existing files (so a later rewrite can be compared).

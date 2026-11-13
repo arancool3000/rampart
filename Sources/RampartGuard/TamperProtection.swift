@@ -110,6 +110,10 @@ public final class TamperDetector: @unchecked Sendable {
 
     private func holdUnload(_ d: Detection, label: String, at date: Date) {
         lock.lock(); defer { lock.unlock() }
+        // wms-o7: bootout, bootstrap, bootout again used to leave the FIRST hold in place; the bootstrap in between then
+        // counted as "reloaded" and the final bootout (the job really gone) was never reported. A hold that has already
+        // been answered by a reload is replaced by the new unload.
+        if let h = heldUnloads[label], let r = reloaded[label], r >= h.firstSeen { heldUnloads[label] = nil }
         if heldUnloads[label] == nil, heldUnloads.count < 16 {
             heldUnloads[label] = HeldUnload(detection: d, label: label, firstSeen: date, due: max(date, Date()).addingTimeInterval(updateGrace))
         }
@@ -157,6 +161,16 @@ public final class TamperDetector: @unchecked Sendable {
         }
         if paths.isProtected(p.path) { return true }
         return false
+    }
+
+    /// The installed plist of a per-user session job: the menu bar agent's in /Library/LaunchAgents, the user helper's inside
+    /// the app bundle (SMAppService). Symlinks resolved; anything elsewhere is a look-alike.
+    func isOwnSessionPlist(_ arg: String, label: String) -> Bool {
+        guard arg.hasPrefix("/"), arg.count < 4096 else { return false }
+        let cands = label == paths.agentLabel ? [paths.agentPlist] : [paths.appBundle + "/Contents/Library/LaunchAgents/\(label).plist"]
+        let a = GuardPaths.normalize((arg as NSString).resolvingSymlinksInPath).lowercased()
+        let raw = GuardPaths.normalize(arg).lowercased()
+        return cands.map { GuardPaths.normalize($0).lowercased() }.contains { $0 == a || $0 == raw }
     }
 
     /// Resolves symlinks in a path-like argument so `launchctl unload /tmp/link.plist` (link -> our plist) counts.
@@ -287,13 +301,18 @@ public final class TamperDetector: @unchecked Sendable {
         // rampart-setup.sh install / install-from reloads the per-user jobs: `launchctl bootout gui/<uid>/app.rampart.agent`
         // then `launchctl bootstrap gui/<uid> /Library/LaunchAgents/app.rampart.agent.plist`. A reload is noted here.
         if tool == "launchctl", let verb = args.dropFirst().first(where: { Self.launchctlReloadVerbs.contains($0) }) {
-            for label in Self.sessionJobLabels(paths) where args.dropFirst().contains(where: { $0.hasSuffix("/" + label) || $0 == label || $0.hasSuffix("/" + label + ".plist") }) {
-                lock.lock(); reloaded[label] = ev.date; lock.unlock()
+            // wms-o7: only a bootstrap / load of OUR plist file brings the job back. `bootstrap gui/501 /tmp/x/app.rampart.agent.plist`
+            // (a look-alike job under our label) and `kickstart` (which can't load an unloaded job) used to count as a reload.
+            if verb != "kickstart" {
+                for label in Self.sessionJobLabels(paths) where args.dropFirst().contains(where: { isOwnSessionPlist($0, label: label) }) {
+                    lock.lock(); reloaded[label] = ev.date; lock.unlock()
+                }
             }
-            _ = verb
         }
         if tool == "launchctl", args.dropFirst().contains(where: { Self.launchctlUnloadVerbs.contains($0) }), paths.isOurLabel(joined) || args.contains(where: isProtectedArg) {
-            guard dedupe("unload:\(joined)", at: ev.date) else { return [] }
+            // wms-o7: a repeat of the same bootout after a reload is a new unload, not a duplicate.
+            lock.lock(); let stamp = Self.sessionJobLabels(paths).compactMap { reloaded[$0]?.timeIntervalSince1970 }.max() ?? 0; lock.unlock()
+            guard dedupe("unload:\(joined):\(stamp)", at: ev.date) else { return [] }
             let d = detection(.unloadAttempt, severity: .critical, score: 95, title: "launchctl used against \(Product.name)", detail: joined, ev: ev, path: nil)
             // Only the per-user session jobs (menu bar agent, user helper) are held: a bootout followed by a bootstrap of the
             // same job within the grace period is an install / upgrade reloading it, not tampering. The system service
@@ -345,17 +364,23 @@ public final class TamperDetector: @unchecked Sendable {
             let own = ownPIDs()
             // hx5: `kill -9 -1` (every process the caller may signal) and `kill -- -PGID` used to be read as flags.
             var pids: [Int32] = []
-            var i = 0, endOfOptions = false, sawSignal = false
+            var i = 0, endOfOptions = false, sawSignal = false, zeroSignal = false
             while i < args.count {
                 let a = args[i]
                 if endOfOptions || !a.hasPrefix("-") { if let n = Int32(a) { pids.append(n) } }
                 else if a == "--" { endOfOptions = true }
-                else if a == "-s" || a == "-n" { i += 1; sawSignal = true }
+                else if a == "-s" || a == "-n" {
+                    if i + 1 < args.count, ["0", "SIG0", "sig0"].contains(args[i + 1]) { zeroSignal = true }
+                    i += 1; sawSignal = true
+                }
                 else if a == "-l" || a == "-L" { return false }
+                // wms-o7: signal 0 only asks "is it running?" (`kill -0 pid`, `kill -s 0 pid`); nothing is delivered.
+                else if !sawSignal, ["-0", "-SIG0", "-sig0"].contains(a) { sawSignal = true; zeroSignal = true }
                 else if let n = Int32(a), sawSignal { pids.append(n) }   // negative pid / process group after the signal
                 else { sawSignal = true }
                 i += 1
             }
+            if zeroSignal { return false }
             if pids.contains(-1) { return true }
             if pids.contains(where: { $0 < -1 }) {
                 let groups = Set(own.map { getpgid($0) }.filter { $0 > 0 })
@@ -519,7 +544,7 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
     public let clock: GuardClock
     public var tokenTTL: TimeInterval = 120
     private let lock = NSLock()
-    private var issued: [String: (uid: uid_t, expires: Date, monoExpires: TimeInterval)] = [:]
+    private var issued: [String: (uid: uid_t, expires: Date, monoExpires: TimeInterval, purposes: Set<Purpose>)] = [:]
     /// Active authenticated sessions (pause or uninstall) by uid; tamper responses exempt these actors.
     /// hx5: expiry is checked against both the wall clock and a monotonic clock, so setting the date back does not
     /// stretch a session or a token.
@@ -527,12 +552,15 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
     /// Longest pause/uninstall session the daemon will open, whatever the caller asks for.
     public var maxSessionSeconds: TimeInterval = 4 * 3600
 
-    public enum Purpose: String, Codable, Sendable { case pause, uninstall, settings }
+    public enum Purpose: String, Codable, Sendable, CaseIterable { case pause, uninstall, settings }
+    /// wms-o7: what a token from the generic "authenticate" request may be redeemed for (pause, or a settings session:
+    /// lift lockdown, restore internet, Kill Switch, settings changes). Uninstall tokens come only from requestUninstall.
+    public static let generalPurposes: Set<Purpose> = [.pause, .settings]
 
     public init(key: IntegrityKey, clock: GuardClock = .live) { self.key = key; self.clock = clock }
 
     public enum Failure: Error, Equatable, CustomStringConvertible {
-        case notAdmin, authorizationMissing, authorizationDenied(String), tokenInvalid, tokenExpired, tokenForOtherUser
+        case notAdmin, authorizationMissing, authorizationDenied(String), tokenInvalid, tokenExpired, tokenForOtherUser, tokenWrongPurpose
         public var description: String {
             switch self {
             case .notAdmin: return "an administrator account is required to turn protection off"
@@ -541,6 +569,7 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
             case .tokenInvalid: return "disable token is invalid or already used"
             case .tokenExpired: return "disable token expired; authenticate again"
             case .tokenForOtherUser: return "disable token belongs to a different user"
+            case .tokenWrongPurpose: return "this authorization was given for a different action; authenticate again for this one"
             }
         }
     }
@@ -570,11 +599,20 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
     }
 
     /// Step 1. `authorizationOK` is the outcome of `verifyExternalForm` (or true in user mode).
-    public func issueToken(peerUID: uid_t, isAdmin: Bool, authorizationOK: Bool) -> Result<String, Failure> {
+    /// wms-o7: `purposes` binds the token at issue time: `redeem` refuses (and burns) it for any other purpose, so an
+    /// authorization the user gave to, say, pause protection can't be spent on an uninstall. The daemon always passes an
+    /// explicit set; the default (every purpose) exists for callers that predate binding.
+    public func issueToken(peerUID: uid_t, isAdmin: Bool, authorizationOK: Bool,
+                           purposes: Set<Purpose> = Set(Purpose.allCases)) -> Result<String, Failure> {
+        guard !purposes.isEmpty else { return .failure(.tokenWrongPurpose) }
         guard isAdmin else { return .failure(.notAdmin) }
         guard authorizationOK else { return .failure(.authorizationMissing) }
         var nonce = [UInt8](repeating: 0, count: 16)
-        _ = SecRandomCopyBytes(kSecRandomDefault, nonce.count, &nonce)
+        if SecRandomCopyBytes(kSecRandomDefault, nonce.count, &nonce) != errSecSuccess {
+            // wms-fb: never hand out an all-zero nonce; SystemRandomNumberGenerator is also a CSPRNG.
+            var g = SystemRandomNumberGenerator()
+            for i in nonce.indices { nonce[i] = UInt8.random(in: 0...255, using: &g) }
+        }
         let expires = clock.now().addingTimeInterval(tokenTTL)
         let body = "\(nonce.map { String(format: "%02x", $0) }.joined()).\(peerUID).\(Int(expires.timeIntervalSince1970))"
         let token = body + "." + key.mac(domain: "disable-token", Data(body.utf8))
@@ -582,7 +620,7 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
         lock.lock()
         issued = issued.filter { clock.now() <= $0.value.expires && mono <= $0.value.monoExpires }   // bounded
         if issued.count >= 64 { issued.removeAll() }
-        issued[token] = (peerUID, expires, mono + tokenTTL)
+        issued[token] = (peerUID, expires, mono + tokenTTL, purposes)
         lock.unlock()
         return .success(token)
     }
@@ -598,6 +636,8 @@ public final class ProtectionDisableFlow: @unchecked Sendable {
         guard let rec = issued[token] else { return .failure(.tokenInvalid) }
         guard rec.uid == peerUID else { return .failure(.tokenForOtherUser) }   // not consumed: the right user may still redeem
         issued[token] = nil
+        // Wrong purpose: burned, not kept for later (a token is spent on the first attempt by its owner).
+        guard rec.purposes.contains(purpose) else { return .failure(.tokenWrongPurpose) }
         let mono = clock.monotonic()
         guard clock.now() <= rec.expires, mono <= rec.monoExpires else { return .failure(.tokenExpired) }
         let secs = max(0, min(sessionSeconds.isFinite ? sessionSeconds : 0, maxSessionSeconds))

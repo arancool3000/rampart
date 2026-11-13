@@ -36,6 +36,41 @@ public enum SafeFS {
         return PinnedDir(fd: fd, realPath: real)
     }
 
+    /// Creates the missing folders of `dir` (wms-o2). The deepest existing ancestor is pinned (no link anywhere in
+    /// it), then each missing component is created with mkdirat and entered with O_NOFOLLOW, so a link swapped in at
+    /// any point can't redirect the creation. Only folders created here get `owner`; protected paths are refused.
+    public static func makeParents(_ dir: String, owner: (uid_t, gid_t)?, isProtected: (String) -> Bool) throws {
+        let norm = normalizePath(dir)
+        guard norm.hasPrefix("/") else { throw RemediationError.ioError("folder must be absolute") }
+        var missing: [String] = []
+        var cur = norm
+        while cur != "/" {
+            var st = Darwin.stat()
+            if lstat(cur, &st) == 0 { break }
+            guard errno == ENOENT else { throw RemediationError.ioError("stat \(cur): \(String(cString: strerror(errno)))") }
+            missing.insert((cur as NSString).lastPathComponent, at: 0)
+            cur = (cur as NSString).deletingLastPathComponent
+        }
+        if missing.isEmpty { return }
+        guard missing.count <= 32 else { throw RemediationError.unsupported("too many missing folders") }
+        let base = try pin(cur)
+        var fd = dup(base.fd)
+        guard fd >= 0 else { throw RemediationError.ioError("dup") }
+        defer { close(fd) }
+        var path = base.realPath == "/" ? "" : base.realPath
+        for name in missing {
+            guard isPlainName(name) else { throw RemediationError.ioError("bad folder name") }
+            path += "/" + name
+            if isProtected(path) { throw RemediationError.protectedPath(path) }
+            let created = mkdirat(fd, name, 0o755) == 0
+            if !created && errno != EEXIST { throw RemediationError.ioError("create \(path): \(String(cString: strerror(errno)))") }
+            let sub = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard sub >= 0 else { throw RemediationError.ioError("\(path) is not a real folder (a link?)") }
+            close(fd); fd = sub
+            if created, let o = owner, getuid() == 0 { fchown(sub, o.0, o.1) }
+        }
+    }
+
     /// A single safe path component (no "/", not "." or "..", no NUL).
     public static func isPlainName(_ n: String) -> Bool {
         !n.isEmpty && n != "." && n != ".." && !n.contains("/") && !n.contains("\0")

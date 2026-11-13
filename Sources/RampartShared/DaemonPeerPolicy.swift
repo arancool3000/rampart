@@ -47,8 +47,31 @@ public enum DaemonPeerPolicy {
         return pid
     }
 
-    /// Default signature check for clients that are not inside the app bundle (CLI, browser): the peer's code is
-    /// valid and signed with RamPart's daemon identifier. Weak with ad-hoc signing (see the honest limit above).
+    /// wms-fa: which daemon signing identifiers a client accepts. The packaged identifier always. The development
+    /// names (`swift build` output is linker-signed "rampartd" / "rampartd-<hash>") only when the client is itself a
+    /// development build: a packaged CLI or nmh (`app.rampart.*`) used to accept any same-user binary that an attacker
+    /// had ad-hoc signed as "rampartd-x" squatting the user socket.
+    public static func daemonIdentifierAcceptable(_ ident: String, selfIdentifier: String?, peerHardened: Bool) -> Bool {
+        let packagedClient = selfIdentifier?.hasPrefix(Product.bundlePrefix + ".") == true
+        if ident == Product.bundlePrefix + ".daemon" { return !packagedClient || peerHardened }
+        return !packagedClient && (ident == "rampartd" || ident.hasPrefix("rampartd-"))
+    }
+
+    /// This process's own code-signing identifier (nil when unsigned or unreadable).
+    public static let selfIdentifier: String? = {
+        var code: SecCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return nil }
+        var st: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &st) == errSecSuccess, let st else { return nil }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(st, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let d = info as? [String: Any] else { return nil }
+        return d[kSecCodeInfoIdentifier as String] as? String
+    }()
+
+    /// Default signature check for clients that are not inside the app bundle (CLI, browser, nmh): the peer's code is
+    /// valid and signed with RamPart's daemon identifier (hardened runtime when this client is a packaged build).
+    /// Weak with ad-hoc signing (see the honest limit above).
     public static func peerLooksLikeDaemon(pid: pid_t) -> Bool {
         var code: SecCode?
         guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid: NSNumber(value: pid)] as CFDictionary, [], &code) == errSecSuccess,
@@ -58,7 +81,8 @@ public enum DaemonPeerPolicy {
         var info: CFDictionary?
         guard SecCodeCopySigningInformation(st, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
               let d = info as? [String: Any], let ident = d[kSecCodeInfoIdentifier as String] as? String else { return false }
-        return ident == Product.bundlePrefix + ".daemon" || ident == "rampartd" || ident.hasPrefix("rampartd-")   // dev builds are linker-signed "rampartd-<hash>"
+        let flags = (d[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+        return daemonIdentifierAcceptable(ident, selfIdentifier: selfIdentifier, peerHardened: flags & 0x10000 != 0)
     }
 
     /// Full check of a connected socket for CLI / browser clients. nil = trusted.

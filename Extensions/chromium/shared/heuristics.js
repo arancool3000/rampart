@@ -241,5 +241,14 @@ function localVerdict(req) {
            brand: (signals.find((s) => s.brand) || {}).brand, tips: [], fallback: true };
 }
 
-const RampartHeuristics = { localVerdict, urlSignals, pageSignalsVerdict, extraPageSignals, combine, verdictFromScore, actionFor, splitHost, registrableOf, isDeveloperHost, looksLikeShellCommand: (t) => SHELL.test(t || ""), CLICKFIX };
+/** wms-o3: may a trusted click on RamPart's in-page UI act? Not within 500 ms of the UI appearing or being
+ *  raised back on top, nor within 500 ms of the page putting something of its own into the top layer. */
+function uiClickAllowed(now, shownAt, lastForeignAt) {
+  if (typeof now !== "number" || typeof shownAt !== "number" || !isFinite(now) || !isFinite(shownAt)) return false;
+  if (now - shownAt < 500) return false;
+  if (typeof lastForeignAt === "number" && lastForeignAt >= 0 && now - lastForeignAt < 500) return false;
+  return true;
+}
+
+const RampartHeuristics = { uiClickAllowed, localVerdict, urlSignals, pageSignalsVerdict, extraPageSignals, combine, verdictFromScore, actionFor, splitHost, registrableOf, isDeveloperHost, looksLikeShellCommand: (t) => SHELL.test(t || ""), CLICKFIX };
 if (typeof globalThis !== "undefined") globalThis.RampartHeuristics = RampartHeuristics;

@@ -5,7 +5,7 @@ import Foundation
 /// hostile page shaped. Foundation only, so it can be compiled into a scratch harness and fuzzed.
 enum SafariMessageValidator {
     static let maxPayloadBytes = 2 * 1024 * 1024
-    static let allowedTypes: Set<String> = ["ping", "checkURL", "checkPage", "checkText", "checkClipboard", "allowHost", "reportDecision", "status"]
+    static let allowedTypes: Set<String> = ["ping", "checkURL", "checkPage", "checkText", "checkClipboard", "allowHost", "reportDecision", "status", "countTrackers"]
     static let allowedDecisions: Set<String> = ["continued", "wentBack", "dismissedBanner"]
 
     enum Failure: Error, Equatable { case notAnObject, tooLarge, badType, badField(String) }
@@ -44,6 +44,10 @@ enum SafariMessageValidator {
             guard let arr = t as? [Any] else { return .failure(.badField("tamper")) }
             out["tamper"] = arr.prefix(40).compactMap { $0 as? String }.map { String($0.prefix(300)) }
         }
+        if let hs = payload["hosts"] {   // wms-o3: countTrackers (was dropped, so Safari never got tracker counts)
+            guard let arr = hs as? [Any] else { return .failure(.badField("hosts")) }
+            out["hosts"] = arr.prefix(300).compactMap { $0 as? String }.map { $0.lowercased() }.filter { (1...253).contains($0.utf8.count) && $0.unicodeScalars.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" || $0 == "." } }
+        }
         if let sig = payload["signals"] {
             guard let d = sig as? [String: Any] else { return .failure(.badField("signals")) }
             out["signals"] = d    // shape is enforced by PageSignals' Decodable conformance
@@ -51,6 +55,7 @@ enum SafariMessageValidator {
         switch type {
         case "checkURL", "checkPage": if out["url"] == nil { return .failure(.badField("url")) }
         case "checkText", "checkClipboard": if out["text"] == nil { return .failure(.badField("text")) }
+        case "countTrackers": if (out["hosts"] as? [String])?.isEmpty ?? true { return .failure(.badField("hosts")) }
         case "allowHost": if out["host"] == nil { return .failure(.badField("host")) }
         default: break
         }

@@ -22,7 +22,22 @@ public final class EsloggerParser {
         public var schemaMismatches = 0
         public var lastSchemaVersion: Int?
         public var lastMessageVersion: Int?
+        /// ES messages the kernel dropped before eslogger saw them (holes in `global_seq_num`). wms-o6: a flood
+        /// that overruns the ES client queue shows up here instead of silently desynchronising lineage.
+        public var seqGaps = 0
+        /// `global_seq_num` went backwards (eslogger restarted, or lines arrived out of order).
+        public var seqResets = 0
+        /// Lines rejected before JSON decoding because they nest too deeply (stack-exhaustion guard).
+        public var tooDeep = 0
     }
+
+    /// Hard limits on attacker-influenced exec fields (argv and env come straight from the exec'ing process).
+    public static let maxArgs = 2048
+    public static let maxArgBytes = 32 * 1024
+    public static let maxArgvBytes = 512 * 1024
+    /// eslogger nests at most ~6 levels; anything far deeper is hostile or corrupt.
+    public static let maxNesting = 48
+    private var lastSeq: Int?
 
     public private(set) var stats = Stats()
     /// Drop `close` events whose `modified` flag is false (huge volume, no value for scan-on-write).
@@ -41,6 +56,7 @@ public final class EsloggerParser {
 
     public func parse(data: Data) -> SecurityEvent? {
         stats.lines += 1
+        if Self.nestsTooDeep(data, limit: Self.maxNesting) { stats.tooDeep += 1; stats.malformed += 1; return nil }
         guard let first = data.first(where: { $0 != 0x20 && $0 != 0x09 }), first == UInt8(ascii: "{"),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             stats.malformed += 1; return nil
@@ -54,14 +70,22 @@ public final class EsloggerParser {
             mismatch = true
             if strictSchema { stats.ignored += 1; return nil }
         }
-        guard let eventWrap = obj["event"] as? [String: Any], let (name, body) = eventWrap.first,
+        // Exactly one event key: an ambiguous wrapper could be read as different events by different readers.
+        guard let eventWrap = obj["event"] as? [String: Any], eventWrap.count == 1, let (name, body) = eventWrap.first,
               let ev = body as? [String: Any] else {
             stats.malformed += 1; return nil
         }
         let date = Self.parseTime(obj["time"] as? String) ?? Date()
         let actor = (obj["process"] as? [String: Any]).flatMap { Self.process($0) }
         var detail: [String: String] = ["es_event": name]
-        if let seq = Self.int(obj["global_seq_num"]) { detail["global_seq"] = String(seq) }
+        if let seq = Self.int(obj["global_seq_num"]) {
+            detail["global_seq"] = String(seq)
+            if let last = lastSeq {
+                if seq > last + 1 { let gap = seq - last - 1; stats.seqGaps += gap; detail["seq_gap"] = String(gap) }
+                else if seq <= last { stats.seqResets += 1 }
+            }
+            lastSeq = seq
+        }
         if mismatch { detail["schema_mismatch"] = "1" }
         if let actorDict = obj["process"] as? [String: Any], let cd = actorDict["cdhash"] as? String { detail["cdhash"] = cd }
 
@@ -74,7 +98,20 @@ public final class EsloggerParser {
         case "exec":
             kind = .exec
             guard let target = ev["target"] as? [String: Any], var p = Self.process(target) else { stats.malformed += 1; return nil }
-            p.args = (ev["args"] as? [Any])?.compactMap { $0 as? String } ?? []
+            p.args = Self.boundedArgs(ev["args"])
+            if let a0 = p.args.first {
+                // argv[0] is chosen by the exec'ing process; the image path is not. Record a mismatch so rules can
+                // spot a binary dressing up as another program (T1036). Login shells ("-zsh") are normal.
+                let b0 = (a0.hasPrefix("-") ? String(a0.dropFirst()) : a0).split(separator: "/").last.map(String.init) ?? ""
+                let bp = (p.path as NSString).lastPathComponent
+                if !b0.isEmpty, !bp.isEmpty, b0 != bp { detail["argv0"] = b0 }
+            }
+            // DYLD_* in the new image's environment (when eslogger reports env): code injection at exec time.
+            if let env = ev["env"] as? [Any] {
+                let dy = env.prefix(4096).compactMap { $0 as? String }.filter { $0.hasPrefix("DYLD_") }.prefix(8)
+                if !dy.isEmpty { detail["dyld_env"] = dy.map { String($0.prefix(1024)) }.joined(separator: " ") }
+            }
+            if let dp = ev["dyld_exec_path"] as? String, !dp.isEmpty, dp != p.path { detail["dyld_exec_path"] = dp }
             process = p
             path = p.path
             if let cd = target["cdhash"] as? String { detail["cdhash"] = cd }
@@ -123,6 +160,16 @@ public final class EsloggerParser {
             }
         case "unlink":
             kind = .fileDelete; path = Self.filePath(ev["target"])
+        case "link", "clone", "copyfile":
+            // A hard link, clone or copy of a file gives it a second name: reads through the new name would never
+            // match the original path (decoys, credential stores). Keep both ends.
+            kind = .other
+            path = Self.filePath(ev["source"])
+            if let tf = Self.filePath(ev["target_file"]) { dest = tf }
+            else if let dir = Self.filePath(ev["target_dir"]),
+                    let fn = (ev["target_filename"] as? String) ?? (ev["target_name"] as? String) {
+                dest = dir.hasSuffix("/") ? dir + fn : dir + "/" + fn
+            }
         case "deleteextattr":
             kind = .xattrDelete; path = Self.filePath(ev["target"])
             if let a = ev["extattr"] as? String { detail["xattr"] = a }
@@ -194,9 +241,48 @@ public final class EsloggerParser {
     }
 
     static func int(_ v: Any?) -> Int? {
-        if let n = v as? NSNumber { return n.intValue }
+        if let n = v as? NSNumber {
+            // Doubles outside Int range would trap on conversion in some paths; reject non-finite / huge values.
+            let d = n.doubleValue
+            guard d.isFinite, abs(d) < 9.0e18 else { return nil }
+            return n.intValue
+        }
         if let s = v as? String { return Int(s) }
         return nil
+    }
+
+    /// argv with hard caps on count and size (a multi-megabyte argv would otherwise flow into every rule regex).
+    static func boundedArgs(_ v: Any?) -> [String] {
+        guard let arr = v as? [Any] else { return [] }
+        var out: [String] = []
+        var total = 0
+        for a in arr.prefix(maxArgs) {
+            guard var s = a as? String else { continue }
+            if s.utf8.count > maxArgBytes { s = String(s.prefix(maxArgBytes)) }
+            total += s.utf8.count
+            if total > maxArgvBytes { break }
+            out.append(s)
+        }
+        return out
+    }
+
+    /// Cheap pre-scan: true when brackets nest deeper than `limit` (outside strings). Protects the JSON decoder
+    /// (and anything recursive after it) from a line built to exhaust the stack.
+    static func nestsTooDeep(_ data: Data, limit: Int) -> Bool {
+        var depth = 0, inString = false, escaped = false
+        for b in data {
+            if inString {
+                if escaped { escaped = false } else if b == 0x5C { escaped = true } else if b == 0x22 { inString = false }
+                continue
+            }
+            switch b {
+            case 0x22: inString = true
+            case 0x7B, 0x5B: depth += 1; if depth > limit { return true }
+            case 0x7D, 0x5D: depth -= 1
+            default: break
+            }
+        }
+        return false
     }
 
     static func process(_ d: [String: Any]) -> ProcessInfoLite? {

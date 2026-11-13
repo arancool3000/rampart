@@ -297,13 +297,14 @@ final class AIChatModel {
     func applyAction(_ p: AIProposedAction, confirmedLowering: Bool) {
         guard actionStates[p.id] == .pending || { if case .failed = actionStates[p.id] { return true }; return false }() else { return }
         // Only proposals shown in the open conversation can run (never one from another or a restored chat).
-        guard messages.contains(where: { if case .reply(let r) = $0.payload { return r.actions?.contains { $0.id == p.id } == true }; return false }) else { return }
+        // wms-o5: the exact proposal (id, action, reason) must be on a card in this conversation, and the gate re-checks it.
+        guard messages.contains(where: { if case .reply(let r) = $0.payload { return r.actions?.contains { $0 == p } == true }; return false }) else { return }
         actionStates[p.id] = .running
         let gate = gate
         let chatID = currentID
         Task { [weak self] in
             var line: String
-            do { line = try await gate.approve(p.id, confirmedLowering: confirmedLowering, executor: AppActionExecutor()) }
+            do { line = try await gate.approve(displayed: p, confirmedLowering: confirmedLowering, executor: AppActionExecutor()) }
             catch { line = "Couldn't apply “\(p.title)”: \(error)" }
             guard let self else { return }
             self.actionStates[p.id] = gate.state(p.id)

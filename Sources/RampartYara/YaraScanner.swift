@@ -59,12 +59,18 @@ extension YaraRules {
         if size == 0 {
             return [UInt8]().withUnsafeBufferPointer { scan($0, options: options, externals: externals, start: t0) }
         }
-        guard let p = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0), p != MAP_FAILED else {
-            return YaraScanResult(matches: [], timedOut: false, skippedReason: "mmap failed", bytesScanned: 0, seconds: 0)
+        // Read, don't mmap: a file mapped from disk raises SIGBUS (killing the scanner) when someone truncates it
+        // while we scan, which would let any file evade scanning by shrinking itself. Size is capped above.
+        let mem = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: size)
+        defer { mem.deallocate() }
+        var got = 0
+        while got < size {
+            let n = pread(fd, mem.baseAddress! + got, size - got, off_t(got))
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { break }
+            got += n
         }
-        defer { munmap(p, size) }
-        let buf = UnsafeBufferPointer(start: p.assumingMemoryBound(to: UInt8.self), count: size)
-        return scan(buf, options: options, externals: externals, start: t0)
+        return scan(UnsafeBufferPointer(start: mem.baseAddress, count: got), options: options, externals: externals, start: t0)
     }
 
     /// Scans an in-memory buffer.
@@ -339,7 +345,10 @@ final class ScanContext {
             return true
         case .count(let e), .percent(let e):
             guard var need = try eval(e).int else { return false }
-            if case .percent = q { need = Int64((Double(need) * Double(total) / 100.0).rounded(.up)) }
+            if case .percent = q {
+                let d = (Double(need) * Double(total) / 100.0).rounded(.up)
+                need = d.isNaN ? 0 : d >= 9.0e18 ? Int64.max : d <= -9.0e18 ? Int64.min : Int64(d)
+            }
             if need <= 0 {
                 for k in 0..<total where try test(k) { return false }
                 return true
@@ -426,8 +435,9 @@ final class ScanContext {
             case .add: return .int(x &+ y)
             case .sub: return .int(x &- y)
             case .mul: return .int(x &* y)
-            case .div: return y == 0 ? .undefined : .int(x / y)
-            case .mod: return y == 0 ? .undefined : .int(x % y)
+            // Int64.min / -1 overflows (a trap): rule arithmetic must never crash the scanner.
+            case .div: return y == 0 || (x == .min && y == -1) ? .undefined : .int(x / y)
+            case .mod: return y == 0 || (x == .min && y == -1) ? .undefined : .int(x % y)
             case .band: return .int(x & y)
             case .bor: return .int(x | y)
             case .bxor: return .int(x ^ y)
@@ -458,7 +468,8 @@ final class ScanContext {
             switch iter {
             case .range(let a, let b):
                 guard let lo = try eval(a).int, let hi = try eval(b).int else { return .bool(false) }
-                guard hi >= lo, hi - lo < 10_000_000 else { return .bool(false) }
+                let (span, overflow) = hi.subtractingReportingOverflow(lo)
+                guard hi >= lo, !overflow, span < 10_000_000 else { return .bool(false) }
                 return .bool(try quantify(q, total: Int(hi - lo + 1)) { k in
                     self.slots[slot] = lo + Int64(k)
                     return try self.eval(body).truthy
@@ -472,7 +483,7 @@ final class ScanContext {
             }
         case .variable(let slot): return .int(slots[slot])
         case .hash(let fn, let a, let b):
-            guard let off = try eval(a).int, let len = try eval(b).int, off >= 0, len >= 0, off + len <= Int64(n) else { return .undefined }
+            guard let off = try eval(a).int, let len = try eval(b).int, off >= 0, len >= 0, off <= Int64(n), len <= Int64(n) - off else { return .undefined }
             let slice = UnsafeRawBufferPointer(rebasing: UnsafeRawBufferPointer(data)[Int(off)..<Int(off + len)])
             if fn == .crc32 { return .int(crc32(slice)) }
             let key = "\(fn.rawValue):\(off):\(len)"

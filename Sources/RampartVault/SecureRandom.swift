@@ -74,4 +74,17 @@ public final class SecretKeyBytes: @unchecked Sendable {
     public func withBytes<R>(_ body: ([UInt8]) throws -> R) rethrows -> R { try lock.withLock { try body(storage) } }
     public func wipe() { lock.withLock { secureZero(&storage); storage = [] } }
     deinit { secureZero(&storage) }
+
+    /// Constant-time equality (no early exit on the first differing byte). Lengths are compared first; the
+    /// length of a key is not secret.
+    public func constantTimeEquals(_ other: SecretKeyBytes) -> Bool {
+        withBytes { a in other.withBytes { b in SecretKeyBytes.constantTimeEqual(a, b) } }
+    }
+
+    public static func constantTimeEqual(_ a: [UInt8], _ b: [UInt8]) -> Bool {
+        guard a.count == b.count else { return false }
+        var diff: UInt8 = 0
+        for i in 0..<a.count { diff |= a[i] ^ b[i] }
+        return diff == 0
+    }
 }

@@ -86,6 +86,7 @@ final class BrowserModel {
         c.suppressesIncrementalRendering = false
         c.limitsNavigationsToAppBoundDomains = false
         c.upgradeKnownHostsToHTTPS = true
+        c.applicationNameForUserAgent = UserAgentPolicy.current   // wms-o3: look like Safari, not a bare web view
         if let r = contentRules { c.userContentController.add(r) }
         return c
     }

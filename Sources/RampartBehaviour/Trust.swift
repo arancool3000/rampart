@@ -48,10 +48,20 @@ final class TrustEvaluator: @unchecked Sendable {
         lookup(path: path).1
     }
 
+    /// The signature itself is Apple's (platform binary or provider says so), wherever the file now lives.
+    func isAppleSigned(path: String, platformHint: Bool) -> Bool {
+        platformHint || lookup(path: path).0 == .apple
+    }
+
     func trust(path: String, platformHint: Bool = false, teamID: String? = nil, tierHint: String? = nil) -> TrustClass {
-        if platformHint { return .apple }
+        // wms-o6: an Apple binary copied to a temp, hidden or user folder keeps its valid Apple signature, but it is
+        // no longer "macOS doing its job": it earns no Apple discount (it is scored as unknown, by location).
+        let relocated = PathClass.isRelocatedAppleToolPath(path)
+        if platformHint && !relocated { return .apple }
         let (t, _) = lookup(path: path)
+        if t == .apple && relocated { return .unknown }
         if t != .unknown { return t }
+        if relocated && (platformHint || tierHint == "apple") { return .unknown }
         switch tierHint {
         case "apple": return .apple
         case "adHoc": return .adHoc

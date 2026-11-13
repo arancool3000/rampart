@@ -18,6 +18,11 @@ public enum EmbeddedPayload {
     public static let maxScriptBytes = 4 << 20
     /// Maximum number of payloads extracted from one script.
     public static let maxPayloads = 6
+    /// Wall-clock budget for all pattern matching on one script. ICU regexes backtrack: a crafted line with
+    /// thousands of decoder words could otherwise take minutes (catastrophic backtracking = scan DoS).
+    public static let regexBudget: TimeInterval = 1.5
+    /// Lines longer than this are clipped before the decode/run patterns run (bounds per-line backtracking).
+    static let maxMatchLine = 4096
 
     public struct Payload: Sendable {
         public var label: String
@@ -99,6 +104,9 @@ public enum EmbeddedPayload {
     public static func analyze(data head: Data, totalSize: UInt64, cap: UInt64,
                                readRange: (UInt64, Int) -> Data?) -> Result {
         var r = Result()
+        // The file may have grown between stat and read: never trust a size smaller than what we hold.
+        let totalSize = max(totalSize, UInt64(head.count))
+        let deadline = Date().addingTimeInterval(regexBudget)
         // ISO Latin-1 keeps one character per byte, so match offsets are byte offsets.
         guard let text = String(data: head, encoding: .isoLatin1), !text.isEmpty else { return r }
         let ns = text as NSString
@@ -106,36 +114,41 @@ public enum EmbeddedPayload {
         // Only the text part is pattern-matched: stop at the first NUL-heavy region.
         let textEnd = textPrefixLength(head)
         let textRange = NSRange(location: 0, length: min(textEnd, ns.length))
-        let lower = text.prefix(textEnd).lowercased()
+        // Byte-level ASCII lowercase + memmem: Swift's Character-wise String.contains over megabytes of text was
+        // the slowest step of the whole analysis (minutes on a crafted 1 MB script).
+        let lower: [UInt8] = head.prefix(textEnd).map { $0 >= 0x41 && $0 <= 0x5A ? $0 | 0x20 : $0 }
         let decoderHints = ["base64", "b64", "gunzip", "gzip", "zcat", "bzip2", "bunzip", "bzcat", "xz", "zstd", "uudecode", "openssl", "xxd",
                             "decompress", "inflate", "zlib", "atob", "marshal", "unpack", "uncompress", "fromhex", "unhexlify",
                             "lzstring", "pako", "decode64", "compression_tool", "aa extract", "begin "]
         let selfHints = ["$0", "${0}", "bash_source", "script_path", "scriptpath", "this_path", "this_file", "$me"]
-        let hasDecoder = decoderHints.contains(where: lower.contains)
-        let hasSelf = selfHints.contains(where: lower.contains)
+        let hasDecoder = decoderHints.contains { Self.containsBytes(lower, $0) }
+        let hasSelf = selfHints.contains { Self.containsBytes(lower, $0) }
         let binaryTail = textEnd < head.count || totalSize > UInt64(head.count)
         guard hasDecoder || hasSelf || binaryTail else { return r }
 
-        let shellRun = hasDecoder ? (firstMatch(shellPipeRun, ns, textRange) ?? firstMatch(shellEvalRun, ns, textRange)) : nil
-        let selfReads = hasSelf ? firstMatch(selfRead, ns, textRange) : nil
-        let langRun = hasDecoder && shellRun == nil ? (firstMatch(langInline, ns, textRange) ?? firstMatch(langTwoStep, ns, textRange)) : nil
+        // The decode/run patterns only ever span lines of text; run them on a copy whose lines are clipped.
+        let mt = clipLines(head, upTo: textEnd, max: maxMatchLine) as NSString
+        let mRange = NSRange(location: 0, length: mt.length)
+        let shellRun = hasDecoder ? (firstMatch(shellPipeRun, mt, mRange, deadline) ?? firstMatch(shellEvalRun, mt, mRange, deadline)) : nil
+        let selfReads = hasSelf ? firstMatch(selfRead, mt, mRange, deadline) : nil
+        let langRun = hasDecoder && shellRun == nil ? (firstMatch(langInline, mt, mRange, deadline) ?? firstMatch(langTwoStep, mt, mRange, deadline)) : nil
         let lookForAppended = selfReads != nil || binaryTail
 
         // Appended payload: explicit tail offset, marker line, or `exit` followed by binary.
         var appended: (offset: Int, why: String)?
-        if lookForAppended, let m = tailOffset.firstMatch(in: text, range: textRange), let n = Int(ns.substring(with: m.range(at: 2))), n > 1 {
+        if lookForAppended, let m = boundedMatches(tailOffset, mt, mRange, deadline, limit: 1).first, let n = Int(mt.substring(with: m.range(at: 2))), n > 1 {
             if let off = offsetOfLine(n, in: head), off < Int(totalSize) { appended = (off, "line \(n) onward, read by `tail` from the script itself") }
         }
-        if lookForAppended, appended == nil, let m = tailBytes.firstMatch(in: text, range: textRange), let n = UInt64(ns.substring(with: m.range(at: 1))),
+        if lookForAppended, appended == nil, let m = boundedMatches(tailBytes, mt, mRange, deadline, limit: 1).first, let n = UInt64(mt.substring(with: m.range(at: 1))),
            n > 0, n < totalSize {
             appended = (Int(totalSize - n), "the last \(n) bytes, read by `tail -c` from the script itself")
         }
-        if appended == nil, selfReads != nil, let m = namedMarker.firstMatch(in: text, range: textRange) {
-            let marker = ns.substring(with: m.range(at: 1))
+        if appended == nil, selfReads != nil, let m = boundedMatches(namedMarker, mt, mRange, deadline, limit: 1).first {
+            let marker = mt.substring(with: m.range(at: 1))
             if let off = lineAfter(marker: marker, in: ns, range: textRange) { appended = (off, "everything after the \(marker) marker") }
         }
         if lookForAppended, appended == nil {
-            for m in markerLine.matches(in: text, range: full) {
+            for m in boundedMatches(markerLine, ns, full, deadline, limit: 64) {
                 let end = lineEnd(ns, m.range)
                 if end < Int(totalSize) && isBinaryOrBlob(head, from: end) {
                     appended = (end, "everything after the \(ns.substring(with: m.range).trimmingCharacters(in: .whitespacesAndNewlines)) marker"); break
@@ -143,7 +156,7 @@ public enum EmbeddedPayload {
             }
         }
         if binaryTail, appended == nil {
-            for m in exitLine.matches(in: text, range: textRange) {
+            for m in boundedMatches(exitLine, ns, textRange, deadline, limit: 64) {
                 let end = lineEnd(ns, m.range)
                 if end < Int(totalSize), totalSize - UInt64(end) >= 64, isBinary(head, from: end) {
                     appended = (end, "binary data after an `exit` line"); break
@@ -153,7 +166,7 @@ public enum EmbeddedPayload {
 
         // Payload extraction (only when there is a reason to look: a decode/run pattern, a self-read or an appended blob).
         if let a = appended {
-            let len = Int(min(cap, totalSize - UInt64(a.offset)))
+            let len = Int(clamping: min(cap, totalSize - UInt64(a.offset)))
             var blob: Data?
             if a.offset + len <= head.count { blob = head.subdata(in: a.offset..<(a.offset + len)) }
             else { blob = readRange(UInt64(a.offset), len) }
@@ -165,15 +178,19 @@ public enum EmbeddedPayload {
             }
         }
         if shellRun != nil || langRun != nil || selfReads != nil || appended != nil {
-            for m in base64Blob.matches(in: text, range: textRange).sorted(by: { $0.range.length > $1.range.length }).prefix(maxPayloads) {
-                guard r.payloads.count < maxPayloads else { break }
+            // In-memory payload budget: at most 2 x cap across all payloads of this script (6 x 256 MB otherwise).
+            var room = Int(clamping: cap) * 2 - r.payloads.reduce(0) { $0 + $1.data.count }
+            for m in boundedMatches(base64Blob, ns, textRange, deadline, limit: 4096).sorted(by: { $0.range.length > $1.range.length }).prefix(maxPayloads) {
+                guard r.payloads.count < maxPayloads, room > 0 else { break }
                 let s = ns.substring(with: m.range)
-                if let d = Data(base64Encoded: padBase64(s)), d.count >= 16, UInt64(d.count) <= cap {
+                if let d = Data(base64Encoded: padBase64(s)), d.count >= 16, UInt64(d.count) <= cap, d.count <= room {
+                    room -= d.count
                     r.payloads.append(Payload(label: "base64 blob at byte \(m.range.location)", data: d))
                 }
             }
-            for m in uuBegin.matches(in: text, range: textRange).prefix(2) where r.payloads.count < maxPayloads {
-                if let d = uudecode(ns.substring(from: m.range.location), cap: cap), !d.isEmpty {
+            for m in boundedMatches(uuBegin, ns, textRange, deadline, limit: 2) where r.payloads.count < maxPayloads && room > 0 {
+                if let d = uudecode(ns.substring(from: m.range.location), cap: min(cap, UInt64(room))), !d.isEmpty {
+                    room -= d.count
                     r.payloads.append(Payload(label: "uuencoded block at byte \(m.range.location)", data: d))
                 }
             }
@@ -181,8 +198,8 @@ public enum EmbeddedPayload {
 
         // Evidence.
         if let run = shellRun ?? langRun {
-            let snippet = clip(ns.substring(with: run))
-            let compressed = compressionRx.firstMatch(in: snippet, range: NSRange(location: 0, length: (snippet as NSString).length)) != nil
+            let snippet = clip(mt.substring(with: run))
+            let compressed = firstMatch(compressionRx, snippet as NSString, NSRange(location: 0, length: (snippet as NSString).length), deadline.addingTimeInterval(1)) != nil
             let embedded = appended != nil || selfReads != nil || !r.payloads.isEmpty
             var score = shellRun != nil ? 45 : (compressed ? 50 : 35)
             if embedded { score += 10 }
@@ -204,8 +221,37 @@ public enum EmbeddedPayload {
 
     // MARK: helpers
 
-    static func firstMatch(_ re: NSRegularExpression, _ ns: NSString, _ range: NSRange) -> NSRange? {
-        re.firstMatch(in: ns as String, range: range)?.range
+    static func firstMatch(_ re: NSRegularExpression, _ ns: NSString, _ range: NSRange, _ deadline: Date) -> NSRange? {
+        boundedMatches(re, ns, range, deadline, limit: 1).first?.range
+    }
+
+    static func containsBytes(_ hay: [UInt8], _ needle: String) -> Bool {
+        let n = Array(needle.utf8)
+        guard !n.isEmpty, hay.count >= n.count else { return n.isEmpty }
+        return hay.withUnsafeBytes { h in n.withUnsafeBytes { memmem(h.baseAddress, h.count, $0.baseAddress, $0.count) != nil } }
+    }
+
+    /// Up to `limit` matches, abandoning the search (keeping what was found) once `deadline` passes.
+    /// `.reportProgress` makes ICU call back during a long match attempt, so a backtracking blow-up is cut off too.
+    static func boundedMatches(_ re: NSRegularExpression, _ ns: NSString, _ range: NSRange, _ deadline: Date, limit: Int) -> [NSTextCheckingResult] {
+        var out: [NSTextCheckingResult] = []
+        guard Date() < deadline, limit > 0 else { return out }
+        re.enumerateMatches(in: ns as String, options: [.reportProgress], range: range) { m, _, stop in
+            if let m { out.append(m); if out.count >= limit { stop.pointee = true; return } }
+            if Date() >= deadline { stop.pointee = true }
+        }
+        return out
+    }
+
+    /// The first `end` bytes as Latin-1 text with every line cut to at most `max` bytes (newlines kept).
+    static func clipLines(_ d: Data, upTo end: Int, max: Int) -> String {
+        var out = [UInt8](); out.reserveCapacity(min(end, d.count))
+        var col = 0
+        for i in 0..<min(end, d.count) {
+            let b = d[d.startIndex + i]
+            if b == 10 { col = 0; out.append(b) } else { if col < max { out.append(b) }; col += 1 }
+        }
+        return String(data: Data(out), encoding: .isoLatin1) ?? ""
     }
 
     static func clip(_ s: String) -> String {

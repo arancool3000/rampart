@@ -258,6 +258,9 @@ public struct ArchiveUnpacker: Sendable {
 
     private func unzip(_ path: String, size: UInt64, to out: String) throws {
         let listing = zipListing(path)
+        if listing.truncated {
+            throw ContainerUnreadable(reason: .tooManyFiles, format: .zip, detail: "member listing too long", memberNames: listing.names)
+        }
         if let totals = listing.totals {
             if totals.files > limits.maxFiles {
                 throw ContainerUnreadable(reason: .tooManyFiles, format: .zip, detail: "\(totals.files) members", memberNames: listing.names)
@@ -282,13 +285,20 @@ public struct ArchiveUnpacker: Sendable {
         }
     }
 
-    struct ZipListing { var totals: (files: Int, bytes: UInt64)?; var encrypted = false; var names: [String] = [] }
+    struct ZipListing { var totals: (files: Int, bytes: UInt64)?; var encrypted = false; var names: [String] = []; var truncated = false }
 
     /// `unzip -Z` (zipinfo) listing: totals, encryption (uppercase T/B in the 5th column) and member names.
     func zipListing(_ path: String) -> ZipListing {
-        guard let r = try? Subprocess.run("/usr/bin/unzip", ["-Z", path], timeout: 30) else { return ZipListing() }
-        return Self.parseZipInfo(String(decoding: r.stdout.prefix(4 << 20), as: UTF8.self))
+        // Bounded: a crafted central directory with millions of entries must not make the listing exhaust memory.
+        guard let r = try? BoundedProcess.run("/usr/bin/unzip", ["-Z", path], maxStdout: Self.zipListingCap(maxFiles: limits.maxFiles),
+                                              timeout: min(30, limits.timeout)) else { return ZipListing() }
+        var l = Self.parseZipInfo(String(decoding: r.stdout.prefix(4 << 20), as: UTF8.self))
+        l.truncated = r.truncated
+        return l
     }
+
+    /// Maximum `unzip -Z` output kept (about 200 bytes per member line, at least 4 MB, at most 64 MB).
+    public static func zipListingCap(maxFiles: Int) -> Int { min(64 << 20, max(4 << 20, maxFiles.multipliedReportingOverflow(by: 200).partialValue)) }
 
     static func parseZipInfo(_ s: String) -> ZipListing {
         var l = ZipListing()
@@ -420,19 +430,16 @@ public struct ArchiveUnpacker: Sendable {
                 if produced == 0 { throw ContainerUnreadable(reason: .corrupt, format: format, detail: "\((tool as NSString).lastPathComponent): \(e)") }
             }
         case .xz, .zlib:
-            guard let data = FileManager.default.contents(atPath: path) else {
-                throw ContainerUnreadable(reason: .corrupt, format: format, detail: "unreadable")
-            }
-            let body = format == .zlib ? Array(data.dropFirst(2)) : Array(data)
-            guard let outBytes = StreamInflater.inflate(body, algorithm: format == .xz ? COMPRESSION_LZMA : COMPRESSION_ZLIB,
-                                                        limit: Int(clamping: cap) + 1, allowTruncated: false) else {
-                throw ContainerUnreadable(reason: .corrupt, format: format, detail: "stream does not decompress (corrupt or truncated)")
-            }
-            if UInt64(outBytes.count) > cap {
-                throw ContainerUnreadable(reason: .bomb, format: format, detail: "expands past \(Self.mb(cap))")
-            }
-            guard FileManager.default.createFile(atPath: dest, contents: Data(outBytes), attributes: [.posixPermissions: 0o600]) else {
-                throw ContainerUnreadable(reason: .corrupt, format: format, detail: "could not write payload")
+            // Streamed file -> file in 1 MB pieces: the container (up to 2 GB) and its output (up to the cap,
+            // 4 GB) are never held in memory, and a stalled or endless stream stops at the deadline.
+            let r = StreamInflater.inflateFile(path, skip: format == .zlib ? 2 : 0, algorithm: format == .xz ? COMPRESSION_LZMA : COMPRESSION_ZLIB,
+                                               to: dest, limit: cap, deadline: Date().addingTimeInterval(limits.timeout))
+            switch r {
+            case .ok: break
+            case .overLimit: throw ContainerUnreadable(reason: .bomb, format: format, detail: "expands past \(Self.mb(cap))")
+            case .timedOut: throw ContainerUnreadable(reason: .timedOut, format: format, detail: "decompression took too long")
+            case .ioError: throw ContainerUnreadable(reason: .corrupt, format: format, detail: "unreadable or could not write payload")
+            case .corrupt: throw ContainerUnreadable(reason: .corrupt, format: format, detail: "stream does not decompress (corrupt or truncated)")
             }
         case .lzma:
             // Legacy .lzma: only bsdtar's liblzma reads it, and only when a tar is inside.
@@ -513,8 +520,10 @@ enum StreamInflater {
         return input.withUnsafeBufferPointer { src -> [UInt8]? in
             stream.src_ptr = src.baseAddress!
             stream.src_size = src.count
+            var stalls = 0
             while true {
                 stream.dst_ptr = dst; stream.dst_size = 64 << 10
+                let before = stream.src_size
                 let st = compression_stream_process(&stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
                 let produced = (64 << 10) - stream.dst_size
                 if produced > 0 { out.append(contentsOf: UnsafeBufferPointer(start: dst, count: produced)) }
@@ -523,8 +532,65 @@ enum StreamInflater {
                 case COMPRESSION_STATUS_END: return out
                 case COMPRESSION_STATUS_OK:
                     if produced == 0 && stream.src_size == 0 { return allowTruncated ? out : nil }
+                    // No progress at all: a decoder that keeps returning OK must not spin forever.
+                    if produced == 0 && stream.src_size == before { stalls += 1; if stalls > 4 { return allowTruncated && !out.isEmpty ? out : nil } } else { stalls = 0 }
                 default: return allowTruncated && !out.isEmpty ? out : nil
                 }
+            }
+        }
+    }
+}
+
+extension StreamInflater {
+    enum FileResult { case ok, overLimit, corrupt, timedOut, ioError }
+
+    /// Decompresses `path` (skipping `skip` header bytes) into a new file `dest`, writing at most `limit` bytes.
+    static func inflateFile(_ path: String, skip: Int, algorithm: compression_algorithm, to dest: String,
+                            limit: UInt64, deadline: Date) -> FileResult {
+        let inFD = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        guard inFD >= 0 else { return .ioError }
+        defer { close(inFD) }
+        let outFD = open(dest, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard outFD >= 0 else { return .ioError }
+        defer { close(outFD) }
+        let inCap = 1 << 20, outCap = 1 << 20
+        let src = UnsafeMutablePointer<UInt8>.allocate(capacity: inCap), dst = UnsafeMutablePointer<UInt8>.allocate(capacity: outCap)
+        defer { src.deallocate(); dst.deallocate() }
+        var stream = compression_stream(dst_ptr: dst, dst_size: 0, src_ptr: UnsafePointer(src), src_size: 0, state: nil)
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, algorithm) == COMPRESSION_STATUS_OK else { return .corrupt }
+        defer { compression_stream_destroy(&stream) }
+        var inOff = off_t(skip), eof = false, written: UInt64 = 0, stalls = 0
+        stream.src_size = 0
+        while true {
+            if Date() > deadline { return .timedOut }
+            if stream.src_size == 0 && !eof {
+                let n = pread(inFD, src, inCap, inOff)
+                if n < 0 { if errno == EINTR { continue }; return .ioError }
+                if n == 0 { eof = true } else { inOff += off_t(n) }
+                stream.src_ptr = UnsafePointer(src); stream.src_size = max(0, n)
+            }
+            stream.dst_ptr = dst; stream.dst_size = outCap
+            let before = stream.src_size
+            let st = compression_stream_process(&stream, eof ? Int32(COMPRESSION_STREAM_FINALIZE.rawValue) : 0)
+            let produced = outCap - stream.dst_size
+            if produced > 0 {
+                if written + UInt64(produced) > limit { return .overLimit }
+                var w = 0
+                while w < produced {
+                    let r = write(outFD, dst + w, produced - w)
+                    if r < 0 { if errno == EINTR { continue }; return .ioError }
+                    w += r
+                }
+                written += UInt64(produced)
+            }
+            switch st {
+            case COMPRESSION_STATUS_END: return written > 0 || produced > 0 ? .ok : .corrupt
+            case COMPRESSION_STATUS_OK:
+                if produced == 0 && stream.src_size == before && (eof || before > 0) {
+                    stalls += 1
+                    if stalls > 4 { return .corrupt }      // truncated or stuck stream
+                } else { stalls = 0 }
+            default: return .corrupt
             }
         }
     }

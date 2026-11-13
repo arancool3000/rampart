@@ -40,7 +40,14 @@ final class GuardService {
         paths = root ? GuardPaths() : GuardPaths.scratch(runtime.root.path)
         detector = TamperDetector(paths: paths)
         flow = (try? IntegrityKey.loadOrCreate(at: runtime.root.appendingPathComponent("guard.key").path)).map { ProtectionDisableFlow(key: $0) }
-        monitor = RemoteAccessMonitor(probe: .live())
+        // wms-o7: the live probe lists processes without signing facts, so a pinned allowance (Team IDs read when the user
+        // allowed a running tool) never matched: the approved tool was treated as an impostor and suspended, and the
+        // look-alike checks had nothing to compare. Processes are now enriched with an Apple-anchored Team ID.
+        var probe = RemoteAccessProbe.live()
+        let baseProcesses = probe.processes
+        let signingCache = ProcessSigningCache()
+        probe.processes = { signingCache.enrich(baseProcesses()) }
+        monitor = RemoteAccessMonitor(probe: probe)
         let killer = ProcessKiller()
         enforcer = RemoteAccessEnforcer(kill: { pid, sig in
             guard !ProcessKiller.isPlatformBinary(pid), ProcessKiller.identity(of: pid) != nil else { return false }
@@ -150,7 +157,9 @@ final class GuardService {
                             note: enforce ? "" : "Self-defence actions run only in the installed system service.")
     }
 
-    func requestDisable(peer: Peer, authorization: Data?) throws -> String {
+    /// wms-o7: `purposes` binds the token at issue time (generic authenticate: pause / settings; requestUninstall: uninstall).
+    func requestDisable(peer: Peer, authorization: Data?,
+                        purposes: Set<ProtectionDisableFlow.Purpose> = ProtectionDisableFlow.generalPurposes) throws -> String {
         guard let flow else { throw ServiceError.unavailable("tamper protection key") }
         var authOK = runtime.userMode
         if !authOK, let a = authorization {
@@ -163,7 +172,7 @@ final class GuardService {
                 throw ServiceError.denied("administrator authentication couldn't be verified (\(f.description)); please try again")
             }
         }
-        switch flow.issueToken(peerUID: peer.uid, isAdmin: peer.isAdmin || runtime.userMode, authorizationOK: authOK) {
+        switch flow.issueToken(peerUID: peer.uid, isAdmin: peer.isAdmin || runtime.userMode, authorizationOK: authOK, purposes: purposes) {
         case .success(let t): return t
         case .failure(let f): throw ServiceError.denied(f.description)
         }
@@ -264,4 +273,55 @@ final class GuardService {
         t.resume(); timer = t
     }
     func stop() { timer?.cancel(); timer = nil }
+}
+
+
+/// wms-o7: signing identifier and Team ID of running remote-tool processes for the remote-access monitor, cached per (pid, start
+/// time). A Team ID is reported only when the code validates against `anchor apple generic` (Developer ID, App Store or
+/// Apple): a self-signed certificate can claim any Team ID in its OU. Read-only Security.framework queries; never prompts.
+final class ProcessSigningCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cache: [Int32: (start: UInt64, signingID: String?, teamID: String?)] = [:]
+    private static let appleAnchored: SecRequirement? = {
+        var r: SecRequirement?
+        return SecRequirementCreateWithString("anchor apple generic" as CFString, [], &r) == errSecSuccess ? r : nil
+    }()
+
+    func enrich(_ procs: [ProcessInfoLite]) -> [ProcessInfoLite] {
+        var live = Set<Int32>()
+        let out = procs.map { p -> ProcessInfoLite in
+            var p = p
+            // Only processes the catalogue already matches by path (the allowance checks need them). Enriching every
+            // process would also wake the "unsigned listener" report for Homebrew / self-built dev servers.
+            guard p.signingID == nil, p.teamID == nil, RemoteToolCatalogue.identify(signingID: nil, teamID: nil, path: p.path) != nil,
+                  let start = GuardProc.info(p.pid)?.start else { return p }
+            live.insert(p.pid)
+            lock.lock(); let hit = cache[p.pid]; lock.unlock()
+            let facts: (String?, String?)
+            if let h = hit, h.start == start { facts = (h.signingID, h.teamID) }
+            else {
+                facts = Self.read(pid: p.pid)
+                lock.lock(); cache[p.pid] = (start, facts.0, facts.1); lock.unlock()
+            }
+            p.signingID = facts.0; p.teamID = facts.1
+            return p
+        }
+        lock.lock(); if cache.count > live.count + 256 { cache = cache.filter { live.contains($0.key) } }; lock.unlock()
+        return out
+    }
+
+    static func read(pid: Int32) -> (String?, String?) {
+        var code: SecCode?
+        guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid: NSNumber(value: pid)] as CFDictionary, [], &code) == errSecSuccess,
+              let code else { return (nil, nil) }
+        var st: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &st) == errSecSuccess, let st else { return (nil, nil) }
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(st, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
+              let d = info as? [String: Any] else { return (nil, nil) }
+        let sid = d[kSecCodeInfoIdentifier as String] as? String
+        var team = d[kSecCodeInfoTeamIdentifier as String] as? String
+        if team != nil, let req = appleAnchored, SecCodeCheckValidity(code, [], req) != errSecSuccess { team = nil }
+        return (sid, team)
+    }
 }

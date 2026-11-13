@@ -69,6 +69,7 @@ public enum PasteGuardDecision {
     /// B1 local ≥ 90 → block
     /// B2 AI malicious ≥ 85 confidence AND local ≥ 40 → block
     /// B3 AI malicious (any confidence) AND local malicious (≥ 70) → block
+    /// B4 no AI verdict AND local ≥ 75 → block (wms-o5: fail closed on known-bad when the AI is unavailable)
     /// W1 local ≥ 40 → warn
     /// W2 AI malicious (any confidence) → warn
     /// W3 AI suspicious with confidence ≥ 60 → warn
@@ -77,6 +78,9 @@ public enum PasteGuardDecision {
         if local >= 90 { return .init(action: .block, rule: "B1 local≥90") }
         if let ai, ai.label == .malicious, ai.confidence >= 85, local >= 40 { return .init(action: .block, rule: "B2 AI malicious≥85 & local≥40") }
         if let ai, ai.label == .malicious, localLabel(local) == .malicious { return .init(action: .block, rule: "B3 both malicious") }
+        // wms-o5: no AI opinion (off, no key, timed out, failed): known-bad local results (≥ 75, i.e. more than a
+        // plain download-and-run) still block. Fail-open must not depend on the AI being reachable.
+        if ai == nil, local >= 75 { return .init(action: .block, rule: "B4 no AI opinion & local≥75") }
         if local >= 40 { return .init(action: .warn, rule: "W1 local≥40") }
         if let ai, ai.label == .malicious { return .init(action: .warn, rule: "W2 AI malicious") }
         if let ai, ai.label == .suspicious, ai.confidence >= 60 { return .init(action: .warn, rule: "W3 AI suspicious≥60") }

@@ -102,6 +102,7 @@ public final class PersistenceScanner: @unchecked Sendable {
     /// A snapshot that remembers which kinds were incomplete, so the differ will not report them as removed.
     public func snapshot() -> PersistenceSnapshot {
         var s = PersistenceSnapshot(records: scanRecords())
+        s.collectors = Self.o10CollectorIDs
         s.incompleteKinds = Array(lastIncompleteKinds).sorted { $0.rawValue < $1.rawValue }
         return s
     }
@@ -148,6 +149,7 @@ public final class PersistenceScanner: @unchecked Sendable {
         }
         if k.contains(.sshKey) { out += sshKeys() }
         if k.contains(.other) { out += others() }
+        out += o10Records(kinds: k)          // wms-o10 collectors (tagged; see PersistenceCollectorsO10.swift)
         lastIncompleteKinds = incomplete
 
         var seen = Set<String>()
@@ -167,7 +169,12 @@ public final class PersistenceScanner: @unchecked Sendable {
         guard let names = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
         return names.filter { $0.hasSuffix(".plist") }.sorted().compactMap { n in
             let p = (dir as NSString).appendingPathComponent(n)
-            return Self.parseLaunchdPlist(path: p, kind: kind)
+            guard var r = Self.parseLaunchdPlist(path: p, kind: kind) else { return nil }
+            // wms-o10: a plist hidden from Finder (dot name or the UF_HIDDEN flag). The fingerprint is the file
+            // hash, so this attribute never makes an unchanged item look "changed".
+            var st = stat()
+            if n.hasPrefix(".") || (lstat(p, &st) == 0 && st.st_flags & UInt32(UF_HIDDEN) != 0) { r.attributes["hidden"] = "1" }
+            return r
         }
     }
 

@@ -86,3 +86,45 @@ rule Rampart_Script_Disguised_As_Document
     condition:
         uint16(0) == 0x2123 and filename matches /\.(pdf|docx?|xlsx?|pptx?|jpe?g|png|gif|heic|mp3|mp4|mov)$/i
 }
+
+// wms-o10: persistence traits in XML launchd plists (LaunchAgents/LaunchDaemons only; binary plists are covered by
+// the persistence scanner, which parses them). No family strings.
+rule Rampart_LaunchPlist_Download_Exec
+{
+    meta:
+        description = "Launch agent/daemon whose command pipes a download or a decoded blob into a shell"
+        detection = "Persistence-LaunchItem-DownloadExec"
+        category = "suspicious"
+        score = 70
+    strings:
+        $args = "<key>ProgramArguments</key>" ascii
+        $curl = "curl " ascii
+        $wget = "wget " ascii
+        $b64a = "base64 -d" ascii
+        $b64b = "base64 -D" ascii
+        $b64c = "base64 --decode" ascii
+        $p1 = "| sh" ascii
+        $p2 = "|sh" ascii
+        $p3 = "| bash" ascii
+        $p4 = "|bash" ascii
+        $p5 = "| zsh" ascii
+        $p6 = "| /bin/sh" ascii
+        $p7 = "| /bin/bash" ascii
+        $p8 = "| /bin/zsh" ascii
+    condition:
+        filesize < 262144 and filepath matches /\/Launch(Agents|Daemons)\/[^\/]+\.plist$/ and $args and any of ($curl, $wget, $b64*) and any of ($p*)
+}
+
+rule Rampart_LaunchPlist_DYLD_Insert
+{
+    meta:
+        description = "Launch agent/daemon that injects a dylib with DYLD_INSERT_LIBRARIES"
+        detection = "Persistence-LaunchItem-DylibInjection"
+        category = "suspicious"
+        score = 70
+    strings:
+        $env = "<key>EnvironmentVariables</key>" ascii
+        $dyld = "<key>DYLD_INSERT_LIBRARIES</key>" ascii
+    condition:
+        filesize < 262144 and filepath matches /\/Launch(Agents|Daemons)\/[^\/]+\.plist$/ and $env and $dyld
+}

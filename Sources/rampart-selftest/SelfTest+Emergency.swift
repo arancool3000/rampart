@@ -50,9 +50,11 @@ extension SelfTest {
         let plan = EmergencyPlanner.plan(reason, context: ctx, firewall: fw)
         check(Set(plan.map(\.kind)) == Set(EmergencyAction.Kind.allCases), "emergency plan covers all 9 actions")
         let sus = plan.first { $0.kind == .suspendProcesses }!
-        check(sus.pids == [4242, 4245], "emergency suspends only non-platform pids")
+        // wms-o7 (F4): a process merely NAMED WindowServer outside the system folders is no longer exempt (malware could
+        // pick the name). Stricter than before: it must be frozen; real RamPart and platform binaries stay spared.
+        check(sus.pids == [4242, 4245, 4246], "emergency suspends only non-platform pids")
         check(sus.protectedPIDs.contains(4243) && sus.protectedPIDs.contains(4244) && sus.protectedPIDs.contains(1), "emergency spares /bin /usr launchd")
-        check(sus.protectedPIDs.contains(4246) && sus.protectedPIDs.contains(4247) && sus.protectedPIDs.contains(4248), "emergency spares WindowServer name, RamPart, platform flag")
+        check(!sus.protectedPIDs.contains(4246) && sus.protectedPIDs.contains(4247) && sus.protectedPIDs.contains(4248), "emergency spares RamPart and platform flag, not a WindowServer look-alike")
         check(sus.commands.map(\.description).joined(separator: "|").contains("/bin/kill -STOP 4242") && sus.undoCommands.allSatisfy { $0.arguments.first == "-CONT" }, "emergency SIGSTOP dry-run commands + SIGCONT undo")
         check(plan.first { $0.kind == .quarantineFiles }!.paths == ["/Users/x/Downloads/evil.bin"], "emergency quarantines only absolute non-system files")
         let snap = plan.first { $0.kind == .snapshot }!

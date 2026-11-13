@@ -215,12 +215,32 @@ public final class VPNService {
     /// SIGTERM / Super Kill Switch: everything off, nothing left behind (routes, DNS, pf).
     public func shutdown() { queue.sync { tearDown(reason: "RamPart stopped the VPN") } }
 
-    /// At daemon start: remove DNS keys and pf rules a crashed previous run may have left.
+    /// What a live tunnel changed outside its own utun (which the kernel destroys, with its routes, when the
+    /// process dies). Written at bring-up, removed at tear-down; a leftover file means the last run crashed.
+    struct SystemState: Codable, Equatable {
+        var endpointIP: String
+        var endpointHostRoute: Bool
+    }
+    static let stateFile = "system-state.json"
+
+    /// At daemon start: remove DNS keys, pf rules and the endpoint host route a crashed previous run may have left.
+    /// (Before WMS-o9 the endpoint's host route via the old gateway survived a crash and pinned that address to a
+    /// network the Mac may since have left.)
     public func cleanupStale() {
         guard live else { return }
-        queue.sync {
-            _ = runner.run(VPNNetworkPlan.dnsDownCommand())
-            for c in VPNNetworkPlan.killSwitchUnloadCommands(token: nil) { _ = runner.run(c) }
+        queue.sync { sweepStaleState() }
+    }
+
+    /// The stale-state sweep itself (also what `cleanupStale` runs when live); exposed for self-tests with a dry runner.
+    public func sweepStaleState() {
+        _ = runner.run(VPNNetworkPlan.dnsDownCommand())
+        for c in VPNNetworkPlan.killSwitchUnloadCommands(token: nil) { _ = runner.run(c) }
+        if let st = loadJSON(SystemState.self, Self.stateFile) {
+            if st.endpointHostRoute, let ip = IPPrefix.strictLiteral(st.endpointIP) {
+                let ep = IPPrefix.format(ip)
+                _ = runner.run(VPNCommand(VPNCommand.route, ["-q", "-n", "delete", ep.contains(":") ? "-inet6" : "-inet", ep], tolerateFailure: true))
+            }
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent(Self.stateFile))
         }
     }
 
@@ -299,6 +319,7 @@ public final class VPNService {
     }
 
     private func bringUpRoutesAndDNS(_ a: Active) -> String? {
+        saveJSON(SystemState(endpointIP: a.plan.endpointIP, endpointHostRoute: a.plan.endpointCoveredByTunnel), Self.stateFile)
         if let err = run(a.plan.routeUpCommands()) { return err }
         a.routesUp = true
         if let dns = a.plan.dnsUpCommand() {
@@ -345,6 +366,7 @@ public final class VPNService {
             status.stats = a.peer.stats
         } else if status.killSwitchEngaged { releaseKillSwitch(nil) }
         active = nil
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent(Self.stateFile))
         status.phase = status.profile == nil ? .notConfigured : .disconnected
         status.connectedSince = nil
         status.killSwitchEngaged = false

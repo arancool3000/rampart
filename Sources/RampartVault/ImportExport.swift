@@ -122,12 +122,16 @@ public enum EncryptedExport {
     static let magic = Data("RAMPEXP\0".utf8)
     struct Payload: Codable { var exported: Date; var items: [VaultItem]; var folders: [VaultFolder] }
 
+    /// wms-fb: shortest export password accepted (the UI enforces the same floor; this is the library's own check).
+    public static let minimumPasswordLength = 10
+
     public static func export(items: [VaultItem], folders: [VaultFolder], password: String, iterations: Int? = nil) throws -> Data {
+        guard iterations != nil || password.count >= minimumPasswordLength else { throw VaultError.weakExportPassword }
         let iters = iterations ?? VaultCrypto.calibrateIterations()
         let salt = SecureRandom.data(16)
         var head = magic
         head.append(VaultFile.be16(1)); head.append(VaultFile.be32(UInt32(iters))); head.append(salt)
-        let key = VaultCrypto.pbkdf2(password: password, salt: salt, iterations: iters)
+        let key = VaultCrypto.pbkdf2(password: VaultCrypto.normalizedPassword(password), salt: salt, iterations: iters)
         defer { key.wipe() }
         var plain = try VaultFile.encoder.encode(Payload(exported: Date(), items: items, folders: folders))
         defer { secureZero(&plain) }
@@ -145,11 +149,13 @@ public enum EncryptedExport {
         guard (VaultCrypto.floorIterations...VaultCrypto.maximumIterations).contains(iters) else { throw VaultError.badFormat("bad parameters") }
         guard d.count <= VaultFile.maxFileBytes else { throw VaultError.badFormat("file too large") }
         let head = d.prefix(30), salt = d.subdata(in: 14..<30)
-        let key = VaultCrypto.pbkdf2(password: password, salt: salt, iterations: iters)
-        defer { key.wipe() }
-        var plain: Data
-        do { plain = try AES.GCM.open(AES.GCM.SealedBox(combined: d.suffix(from: 30)), using: VaultCrypto.symmetric(key), authenticating: head) }
-        catch { throw VaultError.wrongPassword }
+        var opened: Data?
+        for form in VaultCrypto.passwordForms(password) where opened == nil {
+            let key = VaultCrypto.pbkdf2(password: form, salt: salt, iterations: iters)
+            defer { key.wipe() }
+            opened = try? AES.GCM.open(AES.GCM.SealedBox(combined: d.suffix(from: 30)), using: VaultCrypto.symmetric(key), authenticating: head)
+        }
+        guard var plain = opened else { throw VaultError.wrongPassword }
         defer { secureZero(&plain) }
         let p: Payload
         do { p = try VaultFile.decoder.decode(Payload.self, from: plain) } catch { throw VaultError.badFormat("unreadable export contents") }

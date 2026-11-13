@@ -18,7 +18,7 @@
     xhrOpen: () => isNative(XMLHttpRequest.prototype.open),
     xhrSend: () => isNative(XMLHttpRequest.prototype.send),
     formSubmit: () => isNative(HTMLFormElement.prototype.submit),
-    clipboardWrite: () => !navigator.clipboard || isNative(navigator.clipboard.writeText) || !!window.__rampartClipboardHooked,
+    clipboardWrite: () => !navigator.clipboard || isNative(navigator.clipboard.writeText),
     inputValue: () => { const d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value"); return !d || isNative(d.get); },
     addEventListener: () => isNative(EventTarget.prototype.addEventListener),
   };

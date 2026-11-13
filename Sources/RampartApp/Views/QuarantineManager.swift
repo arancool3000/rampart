@@ -32,16 +32,12 @@ struct SandboxReport: Codable, Sendable {
 /// right-to-left override can make "gpj.app" read as "ppa.jpg") and cap length before showing them in RamPart's UI.
 enum QuarantineText {
     static func clean(_ s: String) -> String {
-        String(String.UnicodeScalarView(s.unicodeScalars.filter { c in
-            switch c.value {
-            case 0x0A, 0x09: return true
-            case 0x00...0x1F, 0x7F...0x9F, 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069, 0x061C: return false
-            default: return true
-            }
-        }))
+        // o8: same character rules as SafeText (also drops U+2028/2029 line separators, zero-width and tag
+        // characters), keeping only real line breaks and tabs.
+        String(String.UnicodeScalarView(s.unicodeScalars.filter { c in c == "\n" || c == "\t" || !SafeText.isUnsafeScalar(c) }))
     }
     static func name(_ path: String, max: Int = 60) -> String {
-        let n = clean((path as NSString).lastPathComponent).replacingOccurrences(of: "\n", with: " ")
+        let n = SafeText.line((path as NSString).lastPathComponent, max: Int.max - 1)
         guard n.count > max else { return n }
         return String(n.prefix(max - 12)) + "\u{2026}" + String(n.suffix(11))
     }

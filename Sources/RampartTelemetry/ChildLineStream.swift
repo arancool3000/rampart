@@ -39,6 +39,12 @@ public final class LineSplitter {
         return lines
     }
 
+    /// Forgets any partial line and discards bytes up to the next newline. Called after bytes were dropped
+    /// (backpressure), so the tail of a cut line is never glued onto the head of another one.
+    public func resync() {
+        buffer.removeAll(keepingCapacity: true); discarding = true
+    }
+
     /// Returns any unterminated trailing line (used at EOF).
     public func flush() -> Data? {
         defer { buffer.removeAll(); discarding = false }
@@ -58,6 +64,20 @@ public final class ChildLineStream {
     public var onExit: ((Int32, String) -> Void)?
     /// When false the child is not relaunched after it exits.
     public var restartOnExit = true
+    /// Backpressure (wms-o6): bytes read from the child but not yet split and handled are capped. When the consumer
+    /// falls behind (an attacker floods eslogger with cheap events), whole chunks are dropped and counted instead of
+    /// queueing without bound; the stream then resynchronises at the next newline and `onGap` reports the loss.
+    public var maxPendingBytes = 64 * 1024 * 1024
+    /// Called on `queue` once per contiguous run of dropped chunks, with the total bytes dropped so far.
+    public var onGap: ((Int) -> Void)?
+    private let pendingLock = NSLock()
+    private var pendingBytes = 0
+    private var dropEpoch = 0
+    private var droppedBytesSinceGap = 0
+    private var _droppedBackpressureBytes = 0
+    private var seenEpoch = 0
+    /// Total bytes dropped because the consumer could not keep up.
+    public var droppedBackpressureBytes: Int { pendingLock.withLock { _droppedBackpressureBytes } }
 
     public let queue: DispatchQueue
     private var process: Process?
@@ -107,6 +127,44 @@ public final class ChildLineStream {
         }
     }
 
+    /// Reader side: admits a chunk if the backlog stays under `maxPendingBytes`; otherwise drops it and starts a
+    /// new drop epoch so the first chunk admitted afterwards triggers a resync at exactly the right place.
+    func admit(_ n: Int) -> (Bool, Int) {
+        pendingLock.lock(); defer { pendingLock.unlock() }
+        if n > 0, pendingBytes + n > maxPendingBytes {
+            if droppedBytesSinceGap == 0 { dropEpoch += 1 }
+            droppedBytesSinceGap += n; _droppedBackpressureBytes += n
+            return (false, dropEpoch)
+        }
+        pendingBytes += n
+        droppedBytesSinceGap = 0
+        return (true, dropEpoch)
+    }
+
+    /// Queue side: returns (bytes lost before this chunk, whether to resync) the first time a new epoch is seen.
+    private func release(_ n: Int, epoch: Int) -> (Int, Bool) {
+        pendingLock.lock(); defer { pendingLock.unlock() }
+        pendingBytes -= n
+        guard epoch != seenEpoch else { return (0, false) }
+        seenEpoch = epoch
+        return (_droppedBackpressureBytes, true)
+    }
+
+    /// Test hook: feeds bytes through the same admission / resync path as the child's stdout.
+    public func simulateOutput(_ data: Data, consumerDelay: TimeInterval = 0) {
+        let (admitted, epoch) = admit(data.count)
+        guard admitted else { return }
+        queue.async {
+            if consumerDelay > 0 { Thread.sleep(forTimeInterval: consumerDelay) }
+            let (gapBytes, resync) = self.release(data.count, epoch: epoch)
+            if resync { self.splitter.resync(); self.onGap?(gapBytes) }
+            for line in self.splitter.feed(data) { self.onLine?(line) }
+        }
+    }
+
+    /// Waits until every queued chunk has been handled (tests).
+    public func drainForTest() { queue.sync {} }
+
     private func launchLocked() throws {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: executable)
@@ -121,8 +179,16 @@ public final class ChildLineStream {
         out.fileHandleForReading.readabilityHandler = { [weak self] h in
             let data = h.availableData
             guard let self else { return }
+            // Admission control: never let unprocessed output grow without bound.
+            let (admitted, epoch) = self.admit(data.count)
+            guard admitted else { return }
             self.queue.async {
+                let (gapBytes, resync) = self.release(data.count, epoch: epoch)
                 guard gen == self.generation else { return }
+                if resync {
+                    self.splitter.resync()
+                    self.onGap?(gapBytes)
+                }
                 if data.isEmpty {
                     h.readabilityHandler = nil
                     if let rest = self.splitter.flush() { self.onLine?(rest) }

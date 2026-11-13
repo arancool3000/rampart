@@ -154,8 +154,9 @@ final class Runtime {
         for home in Util.homeDirectories() {
             paths += ["Downloads", "Desktop", "Documents", "Applications", "Library/LaunchAgents",
                       "Library/Application Support", ".local/bin"].map { home + "/" + $0 }
+            paths += ScanOptions.persistenceRoots(home: home)   // wms-o10: helpers, plug-in folders, hidden home folders
         }
-        return paths.filter { FileManager.default.fileExists(atPath: $0) }
+        return Array(NSOrderedSet(array: paths.filter { FileManager.default.fileExists(atPath: $0) })) as? [String] ?? paths
     }
 
     /// Paths watched for on-write scanning.

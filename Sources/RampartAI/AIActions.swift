@@ -26,12 +26,16 @@ public enum AIAction: Hashable, Codable, Sendable {
             case .blockTrackers: return "tracker blocking"
             }
         }
-        /// Turning these OFF lowers protection (developer mode is the reverse: turning it ON lowers it).
+        /// Turning these OFF lowers protection (developer and learning mode are the reverse: turning them ON lowers it).
+        /// wms-o5: kept in step with the root daemon's `IPCAuthz.settingsWeaken` (a selftest compares every toggle).
+        /// Before, learning mode on, the daily quick scan off and tracker blocking off were "harmless" here while the
+        /// daemon counted them as weakening, so injected text could get them proposed as a one-click, non-red card.
         func lowers(_ on: Bool) -> Bool {
             switch self {
-            case .developerMode: return on
-            case .realtimeOn, .autoQuarantine, .scanArchives, .autoUpdate, .webProtection, .notifyThreats, .ransomwareCanaries: return !on
-            case .scheduledQuickScan, .notifyInfo, .learningMode, .blockTrackers: return false
+            case .developerMode, .learningMode: return on
+            case .realtimeOn, .autoQuarantine, .scanArchives, .autoUpdate, .webProtection, .notifyThreats, .ransomwareCanaries,
+                 .scheduledQuickScan, .blockTrackers: return !on
+            case .notifyInfo: return false
             }
         }
     }
@@ -110,6 +114,7 @@ public enum AIAction: Hashable, Codable, Sendable {
         case .addExclusion: return "Files in this folder will no longer be scanned. Malware placed there won't be detected."
         case .remoteLockdown: return "Other devices could connect to this Mac remotely again."
         case .setToggle(.developerMode, _): return "Developer mode relaxes some heuristics and can hide real threats."
+        case .setToggle(.learningMode, _): return "Learning mode holds back behaviour alerts while it learns, so a real threat could go unreported."
         case .setToggle(let t, _): return "This turns off \(t.label), which lowers your protection."
         default: return "This lowers your protection."
         }
@@ -220,6 +225,25 @@ public enum AIActionValidator {
         return out
     }
 
+    /// wms-o5: RampartAI's copy of the root daemon's `IPCAuthz.settingsWeaken` (rampartd can't be imported here; a
+    /// selftest checks the two agree). The executor refuses a settings write that weakens protection unless the
+    /// approved action itself was flagged as lowering, so no unflagged card can ever weaken anything.
+    public static func settingsWeaken(old: RampartSettings, new: RampartSettings) -> Bool {
+        if old.realtimeOn && !new.realtimeOn { return true }
+        if old.autoQuarantine && !new.autoQuarantine { return true }
+        if old.scanArchives && !new.scanArchives { return true }
+        if old.scheduledQuickScan && !new.scheduledQuickScan { return true }
+        if old.notifyThreats && !new.notifyThreats { return true }
+        if old.webProtection && !new.webProtection { return true }
+        if old.autoUpdate && !new.autoUpdate { return true }
+        if old.blockTrackers && !new.blockTrackers { return true }
+        if !old.learningMode && new.learningMode { return true }
+        if !old.developerMode && new.developerMode { return true }
+        if old.ransomwareCanaries && !new.ransomwareCanaries { return true }
+        if !Set(new.exclusions).isSubset(of: Set(old.exclusions)) { return true }
+        return false
+    }
+
     static func current(_ t: AIAction.Toggle, _ s: RampartSettings) -> Bool {
         switch t {
         case .realtimeOn: return s.realtimeOn
@@ -294,21 +318,25 @@ public final class AIActionGate: @unchecked Sendable {
     public func state(_ id: UUID) -> State? { lock.lock(); defer { lock.unlock() }; return states[id] }
 
     public enum ApproveError: Error, Equatable, CustomStringConvertible {
-        case unknown, notPending, needsConfirmation, expired
+        case unknown, notPending, needsConfirmation, expired, mismatch
         public var description: String {
             switch self {
             case .unknown: return "this suggestion isn't from the current conversation"
             case .notPending: return "this suggestion was already handled"
             case .needsConfirmation: return "it needs your confirmation first"
             case .expired: return "this suggestion expired. Ask again to get a fresh one"
+            case .mismatch: return "the change shown on the card doesn't match the suggestion, so nothing was changed"
             }
         }
     }
 
     /// Claims a proposal for execution (pending or failed -> running). Throws if it can't run.
-    private func claim(_ id: UUID, confirmedLowering: Bool) throws -> AIProposedAction {
+    private func claim(_ id: UUID, displayed: AIProposedAction?, confirmedLowering: Bool) throws -> AIProposedAction {
         lock.lock(); defer { lock.unlock() }
         guard let p = proposals[id] else { throw ApproveError.unknown }
+        // wms-o5: the click is bound to the exact card the user saw (action, value and reason). A card whose content
+        // differs from the registered proposal (a forged or edited copy reusing the id) is refused and nothing runs.
+        if let d = displayed, d != p { states[id] = .dismissed; throw ApproveError.mismatch }
         var runnable = states[id] == .pending
         if case .failed = states[id] { runnable = true }
         guard runnable else { throw ApproveError.notPending }
@@ -322,7 +350,17 @@ public final class AIActionGate: @unchecked Sendable {
     /// Runs an action after the user's click. Returns the result line.
     @discardableResult
     public func approve(_ id: UUID, confirmedLowering: Bool, executor: AIActionExecutor) async throws -> String {
-        let p = try claim(id, confirmedLowering: confirmedLowering)
+        try await run(try claim(id, displayed: nil, confirmedLowering: confirmedLowering), executor: executor)
+    }
+
+    /// wms-o5: approval bound to the proposal exactly as displayed. The app calls only this one.
+    @discardableResult
+    public func approve(displayed: AIProposedAction, confirmedLowering: Bool, executor: AIActionExecutor) async throws -> String {
+        try await run(try claim(displayed.id, displayed: displayed, confirmedLowering: confirmedLowering), executor: executor)
+    }
+
+    private func run(_ p: AIProposedAction, executor: AIActionExecutor) async throws -> String {
+        let id = p.id
         do {
             let r = try await executor.execute(p.action)
             finish(id, .done(r))

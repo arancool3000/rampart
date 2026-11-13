@@ -5,6 +5,9 @@
 #   SKIP_DMG=1 SKIP_PKG=1 scripts/build.sh
 #   SIGN_ID="Rampart Local Signing" scripts/build.sh   (default: that identity if present, else ad-hoc)
 set -euo pipefail
+# wms-fc: predictable build environment; group/other can never write to anything that ends up in the bundle.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin; export PATH
+umask 022
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 # --quick: app bundle only (no DMG/PKG). Use for day-to-day builds; the full run is only needed for releases.
@@ -100,6 +103,10 @@ codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --identifier a
 [ -x "$APP/Contents/Helpers/rampart-lure" ] && codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --identifier app.rampart.lure "$APP/Contents/Helpers/rampart-lure"
 codesign --force --options runtime --timestamp=none -s "$SIGN_ID" --entitlements Packaging/Rampart.entitlements "$APP"
 codesign --verify --strict --verbose=1 "$APP"
+# Supply-chain hygiene: the bundle must contain no symlinks / hard links (rampart-setup.sh refuses them) and no
+# group/other-writable files; record the code hashes next to the artefacts.
+BADLINK="$(find "$APP" \( -type l -o \( -type f -links +1 \) \) -print -quit)"; [ -z "$BADLINK" ] || { echo "bundle contains a link: $BADLINK" >&2; exit 1; }
+BADPERM="$(find "$APP" -perm +022 -print -quit)"; [ -z "$BADPERM" ] || { echo "bundle has group/other-writable entry: $BADPERM" >&2; exit 1; }
 "$APP/Contents/MacOS/rampartd" --version
 "$APP/Contents/Helpers/rampart" version
 # Never launch the GUI here; just make sure the bundle's main executable is the app, not a helper.
@@ -135,4 +142,7 @@ if [ -z "${SKIP_PKG:-}" ]; then
   echo "pkg ok: $DIST/$APP_NAME.pkg ($(wc -l < "$DIST/pkg-files.txt" | tr -d ' ') payload entries)"
 fi
 
+echo "==> checksums"
+{ echo "# SHA-256 of the release artefacts ($VERSION $BUILD); app cdhash: $(codesign -dvvv "$APP" 2>&1 | sed -n 's/^CDHash=//p' | head -1)"
+  for f in "$DIST/$APP_NAME.dmg" "$DIST/$APP_NAME.pkg"; do [ -f "$f" ] && shasum -a 256 "$f"; done; } > "$DIST/SHA256SUMS.txt" || true
 echo "==> done: $APP${SKIP_DMG:+}  $( [ -z "${SKIP_DMG:-}" ] && echo "$DIST/$APP_NAME.dmg")  $( [ -z "${SKIP_PKG:-}" ] && echo "$DIST/$APP_NAME.pkg")"

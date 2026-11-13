@@ -70,7 +70,8 @@ public struct PackedMachODetector: FileDetector {
                 let o = 8 + i * stride
                 guard o + stride <= b.count else { break }
                 let cpu = be32(b, o)
-                let off = is64 ? Int(be64(b, o + 8)) : Int(be32(b, o + 8))
+                // A crafted fat64 header can declare any 64-bit offset: never convert it with a trapping Int().
+                guard let off = is64 ? Int(exactly: be64(b, o + 8)) : Int(be32(b, o + 8)), off < Int(Int32.max) else { continue }
                 if chosen == nil || cpu == 0x0100000C { chosen = off }
             }
             guard let c = chosen else { return nil }
@@ -139,7 +140,9 @@ public struct PackedMachODetector: FileDetector {
         }
         if let (o, n) = textRange, n > 0 {
             let len = Int(min(n, 4 << 20))
-            if let d = read(sliceOffset + o, len), !d.isEmpty {
+            // Offsets come from the file: an overflowing sum is malformed, not a reason to trap.
+            let (start, overflow) = sliceOffset.addingReportingOverflow(o)
+            if !overflow, start < UInt64(Int64.max), let d = read(start, len), !d.isEmpty {
                 a.textBytes = d.count
                 a.textEntropy = entropy(d)
             }

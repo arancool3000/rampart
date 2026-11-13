@@ -300,15 +300,29 @@ enum Emergency {
         if let d = try? JSONEncoder.rampart.encode(st) { p.broadcastEmergency(d) }
         logInfo("emergency notice: \(kind.rawValue) — \(EmergencyNotice.text(st, kind: kind.rawValue).title)")
         lastNotice = (kind.rawValue, Date())
-        if p.subscriberCount == 0 { launchAppForNotice() }
+        // wms-o7: the app used to be started only when nobody was subscribed. Any local program can subscribe to the
+        // event feed (or keep a connection open), so a script that killed the app and held a subscription made every
+        // lockdown notice silent. The decision no longer depends on who is listening: whenever the user must hear about
+        // it, the agent is started (kickstart of a running job does nothing) and re-loaded if it was booted out.
+        if getuid() == 0, !Privileged.noPrivilegedTools { launchAppForNotice(kind) }
     }
     nonisolated(unsafe) static var lastNotice: (kind: String, date: Date)?
 
-    private static func launchAppForNotice() {
-        guard getuid() == 0, !Privileged.noPrivilegedTools else { return }
-        let uid = consoleUID()
-        guard uid != 0 else { return }
-        _ = run([GuardCommand("/bin/launchctl", ["kickstart", "gui/\(uid)/app.rampart.agent"], acceptableExitCodes: [3, 113], note: "start the app to show the lockdown notice")])
+    /// Commands that bring the menu bar agent up for a notice (empty: no console user).
+    static func noticeLaunchCommands(kind: NoticeKind, uid: uid_t, agentPlist: String = GuardPaths.standard.agentPlist) -> [GuardCommand] {
+        guard uid != 0 else { return [] }
+        let job = "gui/\(uid)/\(Product.agentLabel)"
+        return [GuardCommand("/bin/launchctl", ["kickstart", job], acceptableExitCodes: [3, 113], note: "start the app to show the lockdown notice"),
+                GuardCommand("/bin/launchctl", ["bootstrap", "gui/\(uid)", agentPlist], acceptableExitCodes: [5, 17, 37], note: "re-load the agent if it was booted out"),
+                GuardCommand("/bin/launchctl", ["kickstart", job], acceptableExitCodes: [3, 113], note: "start it")]
+    }
+
+    private static func launchAppForNotice(_ kind: NoticeKind) {
+        let cmds = noticeLaunchCommands(kind: kind, uid: consoleUID())
+        guard let first = cmds.first else { return }
+        // Already loaded: one kickstart is enough. Not loaded (exit 113): bootstrap our plist, then kickstart.
+        if runCapture(first).0 == 0 { return }
+        _ = run(Array(cmds.dropFirst()))
     }
 
 

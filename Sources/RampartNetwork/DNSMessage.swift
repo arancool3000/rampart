@@ -83,7 +83,24 @@ public struct DNSMessage: Sendable {
 
     /// EDNS0 UDP payload size advertised in an OPT record, if any.
     public var ednsPayloadSize: Int? {
-        additionals.first(where: { $0.type == DNSType.opt }).map { max(512, Int($0.rclass)) }
+        // o4: clamp to 512...4096 (RFC 6891 / DNS flag day 2020); a client asking for 65,535 gets 4096.
+        additionals.first(where: { $0.type == DNSType.opt }).map { min(4096, max(512, Int($0.rclass))) }
+    }
+
+    /// True when the client's OPT record sets the DNSSEC OK bit.
+    public var dnssecOK: Bool {
+        additionals.first(where: { $0.type == DNSType.opt }).map { $0.ttl & 0x8000 != 0 } ?? false
+    }
+
+    /// o4: structural checks a standard query must pass (RFC 6891 6.1.1: at most one OPT, only in the additional
+    /// section, owned by the root). Queries carrying answer/authority records are refused as well: they are never
+    /// needed for opcode 0 and only give an attacker more bytes to smuggle upstream.
+    public var isWellFormedQuery: Bool {
+        guard answers.isEmpty, authorities.isEmpty else { return false }
+        let opts = additionals.filter { $0.type == DNSType.opt }
+        guard opts.count <= 1 else { return false }
+        if let o = opts.first, !o.name.isEmpty { return false }
+        return true
     }
 
     public static func parse(_ data: Data) throws -> DNSMessage {
@@ -242,6 +259,21 @@ public enum DNSWire {
         return nil
     }
 
+    /// o4: the query RamPart sends upstream for `query`. It is rebuilt from the question alone (the client's other
+    /// records, EDNS options such as Client Subnet, and odd header bits are never forwarded). RD is set, CD is
+    /// cleared so the upstream always validates DNSSEC (a client-set CD would accept answers the upstream rejected),
+    /// and, if the client sent EDNS, a fresh OPT advertises 4096 bytes keeping only the client's DO bit.
+    public static func upstreamQuery(for query: DNSMessage) -> Data {
+        var m = DNSMessage(id: query.id, flags: 0x0100)
+        m.questions = Array(query.questions.prefix(1))
+        // OPT only when the client spoke EDNS (RFC 6891 7: no OPT in a reply to a query without one).
+        if query.additionals.contains(where: { $0.type == DNSType.opt }) {
+            m.additionals = [DNSResourceRecord(name: "", type: DNSType.opt, rclass: 4096,
+                                               ttl: query.dnssecOK ? 0x8000 : 0, rdata: Data())]
+        }
+        return m.serialize()
+    }
+
     /// Builds a standard recursive query.
     public static func buildQuery(name: String, type: UInt16, id: UInt16 = UInt16.random(in: 0...UInt16.max)) -> Data {
         var m = DNSMessage(id: id, flags: 0x0100)
@@ -298,5 +330,112 @@ public enum DNSWire {
         r.flags |= 0x0200
         r.questions = Array(query.questions.prefix(1))
         return r.serialize()
+    }
+}
+
+
+/// o4: DNS-rebinding guard. A public name must never resolve to this Mac, the LAN or link-local space, otherwise
+/// a web page can rename itself to 127.0.0.1 / 192.168.x.x and talk to local services (routers, dev servers,
+/// RamPart-local ports) with the page's own origin. Private answers from the public DoH upstream are stripped
+/// unless the name is a local-only name or a well-known developer "points at localhost" domain, or the user
+/// allowlisted it.
+public enum DNSRebindGuard {
+    /// Local-only suffixes (RFC 6761/6762/8375 and common LAN names) plus developer domains that resolve to
+    /// loopback/LAN on purpose (no false positives for the user's own dev tools).
+    public static let exemptSuffixes: [String] = [
+        "localhost", "local", "lan", "home.arpa", "internal", "localdomain", "home", "corp", "intranet", "private",
+        "in-addr.arpa", "ip6.arpa", "plex.direct", "lvh.me", "localtest.me", "nip.io", "sslip.io",
+        "localhost.direct", "traefik.me", "ts.net",
+    ]
+
+    public static func isExempt(_ rawName: String) -> Bool {
+        let name = DNSWire.normalize(rawName)
+        if !name.contains(".") { return true }   // single-label names are local by definition
+        return exemptSuffixes.contains { name == $0 || name.hasSuffix("." + $0) }
+    }
+
+    /// Loopback, unspecified, RFC 1918, link-local, multicast/reserved, ULA/site-local, and IPv4 embedded in
+    /// mapped/compatible/NAT64 IPv6 forms. CGNAT (100.64/10) is not included: VPN overlays use it for public names.
+    public static func isPrivate(_ b: [UInt8]) -> Bool {
+        if b.count == 4 {
+            switch b[0] {
+            case 0, 10, 127: return true
+            case 169: return b[1] == 254
+            case 172: return b[1] & 0xF0 == 16
+            case 192: return b[1] == 168 || (b[1] == 0 && b[2] == 0)
+            default: return b[0] >= 224
+            }
+        }
+        guard b.count == 16 else { return true }
+        if b.allSatisfy({ $0 == 0 }) { return true }                                   // ::
+        if b[0..<15].allSatisfy({ $0 == 0 }) && b[15] == 1 { return true }            // ::1
+        if b[0] & 0xFE == 0xFC { return true }                                          // fc00::/7
+        if b[0] == 0xFE && (b[1] & 0xC0 == 0x80 || b[1] & 0xC0 == 0xC0) { return true } // fe80::/10, fec0::/10
+        if b[0] == 0xFF { return true }                                                 // multicast
+        let embedded = Array(b[12..<16])
+        if b[0..<10].allSatisfy({ $0 == 0 }) && b[10] == 0xFF && b[11] == 0xFF { return isPrivate(embedded) } // ::ffff:a.b.c.d
+        if b[0..<12].allSatisfy({ $0 == 0 }) { return isPrivate(embedded) }                                   // ::a.b.c.d
+        if b[0...11] == [0, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0] { return isPrivate(embedded) }        // 64:ff9b::/96
+        return false
+    }
+
+    public static func isPrivate(address: String) -> Bool { DNSWire.addressBytes(address).map(isPrivate) ?? false }
+
+    /// SVCB/HTTPS (RFC 9460) rdata: true when an ipv4hint/ipv6hint carries a private address, or the rdata
+    /// cannot be parsed (an unparseable record is never trusted).
+    static func svcbHasPrivateHint(_ rdata: Data) -> Bool {
+        let r = [UInt8](rdata)
+        guard r.count >= 3 else { return true }
+        guard let (_, afterName) = try? DNSWire.readName(r, at: 2) else { return true }
+        var off = afterName
+        while off < r.count {
+            guard off + 4 <= r.count else { return true }
+            let key = Int(r[off]) << 8 | Int(r[off + 1]), len = Int(r[off + 2]) << 8 | Int(r[off + 3])
+            let v = off + 4
+            guard v + len <= r.count else { return true }
+            if key == 4 || key == 6 {
+                let w = key == 4 ? 4 : 16
+                guard len % w == 0 else { return true }
+                var i = v
+                while i < v + len { if isPrivate(Array(r[i..<(i + w)])) { return true }; i += w }
+            }
+            off = v + len
+        }
+        return false
+    }
+
+    /// Returns the response with every private address record removed (A, AAAA, SVCB/HTTPS with private hints,
+    /// and private glue in the additional section), plus the stripped values; nil when nothing needed stripping.
+    /// CNAMEs are kept (re-encoded, since their rdata may hold compression pointers into the original message).
+    public static func strip(_ data: Data, question: DNSQuestion) -> (Data, [String])? {
+        guard !isExempt(question.name), let m = try? DNSMessage.parse(data) else { return nil }
+        var stripped: [String] = []
+        func bad(_ rr: DNSResourceRecord) -> Bool {
+            switch rr.type {
+            case DNSType.a where rr.rdata.count == 4, DNSType.aaaa where rr.rdata.count == 16:
+                if isPrivate([UInt8](rr.rdata)) { stripped.append(rr.value ?? "?"); return true }
+            case DNSType.svcb, DNSType.https:
+                if svcbHasPrivateHint(rr.rdata) { stripped.append(DNSType.name(rr.type) + " hint"); return true }
+            default: break
+            }
+            return false
+        }
+        let keep = m.answers.filter { !bad($0) }
+        let addl = m.additionals.filter { !bad($0) }
+        guard !stripped.isEmpty else { return nil }
+        var out = DNSMessage(id: m.id, flags: m.flags)
+        out.questions = m.questions
+        for rr in keep {
+            switch rr.type {
+            case DNSType.a, DNSType.aaaa, DNSType.svcb, DNSType.https:
+                out.answers.append(rr)
+            case DNSType.cname:
+                guard let v = rr.value, !v.isEmpty else { continue }
+                var c = rr; c.rdata = Data(DNSWire.encodeName(v)); out.answers.append(c)
+            default: continue   // other types may carry compressed rdata; drop rather than corrupt
+            }
+        }
+        out.additionals = addl.filter { $0.type == DNSType.opt }
+        return (out.serialize(), stripped)
     }
 }

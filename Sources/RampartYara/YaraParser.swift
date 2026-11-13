@@ -431,6 +431,8 @@ struct YaraParser {
 struct HexParser {
     let src: [UInt8]
     var pos: Int
+    /// Nested alternative groups so far (bounded: deep nesting would overflow the stack when parsing/matching).
+    var depth = 0
 
     mutating func skip() {
         while pos < src.count {
@@ -493,6 +495,9 @@ struct HexParser {
             }
             if c == UInt8(ascii: "(") {
                 pos += 1
+                depth += 1
+                defer { depth -= 1 }
+                if depth > 32 { throw YaraSyntaxError("hex alternatives nested too deeply") }
                 flush()
                 var branches: [[HexElem]] = []
                 while true {
@@ -518,7 +523,8 @@ struct HexParser {
 
     mutating func readInt() -> Int? {
         var v = 0, any = false
-        while pos < src.count, src[pos] >= 0x30, src[pos] <= 0x39 { v = v * 10 + Int(src[pos] - 0x30); pos += 1; any = true }
+        // Saturates: `[99999999999999999999]` in a hex jump must not overflow (trap) the rule compiler.
+        while pos < src.count, src[pos] >= 0x30, src[pos] <= 0x39 { v = min(v, 1 << 40) * 10 + Int(src[pos] - 0x30); pos += 1; any = true }
         return any ? v : nil
     }
 
@@ -575,6 +581,14 @@ struct ConditionParser {
         self.toks = toks; self.ctx = ctx; self.namespace = namespace; self.imports = imports; self.st = st
     }
 
+    /// Expression nesting so far. Deep trees (`((((…`, `not not …`, `1+1+…+1`) would overflow the stack while
+    /// parsing, evaluating or freeing them on a 512 KB scan thread, so they are rejected.
+    var depth = 0
+    /// Budget 64: a parenthesised sub-expression costs 4 (it re-enters ~15 parser frames, ~20 KB of stack in a
+    /// debug build), a unary/`not` or a link in an operator chain costs 1. So at most 16 nested parentheses.
+    static let maxDepth = 64
+    mutating func deeper(_ cost: Int = 1) throws { depth += cost; if depth > Self.maxDepth { throw YaraSyntaxError("expression nested too deeply") } }
+
     var cur: Tok { toks[i] }
     func peek(_ k: Int = 1) -> Tok { i + k < toks.count ? toks[i + k] : .eof }
     mutating func advance() { if i < toks.count - 1 { i += 1 } }
@@ -583,7 +597,7 @@ struct ConditionParser {
     mutating func expectPunct(_ s: String) throws { guard isPunct(s) else { throw YaraSyntaxError("expected '\(s)' got \(cur)") }; advance() }
     mutating func expectIdent(_ s: String) throws { guard isIdent(s) else { throw YaraSyntaxError("expected '\(s)' got \(cur)") }; advance() }
 
-    mutating func parseExpression() throws -> Expr { try parseOr() }
+    mutating func parseExpression() throws -> Expr { let d = depth; defer { depth = d }; try deeper(4); return try parseOr() }
 
     mutating func parseOr() throws -> Expr {
         var xs = [try parseAnd()]
@@ -598,22 +612,25 @@ struct ConditionParser {
     }
 
     mutating func parseNot() throws -> Expr {
-        if isIdent("not") { advance(); return .not(try parseNot()) }
-        if isIdent("defined") { advance(); return .defined(try parseNot()) }
+        let d = depth; defer { depth = d }
+        if isIdent("not") { advance(); try deeper(); return .not(try parseNot()) }
+        if isIdent("defined") { advance(); try deeper(); return .defined(try parseNot()) }
         return try parseEquality()
     }
 
     mutating func parseEquality() throws -> Expr {
         var lhs = try parseRelational()
+        let d = depth; defer { depth = d }
         while true {
+            if isPunct("==") || isPunct("!=") { try deeper() }
             if isPunct("==") { advance(); lhs = .cmp(.eq, lhs, try parseRelational()); continue }
             if isPunct("!=") { advance(); lhs = .cmp(.ne, lhs, try parseRelational()); continue }
             if case .ident(let w) = cur {
                 let ops: [String: StrOp] = ["contains": .contains, "icontains": .icontains, "startswith": .startswith,
                                             "istartswith": .istartswith, "endswith": .endswith, "iendswith": .iendswith, "iequals": .iequals]
-                if let op = ops[w] { advance(); lhs = .strOp(op, lhs, try parseRelational()); continue }
+                if let op = ops[w] { advance(); try deeper(); lhs = .strOp(op, lhs, try parseRelational()); continue }
                 if w == "matches" {
-                    advance()
+                    advance(); try deeper()
                     guard case .regex(let b, let nc, let da) = cur else { throw YaraSyntaxError("expected regex after matches") }
                     advance()
                     lhs = .matches(lhs, try RegexProgram(source: b, nocase: nc, dotall: da))
@@ -626,10 +643,11 @@ struct ConditionParser {
 
     mutating func parseRelational() throws -> Expr {
         var lhs = try parseOfOrArith()
+        let d = depth; defer { depth = d }
         while true {
             let op: CmpOp
             if isPunct("<") { op = .lt } else if isPunct("<=") { op = .le } else if isPunct(">") { op = .gt } else if isPunct(">=") { op = .ge } else { return lhs }
-            advance()
+            advance(); try deeper()
             lhs = .cmp(op, lhs, try parseOfOrArith())
         }
     }
@@ -644,47 +662,54 @@ struct ConditionParser {
 
     mutating func parseBitOr() throws -> Expr {
         var l = try parseBitXor()
-        while isPunct("|") { advance(); l = .arith(.bor, l, try parseBitXor()) }
+        let d = depth; defer { depth = d }
+        while isPunct("|") { advance(); try deeper(); l = .arith(.bor, l, try parseBitXor()) }
         return l
     }
     mutating func parseBitXor() throws -> Expr {
         var l = try parseBitAnd()
-        while isPunct("^") { advance(); l = .arith(.bxor, l, try parseBitAnd()) }
+        let d = depth; defer { depth = d }
+        while isPunct("^") { advance(); try deeper(); l = .arith(.bxor, l, try parseBitAnd()) }
         return l
     }
     mutating func parseBitAnd() throws -> Expr {
         var l = try parseShift()
-        while isPunct("&") { advance(); l = .arith(.band, l, try parseShift()) }
+        let d = depth; defer { depth = d }
+        while isPunct("&") { advance(); try deeper(); l = .arith(.band, l, try parseShift()) }
         return l
     }
     mutating func parseShift() throws -> Expr {
         var l = try parseAdd()
+        let d = depth; defer { depth = d }
         while true {
-            if isPunct("<<") { advance(); l = .arith(.shl, l, try parseAdd()) }
-            else if isPunct(">>") { advance(); l = .arith(.shr, l, try parseAdd()) }
+            if isPunct("<<") { advance(); try deeper(); l = .arith(.shl, l, try parseAdd()) }
+            else if isPunct(">>") { advance(); try deeper(); l = .arith(.shr, l, try parseAdd()) }
             else { return l }
         }
     }
     mutating func parseAdd() throws -> Expr {
         var l = try parseMul()
+        let d = depth; defer { depth = d }
         while true {
-            if isPunct("+") { advance(); l = .arith(.add, l, try parseMul()) }
-            else if isPunct("-") { advance(); l = .arith(.sub, l, try parseMul()) }
+            if isPunct("+") { advance(); try deeper(); l = .arith(.add, l, try parseMul()) }
+            else if isPunct("-") { advance(); try deeper(); l = .arith(.sub, l, try parseMul()) }
             else { return l }
         }
     }
     mutating func parseMul() throws -> Expr {
         var l = try parseUnary()
+        let d = depth; defer { depth = d }
         while true {
-            if isPunct("*") { advance(); l = .arith(.mul, l, try parseUnary()) }
-            else if isPunct("\\") { advance(); l = .arith(.div, l, try parseUnary()) }
-            else if isPunct("%") && !isIdent("of", peek()) { advance(); l = .arith(.mod, l, try parseUnary()) }
+            if isPunct("*") { advance(); try deeper(); l = .arith(.mul, l, try parseUnary()) }
+            else if isPunct("\\") { advance(); try deeper(); l = .arith(.div, l, try parseUnary()) }
+            else if isPunct("%") && !isIdent("of", peek()) { advance(); try deeper(); l = .arith(.mod, l, try parseUnary()) }
             else { return l }
         }
     }
     mutating func parseUnary() throws -> Expr {
-        if isPunct("-") { advance(); return .neg(try parseUnary()) }
-        if isPunct("~") { advance(); return .bitnot(try parseUnary()) }
+        let d = depth; defer { depth = d }
+        if isPunct("-") { advance(); try deeper(); return .neg(try parseUnary()) }
+        if isPunct("~") { advance(); try deeper(); return .bitnot(try parseUnary()) }
         return try parsePrimary()
     }
 

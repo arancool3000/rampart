@@ -224,6 +224,8 @@ public enum VaultError: Error, LocalizedError, Equatable {
     case throttled(Int)
     /// The vault file is older than the newest one this Mac has seen (an old copy was put back).
     case rolledBack(found: Int, expected: Int)
+    /// wms-fb: an encrypted export is only as strong as its password; fewer than 10 characters is refused.
+    case weakExportPassword
 
     public var errorDescription: String? {
         switch self {
@@ -244,6 +246,7 @@ public enum VaultError: Error, LocalizedError, Equatable {
         case .secureEnclaveFailed(let s): return "This Mac's security chip couldn't open the vault key (\(s)). Unlock with your master password."
         case .throttled(let s): return "Too many wrong master passwords. Wait \(s) second\(s == 1 ? "" : "s") before trying again."
         case .rolledBack: return "This vault file is older than the newest version this Mac has saved. Someone or something may have put an old copy back, which could undo password changes. If you restored a backup yourself, choose Open Anyway."
+        case .weakExportPassword: return "Choose an export password of at least 10 characters. The export file can be guessed at offline, so its password is all that protects it."
         }
     }
 }

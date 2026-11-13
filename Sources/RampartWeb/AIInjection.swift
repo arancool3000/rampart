@@ -1,4 +1,5 @@
 import Foundation
+import RampartShared
 
 /// hx2 X3-2: local, deterministic prompt-injection signals for Scam Check. A copy of RampartAI's
 /// `PromptKit.injectionSignals` core patterns and hidden-text check (RampartWeb can't import RampartAI);
@@ -23,7 +24,10 @@ enum AIInjection {
     static func detected(_ t: String) -> Bool {
         if hasHiddenText(t) { return true }
         let visible = String(String.UnicodeScalarView(t.unicodeScalars.filter { !isInvisible($0) }))
-        return coreRE.firstMatch(in: visible, range: NSRange(location: 0, length: (visible as NSString).length)) != nil
+        if coreRE.firstMatch(in: visible, range: NSRange(location: 0, length: (visible as NSString).length)) != nil { return true }
+        // wms-o5: look-alike letters (Cyrillic/Greek), fullwidth and accented forms fold to plain words first.
+        let folded = TextFold.forMatching(t)
+        return folded != visible && coreRE.firstMatch(in: folded, range: NSRange(location: 0, length: (folded as NSString).length)) != nil
     }
 
     static func hasHiddenText(_ t: String) -> Bool {

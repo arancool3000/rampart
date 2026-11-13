@@ -28,6 +28,9 @@ public final class TarpitServer: @unchecked Sendable {
     public var lineDelay: TimeInterval
     public let limits: LureLimits
     private let rate: LureRateLimiter
+    private let refusals = LureRefusalThrottle()
+    /// Refused connections dropped without a record (log / alert flood guard), for tests and status.
+    public private(set) var suppressedRefusals = 0
 
     private let lock = NSLock()
     private var fd: Int32 = -1
@@ -44,7 +47,9 @@ public final class TarpitServer: @unchecked Sendable {
         if scope == .anywhere && !confirmedAnywhere { throw DeceptionError.bindRefused("exposing the lure to the internet needs explicit confirmation") }
         if scope == .localSubnet && localSubnets.isEmpty { throw DeceptionError.bindRefused("no local subnet known") }
         guard port == 0 || port >= 1024 else { throw DeceptionError.bindRefused("lure uses unprivileged high ports only") }
-        self.port = port; self.proto = proto ?? LureProtocol.forPort(port); self.scope = scope; self.localSubnets = localSubnets
+        let subnets = localSubnets.compactMap(LureAccessFilter.canonicalCIDR)
+        if scope == .localSubnet && subnets.isEmpty { throw DeceptionError.bindRefused("no valid local subnet") }
+        self.port = port; self.proto = proto ?? LureProtocol.forPort(port); self.scope = scope; self.localSubnets = subnets
         self.lineDelay = max(0, lineDelay); self.limits = limits; self.rate = LureRateLimiter(perMinute: limits.maxPerPeerPerMinute)
     }
 
@@ -87,7 +92,13 @@ public final class TarpitServer: @unchecked Sendable {
         while true {
             var peer = sockaddr_in(); var len = socklen_t(MemoryLayout<sockaddr_in>.size)
             let c = withUnsafeMutablePointer(to: &peer) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(s, $0, &len) } }
-            if c < 0 { if isStopped || errno == EBADF || errno == EINVAL { return }; continue }
+            if c < 0 {
+                let e = errno
+                if isStopped || e == EBADF || e == EINVAL { return }
+                // Out of descriptors / buffers (launchd caps the helper at 32 files): back off instead of spinning.
+                if e != EINTR && e != ECONNABORTED { usleep(50_000) }
+                continue
+            }
             if isStopped { close(c); return }
             var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             var a = peer.sin_addr
@@ -96,7 +107,9 @@ public final class TarpitServer: @unchecked Sendable {
             let remote = ip + ":" + String(UInt16(bigEndian: peer.sin_port))
             func refuse(_ why: String) {
                 close(c)
-                record(TarpitAttempt(date: Date(), port: boundPort, proto: proto, remote: remote, clientBanner: "", bytesReceived: 0, seconds: 0, refused: why))
+                guard let skipped = refusals.admit(ip) else { lock.lock(); suppressedRefusals += 1; lock.unlock(); return }
+                record(TarpitAttempt(date: Date(), port: boundPort, proto: proto, remote: remote, clientBanner: "", bytesReceived: 0, seconds: 0,
+                                     refused: skipped > 0 ? "\(why) (+\(skipped) more refused)" : why))
             }
             guard LureAccessFilter.allows(peerIPv4: ip, scope: scope, localSubnets: localSubnets) else { refuse("outside allowed scope"); continue }
             guard rate.allow(ip) else { refuse("rate limit"); continue }
@@ -117,6 +130,9 @@ public final class TarpitServer: @unchecked Sendable {
         setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
         var tv = timeval(tv_sec: 0, tv_usec: 100_000)
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        // A peer that never reads (zero window) must not pin this thread past the session deadline.
+        var stv = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &stv, socklen_t(MemoryLayout<timeval>.size))
         var sm = LureStateMachine(proto, limits: limits)
         var pending = Data()
         var total = 0

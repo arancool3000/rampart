@@ -1,4 +1,5 @@
 import Foundation
+import RampartShared
 
 /// Builds prompts that keep user-supplied content inside clearly delimited, untrusted data blocks.
 public enum PromptKit {
@@ -85,7 +86,10 @@ public enum PromptKit {
         return texts.contains { t in
             if hasHiddenText(t) { return true }
             let visible = String(t.unicodeScalars.filter { !isInvisible($0) }.map(Character.init))
-            return re.firstMatch(in: visible, range: NSRange(location: 0, length: (visible as NSString).length)) != nil
+            if re.firstMatch(in: visible, range: NSRange(location: 0, length: (visible as NSString).length)) != nil { return true }
+            // wms-o5: homoglyphs ("іgnоre" in Cyrillic), fullwidth and accented letters fold to the same words.
+            let folded = TextFold.forMatching(t)
+            return folded != visible && re.firstMatch(in: folded, range: NSRange(location: 0, length: (folded as NSString).length)) != nil
         }
     }
 

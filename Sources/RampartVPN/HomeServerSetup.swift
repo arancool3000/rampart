@@ -41,7 +41,7 @@ public enum HomeServerSetup {
     public static func generate(endpointHost: String, port: UInt16 = defaultPort, dns: [String]? = nil,
                                 privateKeys: (server: [UInt8], client: [UInt8], psk: [UInt8])? = nil) throws -> Result {
         let host = endpointHost.trimmingCharacters(in: .whitespaces)
-        guard IPPrefix.parseAddress(host) != nil || WGQuickConfig.isHostname(host) else { throw SetupError.badHost }
+        guard IPPrefix.strictLiteral(host) != nil || WGQuickConfig.isHostname(host) else { throw SetupError.badHost }
         guard port > 0 else { throw SetupError.badPort }
         let serverPriv = privateKeys?.server ?? WGCrypto.generatePrivateKey()
         let clientPriv = privateKeys?.client ?? WGCrypto.generatePrivateKey()

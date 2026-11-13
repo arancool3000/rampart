@@ -287,7 +287,7 @@ api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const s = await getSettings();
         const ping = await askHost({ type: "ping" }, 1500);
         let trackers = null;
-        try { const [t] = await api.tabs.query({ active: true, currentWindow: true }); if (t && tabs.get(t.id)) trackers = tabs.get(t.id).trackers; } catch { /* no tab */ }
+        try { const [t] = await api.tabs.query({ active: true, currentWindow: true }); if (t && tabs.get(t.id)) { const tr = tabs.get(t.id).trackers; if (tr && (!t.url || hostOf(t.url) === tr.host)) trackers = tr; } } catch { /* no tab */ }   // wms-o3: never another site's count
         sendResponse({ settings: s, trackers, host: Object.assign({}, hostState, { reachable: !!(ping && ping.ok), version: str(ping && ping.version, 40), daemon: !!(ping && ping.daemon) }) });
         break;
       }

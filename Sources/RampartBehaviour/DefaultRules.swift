@@ -201,6 +201,18 @@ enum DefaultRules {
      ]},
     {"id": "R26", "name": "System extension from an unfamiliar developer", "type": "weak", "category": "suspicious", "score": 45, "stage": "persistence", "subject": "target", "builtin": true,
      "why": "A newly activated system extension belongs to a Team ID that was not present in the baseline."},
+    {"id": "RP1", "name": "Hosts or DNS resolver hijack", "type": "strong", "category": "suspicious", "score": 70, "stage": "evasion", "subject": "none", "builtin": true,
+     "why": "/etc/hosts or /etc/resolver gained an entry that blocks Apple's security updates or a security tool, or sends a bank, email or cloud site to another server."},
+    {"id": "RP2", "name": "SSH login backdoor", "type": "strong", "category": "backdoor", "score": 70, "stage": "persistence", "subject": "none", "builtin": true, "interactiveFactor": 0.5,
+     "why": "An SSH rc/environment file now runs commands at every SSH login, or sshd was set to take login keys from a program, allow root or empty passwords."},
+    {"id": "RP3", "name": "Unsigned plug-in loaded by a system process", "type": "weak", "category": "suspicious", "score": 50, "stage": "persistence", "subject": "target", "builtin": true,
+     "why": "An unsigned, ad-hoc or broken Spotlight importer, Quick Look generator, screen saver, Dock tile, audio or input plug-in, or kernel extension was added; macOS loads these into its own processes."},
+    {"id": "RP4", "name": "Folder Action attached", "type": "weak", "category": "suspicious", "score": 45, "stage": "persistence", "subject": "none", "builtin": true,
+     "why": "Folder Actions were turned on or changed, or a Folder Action script was added; the script runs whenever files land in the watched folder."},
+    {"id": "RP5", "name": "Dylib injected through an app's launch environment", "type": "strong", "category": "malware", "score": 75, "stage": "persistence", "subject": "none", "builtin": true,
+     "why": "An app's Info.plist LSEnvironment (or the login environment.plist) sets DYLD_*, so code is injected every time the app starts."},
+    {"id": "RP6", "name": "Persistence hidden from view", "type": "weak", "category": "suspicious", "score": 45, "stage": "persistence", "subject": "none", "builtin": true,
+     "why": "A launch item plist is hidden from Finder, or macOS will re-open an app from a temporary, hidden or shared folder at login."},
     {"id": "L01", "name": "Quarantine attribute stripped", "type": "weak", "category": "suspicious", "score": 25, "stage": "evasion", "subject": "lineage", "interactiveFactor": 0.5, "devSensitive": true,
      "why": "The com.apple.quarantine attribute was removed, which skips Gatekeeper's first-launch check.",
      "matchers": [
@@ -504,6 +516,42 @@ enum DefaultRules {
      "matchers": [
        {"kinds": ["exec"], "argsAny": ["@minerArgs"]},
        {"kinds": ["networkConnect"], "detail": {"remote_port": "^(3333|4444|5555|7777|14444|14433|45700)$"}, "trust": "untrusted"}
+     ]},
+    {"id": "EV1", "name": "Apple tool copied out of the system and run", "type": "strong", "category": "suspicious", "score": 65, "stage": "evasion", "subject": "none", "builtin": true, "devSensitive": true,
+     "why": "An Apple command-line tool (a shell, curl, osascript, python...) was copied to a temp, hidden or user folder, often under a new name, and run from there. Malware does this so rules keyed on the tool's name and path miss it, while the Apple signature still looks trustworthy (MITRE T1036.003)."},
+    {"id": "EV2", "name": "Code injected with DYLD environment variables", "type": "strong", "category": "malware", "score": 70, "stage": "evasion", "subject": "none",
+     "why": "A program was started with DYLD_INSERT_LIBRARIES pointing at a library in a temp, hidden or shared folder, or an app's Info.plist was given a DYLD_ launch environment: the library's code then runs inside the trusted app (MITRE T1574.006, T1647).",
+     "matchers": [
+       {"kinds": ["exec"], "detail": {"dyld_env": "DYLD_INSERT_LIBRARIES=(?![^ ]*libclang_rt)[^ ]*(/tmp/|/private/(tmp|var/folders)/|/var/folders/|/Users/Shared/|/Downloads/|/\\.[^/ ]+/)"}},
+       {"kinds": ["exec"], "argsAny": ["(^|\\s)DYLD_INSERT_LIBRARIES=(?!\\S*libclang_rt)\\S*(/tmp/|/private/(tmp|var/folders)/|/var/folders/|/Users/Shared/|/Downloads/|/\\.[^/\\s]+/)"]},
+       {"kinds": ["exec"], "process": ["plutil", "defaults", "PlistBuddy"], "args": ["LSEnvironment", "DYLD_"]}
+     ]},
+    {"id": "EV3", "name": "Program disguised as a system process", "type": "strong", "category": "suspicious", "score": 60, "stage": "evasion", "subject": "actor", "builtin": true,
+     "why": "A program that is not part of macOS calls itself after a system process (launchd, mdworker, softwareupdated...), either by its file name outside the system folders or by faking its argv[0], so it blends into process lists (MITRE T1036.004, T1036.005)."},
+    {"id": "EV4", "name": "Fake Apple security log message", "type": "strong", "category": "suspicious", "score": 55, "stage": "evasion", "subject": "actor",
+     "why": "A third-party program wrote a log message under an Apple security subsystem (XProtect, TCC, Gatekeeper, background items). Real ones come from macOS itself; a fake one tries to mislead security tools that read the log (MITRE T1562.006).",
+     "matchers": [
+       {"kinds": ["other"], "detail": {"log_spoof": "^1$"}, "trust": "nonApple"}
+     ]},
+    {"id": "EV5", "name": "Event feed flooded or lost events", "type": "weak", "category": "suspicious", "score": 35, "stage": "evasion", "subject": "none",
+     "why": "Real-time telemetry dropped events: the kernel event queue overflowed or events arrived faster than they could be checked. A flood like this can hide other activity, so it is recorded next to anything else found at the same time.",
+     "matchers": [
+       {"kinds": ["other"], "detail": {"type": "^telemetry_gap$"}}
+     ]},
+    {"id": "EV6", "name": "File timestamps forged by a script", "type": "weak", "category": "suspicious", "score": 35, "stage": "evasion", "subject": "lineage",
+     "why": "An untrusted script reset a file's dates with touch -t/-r/-d on a launch item or a temp, shared or hidden path, so the new file looks old (MITRE T1070.006).",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["touch"], "args": ["(^|\\s)-[acm]*[trd]\\b"], "argsAny": ["/Library/Launch(Agents|Daemons)/", "(^|\\s)/(private/)?tmp/", "/Users/Shared/", "/Application Support/", "/\\.[^/\\s]+/"], "lineageUntrusted": true}
+     ]},
+    {"id": "EV7", "name": "JavaScript for Automation reaching the shell", "type": "weak", "category": "suspicious", "score": 40, "stage": "execution", "subject": "lineage",
+     "why": "An untrusted chain ran JavaScript for Automation that shells out or loads Objective-C frameworks, or ran a JXA script from a temp folder: a common way to run payloads without dropping a binary (MITRE T1059.007).",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["osascript"], "args": ["-l\\s+JavaScript"], "argsAny": ["doShellScript", "ObjC\\.(import|unwrap|bindFunction)", "\\$\\.NS[A-Z]", "(^|\\s)/(private/)?tmp/", "/var/folders/", "/Users/Shared/"], "lineageUntrusted": true}
+     ]},
+    {"id": "EV8", "name": "Dropped program hidden from Finder", "type": "weak", "category": "suspicious", "score": 35, "stage": "evasion", "subject": "lineage",
+     "why": "An untrusted script set the hidden flag on a file in a temp, shared or launch-item location, so Finder won't show it (MITRE T1564.001).",
+     "matchers": [
+       {"kinds": ["exec"], "process": ["chflags"], "args": ["(^|\\s)hidden\\b"], "argsAny": ["/Library/Launch(Agents|Daemons)/", "(^|\\s)/(private/)?tmp/", "/Users/Shared/", "/Application Support/"], "lineageUntrusted": true}
      ]}
   ]
 }

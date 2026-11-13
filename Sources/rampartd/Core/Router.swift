@@ -93,7 +93,7 @@ final class Router {
     }
 
     /// The matrix cell for this request and peer on the root daemon (nil = allowed). See IPCAuthz.swift.
-    func authorizationDenial(_ req: IPCRequest, peer: Peer) -> String? {
+    func authorizationDenial(_ req: IPCRequest, peer: Peer, userMode: Bool = false) -> String? {
         var weakens = true
         if case .setSettings(let s) = req { weakens = IPCAuthz.settingsWeaken(old: p.settings(), new: s) }
         if case .netGuard(let d) = req { weakens = p.services.netGuard?.weakens(d) ?? true }
@@ -101,7 +101,7 @@ final class Router {
         let caller = AuthzCaller(uid: peer.uid, isAdmin: peer.isAdmin, isConsole: AuthzCaller.consoleUID() == peer.uid,
                                  client: peer.client,
                                  hasSettingsSession: level == .adminClientWeakening && (p.services.guardian?.hasAuthenticatedSession(peer) ?? false))
-        return IPCAuthz.denial(level, caller, name: Self.name(req))
+        return IPCAuthz.denial(level, caller, name: Self.name(req), userMode: userMode)
     }
 
     private func deception() throws -> DeceptionService {
@@ -109,14 +109,21 @@ final class Router {
         return d
     }
 
+    /// `requireAdminForPrivileged`: the root daemon's full matrix. `userModeClientChecks` (wms-fa): the packaged
+    /// user-session helper's client-identity gate (IPCAuthz.denial with userMode). Neither applies to `--local`.
     @discardableResult
-    func handle(_ req: IPCRequest, peer: Peer, requireAdminForPrivileged: Bool, send: @escaping (IPCResponse) -> Bool) -> RouteResult {
+    func handle(_ req: IPCRequest, peer: Peer, requireAdminForPrivileged: Bool, userModeClientChecks: Bool = false,
+                send: @escaping (IPCResponse) -> Bool) -> RouteResult {
         if requireAdminForPrivileged && Self.isPrivileged(req) && !peer.isAdmin {
             _ = send(.error("'\(Self.name(req))' requires an administrator account"))
             return .done
         }
         if requireAdminForPrivileged, let why = authorizationDenial(req, peer: peer) {
             logWarn("IPC denied \(Self.name(req)) for uid \(peer.uid) pid \(peer.pid) (\(peer.client?.rawValue ?? "unverified client"))")
+            _ = send(.error(why)); return .done
+        }
+        if !requireAdminForPrivileged, userModeClientChecks, let why = authorizationDenial(req, peer: peer, userMode: true) {
+            logWarn("IPC denied \(Self.name(req)) (user helper) for pid \(peer.pid) (\(peer.client?.rawValue ?? "unverified client"))")
             _ = send(.error(why)); return .done
         }
         if requireAdminForPrivileged && !peer.isAdmin, case .scan(let paths, let quick) = req,
@@ -303,7 +310,7 @@ final class Router {
                 _ = send(.ok)
             case .requestUninstall(let auth):
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
-                _ = send(.disableToken(try g.requestDisable(peer: peer, authorization: auth)))
+                _ = send(.disableToken(try g.requestDisable(peer: peer, authorization: auth, purposes: [.uninstall])))   // wms-o7: uninstall-only token
             case .uninstall(let token):
                 guard let g = p.services.guardian else { throw ServiceError.unavailable("tamper protection") }
                 try g.redeem(token, peer: peer, purpose: .uninstall, minutes: 10)
@@ -337,6 +344,9 @@ final class Router {
                 _ = send(.ok)
             case .forwardEvents(let events):
                 guard let rt = p.services.realtime as? RealtimePipeline else { throw ServiceError.unavailable("real-time pipeline") }
+                if let why = IPCAuthz.forwardDenial(peerUID: peer.uid, client: peer.client, clientChecks: requireAdminForPrivileged || userModeClientChecks) {
+                    throw ServiceError.denied(why)
+                }
                 guard events.count <= 500 else { throw ServiceError.failed("too many events in one batch") }
                 for raw in events {
                     guard var e = IPCAuthz.sanitizeForwarded(raw, peerUID: peer.uid) else { continue }

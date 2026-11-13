@@ -103,6 +103,25 @@ struct ClientIdentity: Equatable {
                               dangerousEntitlements: bad)
     }
 
+    /// Static signature facts of a file on disk (strict validation; never prompts). nil when unsigned or unreadable.
+    static func ofFile(_ path: String) -> ClientIdentity? {
+        var lst = stat()
+        guard lstat(path, &lst) == 0, (lst.st_mode & S_IFMT) == S_IFREG else { return nil }   // no symlinks
+        var st: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &st) == errSecSuccess, let st else { return nil }
+        var infoCF: CFDictionary?
+        guard SecCodeCopySigningInformation(st, SecCSFlags(rawValue: kSecCSSigningInformation | kSecCSRequirementInformation), &infoCF) == errSecSuccess,
+              let info = infoCF as? [String: Any] else { return nil }
+        let staticOK = SecStaticCodeCheckValidity(st, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess
+        let flags = (info[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+        let ents = info[kSecCodeInfoEntitlementsDict as String] as? [String: Any] ?? [:]
+        let cd = (info[kSecCodeInfoUnique as String] as? Data).map { $0.map { String(format: "%02x", $0) }.joined() } ?? ""
+        return ClientIdentity(identifier: info[kSecCodeInfoIdentifier as String] as? String ?? "",
+                              teamID: info[kSecCodeInfoTeamIdentifier as String] as? String, cdhash: cd, path: path,
+                              valid: staticOK && !cd.isEmpty, hardenedRuntime: flags & 0x10000 != 0, linkerSignedOnly: flags & 0x20000 != 0,
+                              dangerousEntitlements: dangerousEntitlementKeys.filter { (ents[$0] as? Bool) == true })
+    }
+
     /// Install-time pins: `<root>/trusted-clients.json` = ["<cdhash hex>", ...]. Used only when the file is a regular
     /// root-owned file that nobody else can write; otherwise ignored (nil = no pinning).
     static func loadPins(_ path: String) -> Set<String>? {
@@ -157,8 +176,13 @@ enum IPCAuthz {
         var e = e
         if peerUID == 0 { return e }
         if var pr = e.process {
-            guard let owner = ownerUID(pid: pr.pid), owner == peerUID else { return nil }
-            pr.uid = owner; pr.isPlatformBinary = false; pr.signingID = nil; pr.teamID = nil
+            guard let facts = procFacts(pid: pr.pid), facts.uid == peerUID else { return nil }
+            pr.uid = facts.uid; pr.isPlatformBinary = false; pr.signingID = nil; pr.teamID = nil
+            // wms-fa: the image path and parent come from the kernel, never from the peer. A forged path
+            // ("/Applications/Safari.app/...", a root-owned binary) or a forged parent ("the browser spawned me") would
+            // otherwise steer the behaviour rules' lineage, trust multipliers and the kill target.
+            if let real = executablePath(pid: pr.pid) { pr.path = real } else { return nil }
+            pr.ppid = facts.ppid
             e.process = pr
         }
         for path in [e.path, e.destPath].compactMap({ $0 }) {
@@ -169,12 +193,58 @@ enum IPCAuthz {
         return e
     }
 
-    static func ownerUID(pid: Int32) -> uid_t? {
+    static func ownerUID(pid: Int32) -> uid_t? { procFacts(pid: pid)?.uid }
+
+    /// Kernel-reported owner and parent of a live process (sysctl), nil when it is gone.
+    static func procFacts(pid: Int32) -> (uid: uid_t, ppid: pid_t)? {
         guard pid > 0 else { return nil }
         var info = kinfo_proc(); var size = MemoryLayout<kinfo_proc>.stride
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
         guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
-        return info.kp_eproc.e_ucred.cr_uid
+        return (info.kp_eproc.e_ucred.cr_uid, info.kp_eproc.e_ppid)
+    }
+
+    /// Kernel-reported executable path of a live process (proc_pidpath).
+    static func executablePath(pid: Int32) -> String? {
+        guard pid > 0 else { return nil }
+        var buf = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let n = proc_pidpath(pid, &buf, UInt32(buf.count))
+        return n > 0 ? String(cString: buf) : nil
+    }
+
+    /// wms-fa: who may inject telemetry. Root (the system service forwarding decoy events) always; otherwise only a
+    /// verified RamPart client (the app's PasteGuard) while client checks are on. A raw-socket script used to be able
+    /// to feed forged "ransomware burst" events about its own processes and files into the root daemon's behaviour
+    /// engine, which can end in an automatic Emergency Lockdown that cuts the whole Mac's network. nil = allowed.
+    static func forwardDenial(peerUID: uid_t, client: RampartClientKind?, clientChecks: Bool) -> String? {
+        if peerUID == 0 || !clientChecks { return nil }
+        if client == .app || client == .cli || client == .daemon { return nil }
+        return "'forwardEvents' is accepted only from \(Product.name)'s own app or service"
+    }
+
+    /// wms-fa: the user-session helper applies the client-identity gate only when it is itself a packaged RamPart
+    /// build (hardened runtime, strict signature, identifier `app.rampart.daemon`). A `swift build` development
+    /// binary (linker-signed, not hardened) keeps the old same-uid-only behaviour, because its clients are
+    /// development binaries too. Every shipped copy is packaged by scripts/build.sh.
+    static func userModeClientChecks(selfIdentity me: ClientIdentity?) -> Bool {
+        guard let me, me.valid, me.hardenedRuntime, !me.linkerSignedOnly, me.dangerousEntitlements.isEmpty else { return false }
+        return me.identifier == Product.bundlePrefix + ".daemon"
+    }
+
+    /// wms-fa: cdhash pins for the user-session helper: the app and CLI that ship in the same bundle
+    /// (`<bundle>/Contents/MacOS/Rampart`, `<bundle>/Contents/Helpers/rampart`). With ad-hoc signing an identifier is
+    /// forgeable, a cdhash is not: only the binaries built with this very helper may make privileged calls to it.
+    /// nil when the helper is not inside a bundle or no sibling verifies (identifier-only trust then applies).
+    static func siblingClientPins(executable: String, appName: String = Product.name) -> Set<String>? {
+        let exe = URL(fileURLWithPath: executable).resolvingSymlinksInPath().path
+        guard let r = exe.range(of: ".app/Contents/") else { return nil }
+        let bundle = String(exe[..<r.lowerBound]) + ".app"
+        var pins = Set<String>()
+        for (rel, kind) in [("/Contents/MacOS/\(appName)", RampartClientKind.app), ("/Contents/Helpers/rampart", .cli)] {
+            guard let id = ClientIdentity.ofFile(bundle + rel), id.trustedKind(daemonTeamID: nil, pinnedCDHashes: nil) == kind else { continue }
+            pins.insert(id.cdhash.lowercased())
+        }
+        return pins.isEmpty ? nil : pins
     }
 
     /// Posture check ids are short ASCII identifiers; anything else never reaches the fixer, the log or Activity.
@@ -221,19 +291,24 @@ enum IPCAuthz {
         case .emergencyStatus, .emergencyRescan, .emergencyAck:
             return .sessionUser
         case .vpn(let op, _):
-            // RamPart VPN: status for the session; connect / import / setup strengthen; disconnect, remove and option
-            // changes (kill switch off) weaken. Unknown ops get the strictest level.
+            // RamPart VPN: status for the session; connecting to the configuration the user already imported
+            // strengthens. Everything else is weakening (wms-fa): importing or setting up a configuration points ALL of
+            // the Mac's traffic and DNS at a new WireGuard endpoint, so from the CLI it needs administrator confirmation
+            // (malware running the real CLI must not be able to route the user through its own server); disconnect,
+            // remove and option changes (kill switch off) turn protection down. Unknown ops get the strictest level.
             switch op {
             case "status": return .sessionUser
-            case "connect", "importConfig", "setupHome": return .adminClient
+            case "connect": return .adminClient
             default: return .adminClientWeakening
             }
         case .emergencyLockdown:
             // Locking down is the safe direction, but it suspends processes and cuts the network: RamPart's own clients only.
             return .adminClient
-        case .emergencyNetwork(let keep, _):
-            // Keep blocking is the safe direction; restoring the internet is checked again by the admin token in Emergency.
-            return keep ? .sessionUser : .adminClient
+        case .emergencyNetwork:
+            // Restoring the internet is checked again by the admin token in Emergency. "Keep blocking" is the safe
+            // direction, but it makes a 10-minute automatic block permanent (an administrator must authenticate to
+            // undo it), so it is RamPart's own clients only too (wms-fa; it used to be sessionUser).
+            return .adminClient
         case .killSwitch:
             // RamPart's own app or CLI, plus the admin token (Touch ID / password) checked in KillSwitchExec. Not
             // .adminClientWeakening: the token itself is the user-presence proof, the app holds no settings session.
@@ -257,9 +332,24 @@ enum IPCAuthz {
     }
 
     /// nil = allowed; otherwise the refusal sent to the peer.
-    static func denial(_ level: AuthzLevel, _ c: AuthzCaller, name: String) -> String? {
+    ///
+    /// `userMode` (wms-fa): the user-session helper. Its socket already admits only its owner and root, so the
+    /// administrator and console columns do not apply (a standard user owns their own helper), but the client-identity
+    /// gate does: Download Gate, Camera & Microphone Guard, Cat & Mouse, the user vault and real-time protection
+    /// used to be switchable by any same-user process with a ten-line script.
+    static func denial(_ level: AuthzLevel, _ c: AuthzCaller, name: String, userMode: Bool = false) -> String? {
         guard c.credentialed else { return "'\(name)' refused: the caller could not be identified" }
         if c.isRoot { return nil }
+        if userMode {
+            guard level >= .adminClient else { return nil }
+            guard let k = c.client, k == .app || k == .cli else {
+                return "'\(name)' is accepted only from \(Product.name)'s own app or command line tool"
+            }
+            if level == .adminClientWeakening, k == .cli, !c.hasSettingsSession {
+                return "'\(name)' turns a protection off; from the command line it needs administrator confirmation first (authenticate, then retry)"
+            }
+            return nil
+        }
         switch level {
         case .anyLocal:
             return nil
@@ -290,7 +380,9 @@ enum IPCAuthz {
         if !old.learningMode && new.learningMode { return true }      // learning mode suppresses behaviour alerts
         if !old.developerMode && new.developerMode { return true }    // developer mode relaxes behaviour rules
         if old.ransomwareCanaries && !new.ransomwareCanaries { return true }
-        // New exclusions are gated per path by the router (broad ones need an authenticated session).
+        // wms-fa: any new exclusion hides files from the scanner, so it is weakening (the CLI needs administrator
+        // confirmation; the app may do it directly). Broad paths are additionally gated per path by the router.
+        if !Set(new.exclusions).isSubset(of: Set(old.exclusions)) { return true }
         return false
     }
 }

@@ -15,7 +15,17 @@
 # the source while it is being copied can't swap what root runs. Launchd plists are written from this script,
 # never copied from the (admin-writable) app bundle. Uninstall only deletes our own fixed paths, checks bundle
 # identity before deleting an app, and deletes per-user files as that user (no root symlink games).
-set -uo pipefail
+#
+# wms-fc: the script trusts nothing from its caller's environment. PATH is fixed, every variable that changes how bash
+# or dyld behave (BASH_ENV, ENV, CDPATH, GLOBIGNORE, IFS, DYLD_*, LD_*) is cleared, `set -e` makes an unexpected failure
+# stop the run instead of continuing half-installed, and the daemon source for the helper is an internal variable
+# (never RAMPART_DAEMON_SRC from the environment). The wrappers (install.sh, uninstall.sh, postinstall) additionally
+# start this script under `env -i`, so BASH_ENV can't inject code before the first line runs.
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE MAILPATH PS4 SHELLOPTS 2>/dev/null || true
+IFS=$' \t\n'
+for v in $(env | sed -n 's/^\(DYLD_[A-Za-z0-9_]*\|LD_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$v"; done
 umask 022
 
 ACTION="${1:-}"; shift || true
@@ -47,6 +57,11 @@ PKG_ID="app.rampart.app.pkg"
 BUNDLE_ID="app.rampart.app"
 DAEMON_ID="app.rampart.daemon"
 STAGE_PREFIX="/private/tmp/app.rampart.stage"
+# Daemon binary to install when it comes from our root-only staging folder (set by place_staged only; an environment
+# variable of the same purpose used to be honoured, which let a caller that controls the env of the `install` action
+# name any ad-hoc-signed file in a root-owned folder such as /private/tmp).
+DAEMON_SRC=""
+unset RAMPART_DAEMON_SRC
 # Identity pinned at install (root-owned, one source of truth for updates, Guard and the updater):
 # signer (Team ID / designated requirement, or "adhoc" + exact cdhashes), version and build.
 IDENTITY="$SUPPORT/install-identity.plist"
@@ -66,7 +81,7 @@ console_uid() { stat -f %u /dev/console 2>/dev/null || echo 0; }
 has_ctl() { case "$1" in *[[:cntrl:]]*) return 0 ;; esac; return 1; }
 
 # --- identity / version helpers -------------------------------------------------------------------------
-plist_get() { plutil -extract "$2" raw -o - "$1/Contents/Info.plist" 2>/dev/null; }
+plist_get() { plutil -extract "$2" raw -o - "$1/Contents/Info.plist" 2>/dev/null || true; }
 is_ours() { [ -d "$1" ] && [ ! -L "$1" ] && [ "$(plist_get "$1" CFBundleIdentifier)" = "$BUNDLE_ID" ]; }
 # Code identity of a bundle or binary: the CDHash of EVERY architecture slice ("arm64=<hex>,x86_64=<hex>"),
 # so a pin can't be dodged by re-signing only the slice that isn't checked.
@@ -109,8 +124,8 @@ check_not_downgrade() {
 }
 
 # --- install identity pin -------------------------------------------------------------------------------
-team_of() { codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1; }
-dr_of() { codesign -d -r- "$1" 2>&1 | sed -n 's/^designated => //p' | head -1; }
+team_of() { codesign -dv "$1" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -1 || true; }
+dr_of() { codesign -d -r- "$1" 2>&1 | sed -n 's/^designated => //p' | head -1 || true; }
 # Prints the identity record (XML plist) of APP; the helper's cdhash is that of the bundle's rampartd.
 identity_record() {
   local app="$1" team dr kind=signed
@@ -125,7 +140,7 @@ identity_record() {
     && plutil -insert build -string "$(plist_get "$app" CFBundleVersion)" "$t" && cat "$t"
   local rc=$?; rm -f "$t"; return $rc
 }
-rec_get() { plutil -extract "$2" raw -o - "$1" 2>/dev/null; }
+rec_get() { plutil -extract "$2" raw -o - "$1" 2>/dev/null || true; }
 # Why NEW may not replace what the record pins (empty = allowed). PIN is the cdhash the user approved in
 # this very run (admin prompt / sudo), or empty for an unattended path.
 #  - versions never roll back below the recorded install (even if /Applications was swapped meanwhile);
@@ -152,7 +167,7 @@ identity_refusal() {
     [ "$newteam" = "$team" ] || { echo "signed by Team ID '${newteam:-none}', the install is pinned to '${team:-none}'"; return; }
     if [ -n "$req" ]; then codesign --verify -R="$req" "$new" >/dev/null 2>&1 || { echo "not signed by the pinned certificate"; return; }; fi
   else
-    local have; have=$(cdhash_of "$new")
+    local have; have=$(cdhash_of "$new") || have=""
     [ "$have" = "$(rec_get "$rec" appCDHash)" ] && return 0
     [ -n "$pin" ] && [ "$have" = "$pin" ] && return 0
     echo "ad-hoc build with unrecorded code hashes and no explicit approval of them"
@@ -306,7 +321,7 @@ install_helper_from_bundle() {
   [ ! -L "$src" ] || die "$src is a symlink"
   exec 4<"$src" || die "can't open $src"
   local fd_id path_id mode
-  fd_id=$(stat -f '%u:%i' /dev/fd/4); path_id=$(stat -f '%u:%i' "$src"); mode=$(stat -f %Lp "$src")
+  { fd_id=$(stat -f '%u:%i' /dev/fd/4) && path_id=$(stat -f '%u:%i' "$src") && mode=$(stat -f %Lp "$src"); } || { exec 4<&-; die "can't stat $src"; }
   [ "$fd_id" = "$path_id" ] && [ "${fd_id%%:*}" = 0 ] && [ $(( 0$mode & 022 )) = 0 ] || { exec 4<&-; die "$src is not a root-owned, root-only-writable file"; }
   install_helper_from /dev/fd/4
   exec 4<&-
@@ -320,12 +335,16 @@ install_rampart() {
   # Upgrade: stop the old service first.
   run launchctl bootout "system/$LABEL_D" 2>/dev/null || true
   check_root_dir "$HELPER_DIR"; check_root_dir /Library/LaunchDaemons; check_root_dir /Library/LaunchAgents
-  if [ -n "${RAMPART_DAEMON_SRC:-}" ]; then
-    # Set only by place-staged: the binary sits in our root-only staging folder.
-    if [ "$DRY" = 1 ]; then install_helper_from "$RAMPART_DAEMON_SRC"
+  if [ -n "$DAEMON_SRC" ]; then
+    # Set only by place_staged: the binary sits in our root-only staging folder (mode 700, root, under STAGE_PREFIX).
+    local sdir; sdir=$(dirname "$DAEMON_SRC")
+    case "$sdir" in "$STAGE_PREFIX".*) ;; *) die "daemon source $DAEMON_SRC is not in a staging folder" ;; esac
+    if [ "$DRY" = 1 ]; then install_helper_from "$DAEMON_SRC"
     else
-      [ "$(stat -f %u "$(dirname "$RAMPART_DAEMON_SRC")")" = 0 ] || die "daemon source folder is not root-owned"
-      install_helper_from "$RAMPART_DAEMON_SRC" "$(cdhash_of "$RAMPART_DAEMON_SRC")"
+      [ ! -L "$sdir" ] && [ "$(stat -f %u "$sdir")" = 0 ] && [ "$(stat -f %Lp "$sdir")" = 700 ] || die "daemon source folder is not root-only"
+      [ -f "$DAEMON_SRC" ] && [ ! -L "$DAEMON_SRC" ] || die "daemon source is not a regular file"
+      local spin; spin=$(cdhash_of "$DAEMON_SRC") || die "can't read the cdhash of the staged rampartd"
+      install_helper_from "$DAEMON_SRC" "$spin"
     fi
   else
     install_helper_from_bundle
@@ -334,11 +353,17 @@ install_rampart() {
   ensure_root_dir "$LOGS" 755
   daemon_plist | write_root_file "$DAEMON_PLIST" 644 || die "can't write $DAEMON_PLIST"
   agent_plist | write_root_file "$AGENT_PLIST" 644 || die "can't write $AGENT_PLIST"
-  run launchctl bootstrap system "$DAEMON_PLIST"
-  run launchctl enable "system/$LABEL_D"
-  # Command line tool.
-  run install -d -m 755 /usr/local/bin
-  run ln -sfn "$APP/Contents/Helpers/rampart" "$CLI_LINK"
+  # The old job may still be exiting (ExitTimeOut 20): retry, then fail loudly instead of leaving no service.
+  local try=0
+  until run launchctl bootstrap system "$DAEMON_PLIST"; do
+    try=$((try + 1)); [ "$try" -lt 10 ] || die "launchctl bootstrap system/$LABEL_D failed"
+    sleep 1
+  done
+  run launchctl enable "system/$LABEL_D" || true
+  # Command line tool (/usr/local/bin is often owned by the admin user; a failure here is not an install failure).
+  run install -d -m 755 /usr/local/bin || true
+  if [ -e "$CLI_LINK" ] && [ ! -L "$CLI_LINK" ]; then echo "    not replacing $CLI_LINK: it is not a symlink" >&2
+  else run ln -sfn "$APP/Contents/Helpers/rampart" "$CLI_LINK" || echo "    could not create $CLI_LINK" >&2; fi
   # Start the menu bar agent for the logged-in user (the agent plist also loads at every login).
   local uid; uid="$(console_uid)"
   if [ "$uid" != 0 ]; then
@@ -354,8 +379,15 @@ install_rampart() {
 # Refuses a source anyone can modify (world-writable file/folder anywhere in the bundle).
 check_source_not_world_writable() {
   local src="$1" bad
-  bad=$(find "$src" -perm -0002 ! -type l -print -quit 2>/dev/null)
+  bad=$(find "$src" -perm -0002 ! -type l -print -quit 2>/dev/null) || true
   [ -z "$bad" ] || die "refusing $src: $bad is writable by every user"
+}
+# Refuses a bundle containing symlinks or hard-linked files: root later runs chown/chmod -R and ditto over the copy, and a
+# link can point outside the bundle (a target in /etc, another user's file). Our bundle never contains links.
+check_source_no_links() {
+  local src="$1" bad
+  bad=$(find "$src" \( -type l -o \( -type f -links +1 \) \) -print -quit 2>/dev/null) || true
+  [ -z "$bad" ] || die "refusing $src: $bad is a symlink or hard link"
 }
 
 # install-from SRC: stage + verify + place. The cdhash is pinned from SRC before the copy (or given with
@@ -367,9 +399,10 @@ install_from() {
   has_ctl "$src" && die "refusing a path with control characters"
   valid_app_target "$dest" || die "refusing destination $dest"
   check_source_not_world_writable "$src"
+  check_source_no_links "$src"
   if [ -z "$pin" ]; then
     codesign --verify --strict --deep -R="identifier \"$BUNDLE_ID\"" "$src" >/dev/null 2>&1 || die "$src fails signature verification"
-    pin=$(cdhash_of "$src")
+    pin=$(cdhash_of "$src") || die "can't read the cdhash of $src"
   fi
   valid_cdhash "$pin" || die "can't read the cdhash of $src"
   if [ "$DRY" = 1 ]; then
@@ -379,7 +412,9 @@ install_from() {
   else
     stage=$(mktemp -d "$STAGE_PREFIX.XXXXXX") || die "mktemp failed"
     STAGE_DIR="$stage"; trap 'rm -rf "$STAGE_DIR"' EXIT
-    ditto "$src" "$stage/Rampart.app" && chown -R root:wheel "$stage/Rampart.app" && chmod -R go-w "$stage/Rampart.app" || die "copy failed"
+    ditto "$src" "$stage/Rampart.app" || die "copy failed"
+    check_source_no_links "$stage/Rampart.app"   # the copy is ours now; a link that slipped in mid-copy fails the install
+    chown -R -h root:wheel "$stage/Rampart.app" && chmod -R -P go-w "$stage/Rampart.app" || die "copy failed"
     xattr -dr com.apple.quarantine "$stage/Rampart.app" 2>/dev/null || true
   fi
   verify_bundle "$stage/Rampart.app" "$pin"
@@ -399,7 +434,7 @@ place_staged() {
   fi
   verify_bundle "$app" "$EXPECT_CDHASH"
   if [ "$DRY" = 0 ] || [ -n "${RAMPART_TEST_IDENTITY:-}" ]; then
-    local why; why=$(identity_refusal "$app" "$EXPECT_CDHASH" "$IDENTITY")
+    local why; why=$(identity_refusal "$app" "$EXPECT_CDHASH" "$IDENTITY") || why="${why:-the install record could not be checked}"
     [ -z "$why" ] || die "refusing this update: $why"
   else echo "[dry-run] check $(printf %q "$app") against the install record $IDENTITY (signer, cdhash, no rollback)"
   fi
@@ -410,14 +445,14 @@ place_staged() {
       check_not_downgrade "$app" "$dest"
       # Same signer as the copy being replaced (only meaningful with a real certificate; ad-hoc has none).
       if ! is_adhoc "$dest"; then
-        local dr; dr=$(codesign -d -r- "$dest" 2>&1 | sed -n 's/^designated => //p')
+        local dr; dr=$(codesign -d -r- "$dest" 2>&1 | sed -n 's/^designated => //p') || dr=""
         [ -n "$dr" ] && codesign --verify -R="$dr" "$app" >/dev/null 2>&1 || die "the new copy isn't signed by the same identity as $dest"
       fi
     else echo "[dry-run] check $(printf %q "$dest") is not newer (refuse downgrade) and has the same signer"
     fi
   fi
   # Keep the daemon binary and this verified copy inside the root-only folder; /Applications is admin-writable.
-  run cp "$app/Contents/MacOS/rampartd" "$stage/rampartd"
+  run cp "$app/Contents/MacOS/rampartd" "$stage/rampartd" || die "can't stage rampartd"
   if [ -e "$dest" ] && [ ! -L "$dest" ]; then run mv "$dest" "$stage/previous.app" || die "can't move the old copy aside"; fi
   if ! run mv "$app" "$dest"; then
     [ -d "$stage/previous.app" ] && mv "$stage/previous.app" "$dest"
@@ -425,7 +460,8 @@ place_staged() {
   fi
   run rm -rf "$stage/previous.app"
   APP="$dest"
-  RAMPART_DAEMON_SRC="$stage/rampartd" install_rampart
+  DAEMON_SRC="$stage/rampartd" install_rampart
+  DAEMON_SRC=""
   record_identity "$dest"
   record_trusted_clients "$dest"
 }
@@ -448,13 +484,13 @@ restore_dns() {
     m=$(plutil -extract "services.$i.servers" raw -o - "$snap" 2>/dev/null || echo 0)
     [[ "$m" =~ ^[0-9]{1,2}$ ]] || m=0
     for ((j = 0; j < m; j++)); do
-      s=$(plutil -extract "services.$i.servers.$j" raw -o - "$snap")
+      s=$(plutil -extract "services.$i.servers.$j" raw -o - "$snap" 2>/dev/null) || continue
       [[ "$s" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] && servers+=("$s")
     done
-    if [ "${#servers[@]}" = 0 ]; then run networksetup -setdnsservers "$svc" empty
-    else run networksetup -setdnsservers "$svc" "${servers[@]}"; fi
+    if [ "${#servers[@]}" = 0 ]; then run networksetup -setdnsservers "$svc" empty || true
+    else run networksetup -setdnsservers "$svc" "${servers[@]}" || true; fi
   done
-  run dscacheutil -flushcache; run killall -HUP mDNSResponder 2>/dev/null || true
+  run dscacheutil -flushcache || true; run killall -HUP mDNSResponder 2>/dev/null || true
 }
 
 # Prints HOME/REL only if every folder between HOME and REL's last component is a real folder (not a
@@ -469,7 +505,7 @@ safe_user_path() {
   for ((i = 0; i < ${#parts[@]} - 1; i++)); do
     cur="$cur/${parts[i]}"
     [ -d "$cur" ] && [ ! -L "$cur" ] || return 1
-    o=$(stat -f %u "$cur"); [ "$o" = "$uid" ] || [ "$o" = 0 ] || return 1
+    o=$(stat -f %u "$cur") || return 1; [ "$o" = "$uid" ] || [ "$o" = 0 ] || return 1
   done
   printf '%s\n' "$home/$rel"
 }
@@ -496,10 +532,19 @@ uninstall_rampart() {
   run pkill -x Rampart 2>/dev/null || true
   restore_dns
   # pf anchors (never in pf.conf): blocklist 250, emergency 249, remote access 251, the lure, and anything else named Rampart.
+  # Listed names are validated (anchor charset only) and never glob-expanded. A dry run may take the listing from a fixture.
+  local listed
+  if [ "$DRY" = 1 ] && [ -n "${RAMPART_TEST_PF_ANCHORS+x}" ]; then listed="$RAMPART_TEST_PF_ANCHORS"
+  elif [ "$DRY" = 1 ]; then listed=""
+  else listed=$( (pfctl -s Anchors 2>/dev/null; pfctl -a com.apple -s Anchors 2>/dev/null) || true); fi
+  local a
+  set -f
   for a in com.apple/249.RampartEmergency com.apple/250.Rampart com.apple/251.RampartRemote app.rampart/lure \
-           $( (pfctl -s Anchors 2>/dev/null; pfctl -a com.apple -s Anchors 2>/dev/null) | tr -d ' \t' | grep -i rampart | sort -u); do
+           $(printf '%s\n' "$listed" | tr -d ' \t' | grep -i rampart | sort -u || true); do
+    case "$a" in *[!A-Za-z0-9._/-]*|"") echo "    skipping pf anchor with unexpected characters: $a" >&2; continue ;; esac
     run pfctl -a "$a" -F all 2>/dev/null || true
   done
+  set +f
 
   echo "==> Removing files"
   # Fixed root-owned paths only; rm on a symlink removes the link, never its target.
@@ -559,7 +604,7 @@ verify_removed() {
   launchctl print "system/$LABEL_D" >/dev/null 2>&1 && left+=("launchd job system/$LABEL_D")
   pgrep -x rampartd >/dev/null 2>&1 && left+=("running rampartd process")
   pgrep -f "$HELPER" >/dev/null 2>&1 && left+=("running $HELPER process")
-  local pkgs; pkgs=$(pkgutil --pkgs 2>/dev/null)
+  local pkgs; pkgs=$(pkgutil --pkgs 2>/dev/null) || pkgs=""
   grep -qx "$PKG_ID" <<<"$pkgs" && left+=("pkg receipt $PKG_ID")
   if [ "${#left[@]}" = 0 ]; then
     echo "==> Verified: Rampart is completely removed."

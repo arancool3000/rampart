@@ -61,6 +61,7 @@ public final class RefreshScanner: @unchecked Sendable {
     /// Builds an item, measuring it and applying the safety policy's path rules (refused paths never appear).
     func item(_ path: String, _ cat: RefreshCategory, regenerable: Bool, reason: String = "", group: String? = nil, measure: Bool = true) -> RefreshItem? {
         if policy.pathRefusal(path) != nil { return nil }
+        if cat.actionable, policy.categoryRefusal(path, cat) != nil { return nil }   // o8: e.g. a tampered `brew cleanup -n`
         let m = measure ? DiskSizer.measure(path, cancelled: { [weak self] in self?.cancelled ?? true }) : DiskSizer.Measure()
         guard !measure || m.total > 0 else { return nil }
         var it = RefreshItem(path: path, category: cat, bytes: m.bytes, sharedBytes: m.sharedBytes,

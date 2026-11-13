@@ -193,10 +193,13 @@ final class VaultQuarantine: QuarantineService {
     init(vault: QuarantineVault) { self.vault = vault }
     func list() -> [QuarantineRecord] { vault.list() }
     func quarantine(path: String, detection: Detection) throws -> QuarantineRecord {
-        try vault.quarantine(path: path, detectionName: detection.name)
+        // wms-o2: pin the scanned content (only when the detection is about this exact file).
+        let pin = detection.path.map { normalizePath($0) == normalizePath(path) } == true ? detection.sha256 : nil
+        return try vault.quarantine(path: path, detectionName: detection.name, expectedSHA256: pin)
     }
     func restore(id: UUID) throws -> String {
-        try vault.restore(id: id, options: QuarantineVault.RestoreOptions(allowlist: false))
+        // wms-o2: restore the macOS quarantine flag with the item so Gatekeeper still checks it on first open.
+        try vault.restore(id: id, options: QuarantineVault.RestoreOptions(reapplyQuarantineXattr: true, allowlist: false))
     }
     func delete(id: UUID) throws { try vault.delete(id: id) }
     func purgeExpired() { _ = vault.purge(olderThanDays: 30) }

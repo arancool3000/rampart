@@ -78,6 +78,12 @@ final class NetGuardService {
     }
 
     func tick() {
+        // o4: the user's original DNS servers (what the DNS watchdog restores to) never go into the firewall's pf table.
+        let orig = DNSSwitcher(snapshotURL: runtime.root.appendingPathComponent("dns-original.json")).loadSnapshot()?
+            .services.flatMap(\.servers) ?? []
+        if !Set(orig).isSubset(of: Set(firewall.extraProtectedAddresses)) {
+            firewall.extraProtectedAddresses = Array(Set(orig + firewall.extraProtectedAddresses)).sorted()
+        }
         let conns = monitor.snapshot()
         if Date().timeIntervalSince(bytesAt) > 30 { bytes = AppFirewall.byteCounts(); bytesAt = Date() }
         let prompts = firewall.update(connections: conns, bytes: bytes)

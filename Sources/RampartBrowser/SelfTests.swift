@@ -10,7 +10,7 @@ enum BrowserSelfTests {
     }
 
     static func run() -> Bool {
-        urlPolicy(); interstitials(); downloads(); pageFindings(); domainDisplay(); contentRules(); typedInput(); punycodeASCII(); hx6()
+        urlPolicy(); interstitials(); downloads(); pageFindings(); domainDisplay(); contentRules(); typedInput(); punycodeASCII(); hx6(); wmsO3()
         print("RampartBrowser selftest: \(passed) passed, \(failed) failed")
         return failed == 0
     }

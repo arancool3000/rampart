@@ -29,11 +29,12 @@ func send(_ resp: NMResponse) {
 }
 
 let decoder = JSONDecoder()
-while let frame = NativeMessaging.readFrame(fd: STDIN_FILENO) {
+// wms-o3: 4 MiB cap (not Chrome's 64 MiB); every request is cleaned by NMRequestSanitizer inside handle().
+while let frame = NativeMessaging.readFrame(fd: STDIN_FILENO, maxBytes: NativeMessaging.hostMaxInbound) {
     guard let req = try? decoder.decode(NMRequest.self, from: frame) else {
         var id: String? = nil
         if let any = try? JSONSerialization.jsonObject(with: frame) as? [String: Any] { id = any["id"] as? String ?? (any["id"] as? Int).map(String.init) }
-        send(NMResponse(id: id, ok: false, error: "bad request")); continue
+        send(NMResponse(id: NMRequestSanitizer.safeID(id), ok: false, error: "bad request")); continue
     }
     send(service.handle(req))
 }
@@ -79,7 +80,12 @@ final class RampartdBridge: DaemonBridge, @unchecked Sendable {
         guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return nil }
         withUnsafeMutableBytes(of: &addr.sun_path) { raw in for (i, b) in bytes.enumerated() { raw[i] = b }; raw[bytes.count] = 0 }
         let rc = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
-        guard rc == 0, let data = try? IPC.encode(req), IPC.writeFrame(fd: fd, data), let resp = IPC.readFrame(fd: fd) else { return nil }
+        guard rc == 0 else { return nil }
+        // wms-fa: same socket-file and peer policy as the app and CLI (RampartShared.DaemonPeerPolicy). Without it a
+        // same-user process squatting the user socket could answer every blocklist lookup with "not listed" and
+        // swallow every warning the extension reports, while the extension believed RamPart was answering.
+        guard DaemonPeerPolicy.connectedPeerProblem(fd: fd, path: path) == nil else { return nil }
+        guard let data = try? IPC.encode(req), IPC.writeFrame(fd: fd, data), let resp = IPC.readFrame(fd: fd) else { return nil }
         return try? JSONDecoder.rampart.decode(IPCResponse.self, from: resp)
     }
 }

@@ -85,7 +85,16 @@ public final class EventHub {
         public var criticalDropped = 0
         public var perSource: [String: Int] = [:]
         public var buffered = 0
+        /// Identical execs (same parent, image and argv) beyond the storm limit, collapsed (wms-o6).
+        public var floodCollapsed = 0
+        /// `telemetry_gap` events the hub itself raised because it had to shed events.
+        public var gapEvents = 0
     }
+
+    /// Identical execs from one parent allowed per `stormWindow` before the rest are collapsed. A `while true; do
+    /// /usr/bin/true; done` storm can't then evict a real exec from the bounded buffer.
+    public static let stormLimit = 32
+    public static let stormWindow: TimeInterval = 2
 
     public private(set) var config: Config
     /// When set, exec events whose argv matches a recent risky/command clipboard copy are annotated with
@@ -121,6 +130,10 @@ public final class EventHub {
     private var recent: [DedupeKey: TimeInterval] = [:]
     private var lastPrune: TimeInterval = 0
     private var buckets: [String: (tokens: Double, at: TimeInterval)] = [:]
+    private var storms: [Int: (start: TimeInterval, count: Int)] = [:]
+    private var lastGapAt: TimeInterval = -1_000
+    private var droppedSinceGap = 0
+    private var pendingGap: SecurityEvent?
     private var stats = Stats()
     private let deliverQueue = DispatchQueue(label: "app.rampart.telemetry.hub", qos: .userInitiated)
     private let log = RLog.logger("telemetry.hub")
@@ -274,6 +287,11 @@ public final class EventHub {
         }
     }
 
+    /// Critical by kind, or a report that telemetry was lost (that report must survive the very flood it describes).
+    static func isCriticalEvent(_ ev: SecurityEvent) -> Bool {
+        isCritical(ev.kind) || (ev.kind == .other && ev.detail["type"] == "telemetry_gap")
+    }
+
     static func isFileEvent(_ k: SecurityEventKind) -> Bool {
         switch k { case .fileCreate, .fileWrite, .fileClose, .fileRename, .fileDelete: return true; default: return false }
     }
@@ -356,14 +374,25 @@ public final class EventHub {
         recent[key] = now
         if now - lastPrune > config.dedupeWindow * 2 || recent.count > 50_000 {
             recent = recent.filter { now - $0.value < config.dedupeWindow }
+            storms = storms.filter { now - $0.value.start < Self.stormWindow }
             lastPrune = now
+        }
+        // Exec storm collapse (wms-o6): identical execs from one parent beyond the limit carry no new information.
+        if ev.kind == .exec, let p = ev.process {
+            var h = Hasher(); h.combine(p.ppid); h.combine(p.path); h.combine(p.args)
+            let sk = h.finalize()
+            var st = storms[sk] ?? (now, 0)
+            if now - st.start > Self.stormWindow { st = (now, 0) }
+            st.count += 1; storms[sk] = st
+            if storms.count > 50_000 { storms.removeAll(keepingCapacity: true) }
+            if st.count > Self.stormLimit { stats.floodCollapsed += 1; lock.unlock(); return }
         }
         // Per-source token bucket. High-priority security events are NEVER dropped by rate limiting: a
         // flood of cheap events (short-lived execs, file churn) must not drain the bucket and silently
         // hide a real detection. Low-priority events still shed when the bucket is empty.
         var b = buckets[ev.source] ?? (config.perSourceBurst, now)
         b.tokens = min(config.perSourceBurst, b.tokens + (now - b.at) * config.perSourceRate); b.at = now
-        let highPri = Self.isHighPriority(ev.kind)
+        let highPri = Self.isHighPriority(ev.kind) || Self.isCriticalEvent(ev)
         if b.tokens < 1 {
             if highPri {
                 buckets[ev.source] = b            // bucket stays empty; admit the event anyway
@@ -378,12 +407,23 @@ public final class EventHub {
         // Backpressure: bounded buffer. Critical events get a reserved queue that normal overflow never
         // sheds; otherwise shed low priority first, then oldest non-critical high.
         func buffered() -> Int { (crit.count - critHead) + (high.count - highHead) + (low.count - lowHead) }
-        if Self.isCritical(ev.kind) { crit.append(ev) }
+        if Self.isCriticalEvent(ev) { crit.append(ev) }
         else if highPri { high.append(ev) } else { low.append(ev) }
         while buffered() > config.bufferCapacity {
-            if low.count > lowHead { lowHead += 1; stats.overflowDropped += 1 }
-            else if high.count > highHead { highHead += 1; stats.overflowDropped += 1 }
+            if low.count > lowHead { lowHead += 1; stats.overflowDropped += 1; droppedSinceGap += 1 }
+            else if high.count > highHead { highHead += 1; stats.overflowDropped += 1; droppedSinceGap += 1 }
             else { break }   // only critical events remain: keep them unless the hard cap below trips
+        }
+        // Shedding is itself a signal: at most one telemetry_gap every 10 s, on the never-shed critical queue.
+        // It lives in its own single slot (never shed, merged while pending) and is delivered after critical and
+        // high-priority events, before file events: it is context, not something to outrank a real exec.
+        if droppedSinceGap > 0 && (pendingGap != nil || now - lastGapAt >= 10) {
+            let lost = droppedSinceGap + (pendingGap?.detail["lost"].flatMap(Int.init) ?? 0)
+            if pendingGap == nil { stats.gapEvents += 1 }
+            pendingGap = SecurityEvent(date: ev.date, kind: .other,
+                                       detail: ["type": "telemetry_gap", "reason": "hub_overflow", "lost": String(lost),
+                                                "gap_source": "hub"], source: "hub")
+            droppedSinceGap = 0; lastGapAt = now
         }
         // Absolute safety valve: critical events alone must blow past a much larger hard cap before any
         // are shed (keeps a flood of real detections from unbounded memory growth).
@@ -400,6 +440,7 @@ public final class EventHub {
             let ev: SecurityEvent
             if critHead < crit.count { ev = crit[critHead]; critHead += 1 }   // critical first
             else if highHead < high.count { ev = high[highHead]; highHead += 1 }
+            else if let g = pendingGap { ev = g; pendingGap = nil }
             else if lowHead < low.count { ev = low[lowHead]; lowHead += 1 }
             else {
                 crit.removeAll(keepingCapacity: true); high.removeAll(keepingCapacity: true); low.removeAll(keepingCapacity: true)

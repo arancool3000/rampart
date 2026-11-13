@@ -22,6 +22,9 @@ public final class VaultStore: @unchecked Sendable {
 
     /// Wrong-master-password backoff (shared by unlock, re-authentication and password change).
     public let throttle: UnlockThrottle
+    /// wms-fb: called (off the lock, on the caller's thread) after `changeMasterPassword` gave the vault a new
+    /// key, so Touch ID wraps and other key holders can refresh themselves.
+    private var rotationObservers: [() -> Void] = []
     var stateURL: URL { directory.appendingPathComponent("vault.state") }
     private var rollback: RollbackGuard { RollbackGuard(url: stateURL) }
 
@@ -68,7 +71,7 @@ public final class VaultStore: @unchecked Sendable {
         var h = VaultFile.Header(vaultID: vaultID,
                                  kdf: .init(algorithm: "pbkdf2-hmac-sha256", iterations: iterations, salt: SecureRandom.data(16)),
                                  wrappedKey: Data(), written: Date(), generation: generation)
-        let kek = VaultCrypto.pbkdf2(password: password, salt: h.kdf.salt, iterations: iterations)
+        let kek = VaultCrypto.pbkdf2(password: VaultCrypto.normalizedPassword(password), salt: h.kdf.salt, iterations: iterations)
         defer { kek.wipe() }
         h.wrappedKey = try vaultKey.withBytes { b in
             try VaultCrypto.seal(Data(b), key: VaultCrypto.symmetric(kek), aad: VaultFile.wrapAAD(h))
@@ -90,15 +93,34 @@ public final class VaultStore: @unchecked Sendable {
             throw VaultError.badFormat("unknown key derivation")
         }
         try throttle.check()
-        let kek = VaultCrypto.pbkdf2(password: password, salt: file.header.kdf.salt, iterations: file.header.kdf.iterations)
-        defer { kek.wipe() }
-        var raw: Data
-        do { raw = try VaultCrypto.open(file.header.wrappedKey, key: VaultCrypto.symmetric(kek), aad: VaultFile.wrapAAD(file.header)) }
-        catch { throttle.recordFailure(); throw VaultError.wrongPassword }
+        // NFC form first; the raw form only for vaults wrapped before normalisation (one throttled attempt in all).
+        var raw: Data?
+        for form in VaultCrypto.passwordForms(password) where raw == nil {
+            let kek = VaultCrypto.pbkdf2(password: form, salt: file.header.kdf.salt, iterations: file.header.kdf.iterations)
+            defer { kek.wipe() }
+            raw = try? VaultCrypto.open(file.header.wrappedKey, key: VaultCrypto.symmetric(kek), aad: VaultFile.wrapAAD(file.header))
+        }
+        guard var raw else { throttle.recordFailure(); throw VaultError.wrongPassword }
         defer { secureZero(&raw) }
         guard raw.count == 32 else { throw VaultError.tampered }
         throttle.recordSuccess()
         return SecretKeyBytes(data: raw)
+    }
+
+    /// wms-fb: true when `backup`, opened with `password`, yields a key that also opens the vault on disk right now.
+    /// After `changeMasterPassword` this is false for every earlier backup: the vault key is rotated, so an old
+    /// backup plus an old (possibly leaked) master password no longer decrypts the current file.
+    public func backupKeyOpensCurrentVault(backup: URL, password: String) throws -> Bool {
+        if (try? backup.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true { throw VaultError.badFormat("the backup is a link") }
+        let old = try VaultFile.parse(try Data(contentsOf: backup))
+        let key = try unwrapKey(old, password: password)
+        defer { key.wipe() }
+        return try readFile().verify(vaultKey: key)
+    }
+
+    /// Registers a callback for vault-key rotation (see `rotationObservers`).
+    public func addKeyRotationObserver(_ observer: @escaping () -> Void) {
+        mutex.withLock { rotationObservers.append(observer) }
     }
 
     /// Re-authentication check (e.g. before revealing setup links). Doesn't change any state except the
@@ -221,16 +243,26 @@ public final class VaultStore: @unchecked Sendable {
         let file = try readFile()
         let check = try unwrapKey(file, password: current)
         // The password must open the vault that is unlocked right now, not just whatever file is on disk.
-        let matches: Bool? = mutex.withLock { vaultKey.map { k in k.withBytes { a in check.withBytes { b in a == b } } } }
+        let matches: Bool? = mutex.withLock { vaultKey.map { $0.constantTimeEquals(check) } }
         check.wipe()
         guard let matches else { throw VaultError.locked }
         guard matches else { throw VaultError.tampered }
         let iters = iterations ?? VaultCrypto.calibrateIterations()
-        try mutex.withLock {
-            guard let key = vaultKey, let h = header else { throw VaultError.locked }
-            header = try wrapHeader(vaultID: h.vaultID, vaultKey: key, password: new, iterations: iters, generation: h.generation)
-            try saveLocked(forceBackup: true)
+        // wms-fb: a new master password also means a NEW vault key. Re-wrapping the old key would leave every
+        // earlier backup (same key, old password) able to open the current vault: someone who learned the old
+        // password and kept an old copy would not be locked out by the change. Items and meta are re-encrypted
+        // under the new key; the file MAC key changes with it. Observers (Touch ID) re-wrap afterwards.
+        let observers: [() -> Void] = try mutex.withLock {
+            guard let old = vaultKey, let h = header else { throw VaultError.locked }
+            let fresh = SecretKeyBytes(SecureRandom.bytes(32))
+            let newHeader = try wrapHeader(vaultID: h.vaultID, vaultKey: fresh, password: new, iterations: iters, generation: h.generation)
+            let previousHeader = header
+            header = newHeader; vaultKey = fresh
+            do { try saveLocked(forceBackup: true) } catch { header = previousHeader; vaultKey = old; fresh.wipe(); throw error }
+            old.wipe()
+            return rotationObservers
         }
+        for o in observers { o() }
     }
 
     // MARK: Persistence

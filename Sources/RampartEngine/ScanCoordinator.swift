@@ -35,8 +35,46 @@ public struct ScanOptions: Sendable {
             home + "/Downloads", home + "/Desktop", home + "/Library/LaunchAgents",
             home + "/Library/Application Support", "/Applications", "/Library/LaunchAgents",
             "/Library/LaunchDaemons", "/Library/Application Support", "/Users/Shared", "/private/tmp", "/private/var/tmp",
-        ]
+        ] + persistenceRoots(home: home)
         return candidates.filter { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    /// wms-o10: places persistence and plug-ins live that a quick scan used to miss: privileged helpers, startup
+    /// items, authorization plug-ins, plug-in folders system processes load from, kernel extensions, user scripts,
+    /// and unfamiliar hidden folders at the top of the home folder (a favourite hiding place). Known large
+    /// tool caches are left to full scans. Existing paths only.
+    public static func persistenceRoots(home: String) -> [String] {
+        var out = ["/Library/PrivilegedHelperTools", "/Library/StartupItems", "/Library/Security/SecurityAgentPlugins",
+                   "/Library/DirectoryServices/PlugIns", "/Library/Extensions", "/Library/Audio/Plug-Ins", "/Library/Internet Plug-Ins",
+                   "/Library/Scripts", "/private/var/root/.ssh"]
+        for base in ["/Library", home + "/Library"] {
+            out += ["Spotlight", "QuickLook", "Screen Savers", "ColorPickers", "Input Methods", "PreferencePanes"].map { base + "/" + $0 }
+        }
+        out += [home + "/Library/Scripts", home + "/Library/Internet Plug-Ins", home + "/.config/fish"]
+        out += hiddenHomeFolders(home: home)
+        return out.filter { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    /// Big, well-known tool caches skipped by the quick scan's hidden-folder sweep (a full scan still covers them).
+    public static let quickSkipDotDirs: Set<String> = [
+        ".Trash", ".cache", ".npm", ".cargo", ".rustup", ".gradle", ".m2", ".nvm", ".pyenv", ".rbenv", ".docker", ".vscode",
+        ".vscode-server", ".cursor", ".swiftpm", ".bun", ".deno", ".conda", ".pnpm-store", ".yarn", ".volta", ".sdkman", ".android",
+        ".lima", ".colima", ".gem", ".git", ".oh-my-zsh", ".nix-profile", ".ollama", ".minikube", ".vagrant.d", ".terraform.d",
+        ".rye", ".julia", ".ghcup", ".stack", ".opam", ".platformio", ".espressif", ".arduino15", ".claude", ".codex", ".Spotlight-V100",
+        ".fseventsd", ".DocumentRevisions-V100", ".TemporaryItems", ".Trashes", ".local", ".gnupg", ".zsh_sessions", ".dartServer", ".pub-cache",
+        ".kube", ".aws", ".azure", ".config", ".expo", ".gemini", ".ipython", ".jupyter", ".keras", ".matplotlib", ".mozbuild", ".node-gyp",
+        ".nuget", ".dotnet", ".sonarlint", ".vscode-insiders", ".windsurf", ".zed",
+    ]
+
+    public static func hiddenHomeFolders(home: String) -> [String] {
+        let fm = FileManager.default
+        return ((try? fm.contentsOfDirectory(atPath: home)) ?? []).sorted().compactMap { n in
+            guard n.hasPrefix("."), n.count > 1, !quickSkipDotDirs.contains(n) else { return nil }
+            var st = stat()
+            let p = home + "/" + n
+            guard lstat(p, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else { return nil }
+            return p
+        }
     }
 }
 

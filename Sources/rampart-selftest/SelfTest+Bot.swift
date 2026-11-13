@@ -6,7 +6,10 @@ import CoreGraphics
 extension SelfTest {
     static func botChecks() {
         // Matrix shape: every row is exactly 16 boxes, only known keys, mirror-symmetric, strong silhouette.
-        let keys = Set(".LsCGBHESTAhKPF")
+        // Cyber Sentinel adds D d X R V a; each has its own palette colour (an unknown key would draw magenta).
+        let keys = Set(".LsCGBHESTAhKPFDdXRVa")
+        check(PixelGuard.body.allSatisfy { $0.allSatisfy { keys.contains($0) } }, "bot: shipped body uses known keys only")
+        for k in keys where k != "." { check(PixelGuard.Palette.color(k, rightHalf: false) != PixelRGBA(0xFF00FF), "bot: key \(k) has a palette colour") }
         for v in PixelGuard.Variant.allCases {
             let h = PixelGuard.head(v)
             check(h.allSatisfy { $0.count == PixelGuard.cols }, "bot: \(v.name) rows are 16 wide")
@@ -28,7 +31,7 @@ extension SelfTest {
             }
         }
         check(PixelGuard.body.allSatisfy { $0.count == PixelGuard.cols } && PixelGuard.isSymmetric(PixelGuard.body), "bot: body is 16 wide and symmetric")
-        check(PixelGuard.chosen == .capGuard, "bot: shipped mark is the Cap Guard")
+        check(PixelGuard.chosen == .cyberSentinel, "bot: shipped mark is the Cyber Sentinel")
         // Two-tone: right half is darker than the left for the shell.
         let l = PixelGuard.Palette.color("H", rightHalf: false), r = PixelGuard.Palette.color("H", rightHalf: true)
         check(l.r + l.g + l.b > r.r + r.g + r.b, "bot: right half is the shade side")

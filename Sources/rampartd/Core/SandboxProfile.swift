@@ -112,6 +112,18 @@ enum SandboxProfile {
     /// Always unreadable, even as metadata (later rules win in SBPL).
     static let unreadableRoots = ["/Users", "/Volumes", "/usr/local", "/private/var/root", "/Library/Keychains"]
 
+    /// wms-o2: sysctl reads are an allow-list. A blanket `(allow sysctl-read)` let the item list every process on the Mac
+    /// (kern.proc.all) and read the host name. These names are what libSystem, dyld, the shells, perl, ruby and python
+    /// need (checked by running each under the profile).
+    static let sysctlPrefixes = ["hw.", "kern.os", "sysctl.", "vm."]   // "sysctl." = name/format lookups (sysctl.oidfmt, sysctl.proc_*)
+    static let sysctlNames = ["kern.version", "kern.boottime", "kern.argmax", "kern.secure_kernel", "kern.maxfilesperproc",
+                              "kern.maxfiles", "kern.hv_vmm_present", "kern.usrstack64", "kern.ngroups", "kern.bootargs",
+                              "kern.memorystatus_level", "kern.clockrate", "kern.saved_ids", "kern.posix1version"]
+    static var sysctlRule: String {
+        "(allow sysctl-read " + (sysctlPrefixes.map { "(sysctl-name-prefix \"\($0)\")" } + sysctlNames.map { "(sysctl-name \"\($0)\")" })
+            .joined(separator: " ") + ")"
+    }
+
     static let diskLimitBytes: UInt64 = 256 << 20
     static let diskLimitEntries = 20_000
 
@@ -155,7 +167,7 @@ enum SandboxProfile {
         (allow process-exec \(execs.joined(separator: " ")))
         (allow signal (target self))
         (allow process-info* (target self))
-        (allow sysctl-read)
+        \(sysctlRule)
         (allow file-read*)
         (deny file-read-data file-read-xattr (require-not (require-any \(readable))))
         (allow file-map-executable (subpath "/System") (subpath "/usr/lib") (subpath "/Library/Developer/CommandLineTools") (subpath \(w)))

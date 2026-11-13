@@ -171,7 +171,7 @@ final class EmergencyModel {
                 await refresh(); return
             }
         }
-        guard let script = KillSwitchScript.locate() else {
+        guard let script = KillSwitchScript.locate(dryRun: noPriv) else {
             killSwitchReport = "The service didn't answer and the kill switch script isn't available in this copy. In Terminal run: sudo rampart killswitch"
             return
         }

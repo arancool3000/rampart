@@ -21,6 +21,13 @@ struct AppActionExecutor: AIActionExecutor {
         model.activityActorOverride = .ai
         defer { model.activityActorOverride = nil }
         model.noteActivityActor()
+        // wms-o5: a protection-lowering suggestion needs, besides the second click, a fresh administrator
+        // authentication verified by the service (requestDisableProtection -> a 10-minute settings session).
+        // Injected text can at most put a red card on screen; it can never lower protection without the admin.
+        if action.lowersProtection {
+            guard model.mode == .live else { throw offline }
+            try await Self.adminConfirm(model.client, title: action.title)
+        }
         switch action {
         case .setToggle(.realtimeOn, let on):
             guard model.mode == .live else { throw offline }
@@ -33,6 +40,10 @@ struct AppActionExecutor: AIActionExecutor {
             // Read-modify-write against the daemon's current settings (single source of truth).
             guard case .settings(let current) = try await model.client.request(.getSettings) else { throw Failure(description: "Couldn't read the current settings.") }
             guard let next = AIActionValidator.applying(action, to: current) else { throw Failure(description: "Not a settings change.") }
+            // wms-o5: an action not flagged as lowering may never produce a weakening write.
+            if !action.lowersProtection && AIActionValidator.settingsWeaken(old: current, new: next) {
+                throw Failure(description: "This change would lower your protection, so it wasn't applied.")
+            }
             let resp = try await model.client.request(.setSettings(next))
             switch resp {
             case .settings(let confirmed): model.settings = confirmed
@@ -55,5 +66,21 @@ struct AppActionExecutor: AIActionExecutor {
         }
         if let e = model.lastError { throw Failure(description: e) }
         return action.doneText
+    }
+
+    /// Fresh admin prompt (Touch ID or password) -> service-issued token -> settings session. Throws if any step fails.
+    @MainActor static func adminConfirm(_ client: DaemonClient, title: String) async throws {
+        let purpose = "apply the AI assistant's suggestion: \(SafeText.line(title, max: 80))"
+        let o = await EmergencyBridge.withAdminToken(client: client, purpose: purpose) { token in
+            do {
+                switch try await client.request(.disableProtection(token: token, minutes: 0)) {
+                case .ok: return .unsupported          // "no status to show": success for this caller
+                case .error(let e): return .error(e)
+                default: return .error("Unexpected reply from the protection service.")
+                }
+            } catch { return .error(error.localizedDescription) }
+        }
+        if case .error(let e) = o { throw Failure(description: "Administrator confirmation didn't complete: \(e)") }
+        if case .status = o { throw Failure(description: "Administrator confirmation didn't complete.") }
     }
 }

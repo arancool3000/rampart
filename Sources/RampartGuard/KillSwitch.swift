@@ -82,12 +82,28 @@ public enum KillSwitch {
 
     /// Path B: the bundled script is accepted only from inside a verified app bundle's Resources (no symlinks, not
     /// writable by others). Returns the script path or nil.
-    public static func bundledScript(inBundle bundlePath: String) -> String? {
+    ///
+    /// wms-o7: for the real (administrator-prompt) run the script and every folder up to and including the bundle must
+    /// also be root-owned. The app checks the bundle's signature, then macOS shows the password prompt, then root runs
+    /// the file by path: from a copy the user (or an admin attacker who swapped /Applications/RamPart.app) can write, the
+    /// script could be replaced while the prompt is on screen and the owner's password would run attacker code as root.
+    /// A copy that isn't root-owned falls back to `sudo rampart killswitch`; path A (the service) is unaffected.
+    public static func bundledScript(inBundle bundlePath: String, requireRootOwned: Bool = true) -> String? {
         let p = bundlePath + "/Contents/Resources/" + scriptName
         let r = (p as NSString).resolvingSymlinksInPath
         guard r == p || r.hasPrefix((bundlePath as NSString).resolvingSymlinksInPath + "/Contents/Resources/") else { return nil }
         var st = stat()
         guard lstat(p, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_mode & 0o022 == 0 else { return nil }
+        if requireRootOwned {
+            var dirs: [String] = [p]
+            var d = (p as NSString).deletingLastPathComponent
+            let stop = (bundlePath as NSString).standardizingPath
+            while dirs.count < 8 { dirs.append(d); if d == stop || d == "/" || d.isEmpty { break }; d = (d as NSString).deletingLastPathComponent }
+            for x in dirs {
+                var s2 = stat()
+                guard lstat(x, &s2) == 0, s2.st_uid == 0, s2.st_mode & 0o022 == 0 else { return nil }
+            }
+        }
         return p
     }
 

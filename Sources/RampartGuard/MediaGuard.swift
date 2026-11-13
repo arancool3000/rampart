@@ -137,9 +137,25 @@ public enum MediaLogParser {
     }
 
     static func message(_ line: String) -> String {
-        if line.hasPrefix("{"), let d = line.data(using: .utf8),
-           let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any], let m = j["eventMessage"] as? String { return m }
+        if line.hasPrefix("{") {
+            // A JSON record is only believed when Control Center (a system image) logged it. wms-o6: any app can
+            // write "Active activity attributions changed to []" or "isSystemExecutable: true" under the
+            // com.apple.controlcenter subsystem (os_log takes the subsystem as a plain string) to end the session
+            // RamPart is tracking or to have its own bundle id treated as part of macOS.
+            guard line.utf8.count <= 1 << 16, let d = line.data(using: .utf8),
+                  let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let m = j["eventMessage"] as? String else { return "" }
+            if let proc = j["processImagePath"] as? String, !isSystemImage(proc) { return "" }
+            if let sender = j["senderImagePath"] as? String, !isSystemImage(sender) { return "" }
+            return m
+        }
         return line
+    }
+
+    /// Sealed-system-volume or SIP-protected Apple image paths.
+    static func isSystemImage(_ p: String) -> Bool {
+        guard p.hasPrefix("/"), !p.contains("/../") else { return false }
+        return ["/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/usr/lib/", "/Library/Apple/"].contains { p.hasPrefix($0) }
     }
 
     /// Bundle-identifier-like: short, printable, no quotes or path separators.

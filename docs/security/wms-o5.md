@@ -1,0 +1,33 @@
+# wms-o5: AI and text analysis (prompt injection, action approval, PasteGuard, Gemini transport)
+
+Scope: `Sources/RampartAI/**`, `Features/AIAssistant/**`, `Features/Bot/**`, PasteGuard (`RampartBehaviour/PasteGuard*.swift`),
+Scam Check and `RampartWeb/AIInjection.swift`. Tests: `Sources/rampart-selftest/SelfTest+WMSo5.swift` (suite `wmso5`).
+This builds on harden-hx2 (DATA blocks, local injection detector, user-intent filter, gate TTL, transport pinning).
+
+## Threat model
+Attackers write text that reaches the AI or the paste classifier: scam messages, web pages and links, clipboard
+contents, file names and detection evidence. They want to (a) get a weakening settings change proposed or applied,
+(b) get the hidden prompt or the API key out, (c) have malware or a malicious paste rated safe, or (d) slip a
+dangerous command past PasteGuard. Local malware that can drive the GUI with an Accessibility grant is out of scope:
+the app is by design trusted for weakening calls.
+
+## Findings
+
+| # | Sev | Where | Problem | Fix | Status |
+|---|-----|-------|---------|-----|--------|
+| 1 | High | AIActions.swift `Toggle.lowers` | The assistant treated **learning mode on**, **daily quick scan off** and **tracker blocking off** as harmless. The daemon (`IPCAuthz.settingsWeaken`) counts all three as weakening. So injected DATA could get e.g. "Turn on learning mode" (which suppresses behaviour alerts) shown as a one-click teal card. The user-intent filter and the second confirm were both skipped. | Aligned with the daemon. Added `AIActionValidator.settingsWeaken`, a mirror of the daemon check. A selftest compares every toggle in both directions against `IPCAuthz`. The executor refuses any write that weakens when the action wasn't flagged as lowering. Added a warning for learning mode. | Fixed |
+| 2 | Med | AIActionGate / AIChatModel | Approval was keyed by id only. A card whose content differed from the registered proposal but reused its id would run the stored action, not the one shown. The app checked the id only. | `approve(displayed:)`: the whole proposal (id, action, value, reason) must equal the registered one, or it throws `.mismatch` and the proposal is retired. The app uses only this overload and checks full equality against its own messages. | Fixed |
+| 3 | Med | AIActionExecutor | A weakening change needed only the second click. There was no administrator authentication. | Lowering actions now run `EmergencyBridge.withAdminToken`: a fresh Touch ID or password prompt, then a service-verified token, then `disableProtection(token, minutes: 0)`, which opens a 10-minute settings session. Only then is the change applied. Any failure means nothing changes. Headless and `RAMPART_NO_PRIVILEGED_TOOLS` runs never prompt (the existing bridge behaviour). | Fixed |
+| 4 | Med | PromptKit, AIInjection (Scam Check), PasteCommandAnalyzer | Injection detectors matched ASCII only. Cyrillic or Greek look-alikes ("іgnоre previous instructions", "this is sаfe"), fullwidth and accented forms got through. The paste analyzer also missed a single zero-width split. | New `RampartShared/TextFold` (NFKC, confusable map, diacritic and width folding, invisible-character removal). All three detectors also match the folded form. The paste detector gained the loose override and "this command is safe" forms. Benign Russian, Greek, accented and emoji text is checked for no false positives. | Fixed |
+| 5 | Med | PasteGuardClassifier | Bypasses: extra pipe stages (`curl … \| tee f \| sh`, `\| base64 -D \| bash`), `env`/`xargs` wrappers, here-strings `bash <<< "$(curl …)"`, backticks, download then `python3`/`osascript`/`zsh`, base64 piped to a shell, `osascript -e 'do shell script "curl …"'`. Zero-width, homoglyph and bidi characters also hid the command words from the run-intent check. | New signatures. Matching also runs on a folded copy and its decoded layers. Hidden, bidi or mixed-script words in a paste add an obfuscation score (ZWJ and ZWNJ are excluded so emoji don't trigger it). Run intent is also checked on the folded text. | Fixed |
+| 6 | Med | PasteGuardDecision | Without an AI verdict (AI off, no key, timeout, error), local-only blocking needed a score of 90 or more. Encoded download-and-run (about 79), a password lure (75) or a reverse shell (85) only warned. | New row B4: no AI opinion and local score of 75 or more means block. A plain unpinned `curl \| sh` (70) still only warns, so unlisted dev installers aren't blocked. An AI "benign" verdict still can't drop anything below warn. | Fixed |
+| 7 | Low | GeminiClient | There was no request size cap. The key wasn't re-validated when building the request (the key provider is injectable, so a CR/LF key could split the header). The per-request timeout wasn't capped, and there was no overall deadline across retries. | Request body capped at 512 KB. The key must pass `isPlausibleKey` (key characters only). The timeout must be finite, positive and at most 120 s. There is an overall 120 s deadline. | Fixed |
+
+Checked and found sound: the key is read only from the Keychain (no UI) and sent only in `x-goog-api-key`. It is never in the URL, logs or error text. The transport uses an ephemeral session, TLS 1.2 minimum, system trust evaluation pinned to the Gemini host, refusal of every redirect, no client-certificate or HTTP-auth challenges, and a 2 MB response cap. Proposals only come from the Ask chat. Scam, link, detection and paste tools have no action field. The model never sees the key. Prompt-leak output checks (markers, nonce, 9-word shingles) are in place. PasteGuard's AI can raise a verdict but never lower one.
+
+## Residual risks
+- The injection detectors are pattern-based. Paraphrase, other languages, letter-spaced text ("i g n o r e") and instructions hidden in images defeat them. The structural defences (DATA blocks, no actions outside Ask, the user-intent filter, local verdict floors) are what really hold.
+- The model can still give poor *advice* in prose. A prompt leak through translation or encoding isn't caught by the shingle check, but the prompt holds no secrets.
+- The GUI app is trusted to make weakening changes. Malware with an Accessibility grant could click through the cards and the admin prompt is the remaining barrier, which it can't pass without the password or Touch ID.
+- PasteGuard is heuristic. Shell variable tricks (`a=cu;b=rl;$a$b …`) and downloaders other than curl/wget aren't modelled. Plain unpinned `curl | sh` only warns (a false-positive trade-off).
+- Without Endpoint Security AUTH, RamPart can't stop a command typed by hand. PasteGuard covers the clipboard only.

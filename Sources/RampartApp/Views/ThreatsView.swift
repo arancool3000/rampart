@@ -477,7 +477,7 @@ struct DetectionInspector: View {
             if let record { RestoreSheet(record: record, detection: detection, onRestored: onRestored) }
         }
         .sheet(item: $teaching) { req in TeachSheet(request: req) }
-        .confirmationDialog("Delete \"\(displayName)\" permanently?", isPresented: $showDelete) {
+        .confirmationDialog("Delete \"\(SafeText.line(displayName, max: 60))\" permanently?", isPresented: $showDelete) {
             Button("Delete", role: .destructive) { if let record { onDelete(record) } }
             Button("Cancel", role: .cancel) {}
         } message: { Text("You'll have a few seconds to undo. After that, the file is gone for good.") }

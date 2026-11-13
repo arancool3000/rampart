@@ -53,6 +53,19 @@ extension SelfTest {
             ("netguard", SelfTest.netGuardChecks),
             ("desktop", SelfTest.desktopChecks),
             ("reliability", SelfTest.reliabilityChecks),
+            ("wmsfc", SelfTest.wmsFcChecks),
+            ("wmsfb", SelfTest.wmsFbChecks),
+            ("wmso6", SelfTest.wmsO6Checks),
+            ("wmso9", SelfTest.wmso9Checks),
+            ("wmso2", SelfTest.wmsO2Checks),
+            ("wmso8", SelfTest.wmsO8Checks),
+            ("wmso3", SelfTest.wmsO3Checks),
+            ("wmso1", SelfTest.wmsO1Checks),
+            ("wmso10", SelfTest.wmsO10Checks),
+            ("wmso5", SelfTest.wmsO5Checks),
+            ("wmso7", SelfTest.wmsO7Checks),
+            ("wmso4", SelfTest.wmsO4Checks),
+            ("wmsfa", SelfTest.wmsFaChecks),
         ]
     }
 }

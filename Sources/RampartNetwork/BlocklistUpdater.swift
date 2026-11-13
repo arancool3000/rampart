@@ -16,13 +16,26 @@ public final class BlocklistUpdater: @unchecked Sendable {
         /// at `signatureURL` (default `<url>.sig`, raw 64 bytes or base64) and may come from any https host.
         public var publicKey: String?
         public var signatureURL: URL?
+        /// wms-fc: when set (with `publicKey`), the list is RamPart's own and is verified against a signed manifest
+        /// (`FeedSigning`: SHA-256 + size + feed id + monotonic version + creation date) instead of a bare `.sig`.
+        /// A bare signature can be replayed with an old list; the manifest can't.
+        public var manifestURL: URL?
         public init(id: String, url: URL, format: DomainBlocklist.Format, minimumEntries: Int, refreshInterval: TimeInterval,
-                    publicKey: String? = nil, signatureURL: URL? = nil) {
+                    publicKey: String? = nil, signatureURL: URL? = nil, manifestURL: URL? = nil) {
             self.id = id; self.url = url; self.format = format
             self.minimumEntries = minimumEntries; self.refreshInterval = refreshInterval
-            self.publicKey = publicKey; self.signatureURL = signatureURL
+            self.publicKey = publicKey; self.signatureURL = signatureURL; self.manifestURL = manifestURL
         }
         public var effectiveSignatureURL: URL { signatureURL ?? URL(string: url.absoluteString + ".sig")! }
+
+        /// RamPart's own signed domain list. nil until the lead sets `FeedSigning.productionPublicKeyBase64` (the hook).
+        public static func rampartSigned(id: String, url: URL, format: DomainBlocklist.Format, minimumEntries: Int,
+                                         refreshInterval: TimeInterval = 12 * 3600,
+                                         publicKey: String? = FeedSigning.productionPublicKeyBase64) -> Source? {
+            guard let publicKey, FeedSigning.keyID(publicKeyBase64: publicKey) != nil else { return nil }
+            return Source(id: id, url: url, format: format, minimumEntries: minimumEntries, refreshInterval: refreshInterval,
+                          publicKey: publicKey, manifestURL: FeedSigning.defaultManifestURL(for: url))
+        }
     }
 
     /// Defaults from research doc 06.
@@ -124,7 +137,8 @@ public final class BlocklistUpdater: @unchecked Sendable {
     func listURL(_ s: Source) -> URL { directory.appendingPathComponent(s.id + ".txt") }
     func metaURL(_ s: Source) -> URL { directory.appendingPathComponent(s.id + ".meta.json") }
 
-    struct Meta: Codable { var etag: String?; var lastModified: String?; var fetched: Date; var entries: Int }
+    /// `version` / `sha256`: the last accepted signed manifest (rollback protection for RamPart's own lists).
+    struct Meta: Codable { var etag: String?; var lastModified: String?; var fetched: Date; var entries: Int; var version: Int?; var sha256: String? }
 
     public struct Rejection: Error, CustomStringConvertible {
         public let reason: String
@@ -208,7 +222,25 @@ public final class BlocklistUpdater: @unchecked Sendable {
             log.error("blocklist \(source.id, privacy: .public) rejected: \(why.reason, privacy: .public)")
             return .rejected(why.reason)
         case .success(let n):
-            if let pk = source.publicKey {
+            var accepted: FeedSigning.Manifest?
+            if let pk = source.publicKey, let murl = source.manifestURL {
+                // RamPart's own list: signed manifest with rollback + freshness checks (wms-fc).
+                guard murl.scheme?.lowercased() == "https" else { return .rejected("manifest URL must be https") }
+                var mreq = URLRequest(url: murl)
+                mreq.setValue("Rampart/\(Product.version)", forHTTPHeaderField: "User-Agent")
+                guard let (signed, mresp) = try? await session.data(for: mreq), (mresp as? HTTPURLResponse)?.statusCode == 200,
+                      (mresp as? HTTPURLResponse)?.url?.host?.lowercased() == murl.host?.lowercased() else {
+                    log.error("blocklist \(source.id, privacy: .public) rejected: signed manifest missing")
+                    return .rejected("signed manifest missing")
+                }
+                let prev = meta?.version.map { FeedSigning.Previous(version: $0, sha256: meta?.sha256) }
+                switch FeedSigning.verify(signed: signed, body: data, feed: source.id, publicKeyBase64: pk, previous: prev) {
+                case .success(let m): accepted = m
+                case .failure(let f):
+                    log.error("blocklist \(source.id, privacy: .public) rejected: \(f.description, privacy: .public)")
+                    return .rejected("signed manifest refused: \(f)")
+                }
+            } else if let pk = source.publicKey {
                 var sreq = URLRequest(url: source.effectiveSignatureURL)
                 sreq.setValue("Rampart/\(Product.version)", forHTTPHeaderField: "User-Agent")
                 guard let (sig, sresp) = try? await session.data(for: sreq), (sresp as? HTTPURLResponse)?.statusCode == 200,
@@ -225,7 +257,8 @@ public final class BlocklistUpdater: @unchecked Sendable {
             do {
                 try data.write(to: listURL(source), options: .atomic)
                 let m = Meta(etag: http.value(forHTTPHeaderField: "ETag"),
-                             lastModified: http.value(forHTTPHeaderField: "Last-Modified"), fetched: Date(), entries: n)
+                             lastModified: http.value(forHTTPHeaderField: "Last-Modified"), fetched: Date(), entries: n,
+                             version: accepted?.version ?? meta?.version, sha256: accepted?.sha256.lowercased() ?? meta?.sha256)
                 try JSONEncoder.rampart.encode(m).write(to: metaURL(source), options: .atomic)
             } catch { return .failed("write: \(error.localizedDescription)") }
             return .updated(entries: n)

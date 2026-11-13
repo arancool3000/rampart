@@ -116,7 +116,40 @@ public final class BehaviourEngine: @unchecked Sendable {
         var out: [Detection] = []
         for h in hits { if let d = apply(h) { out.append(d) } }
         expireStories(now: e.date)
+        capState(now: e.date)
         return dedupe(out)
+    }
+
+    /// wms-o6: every per-key table is bounded, so an event flood with endless distinct pids, paths or stories can't
+    /// grow the engine's memory without limit (the tables are caches; losing old entries only loses old context).
+    public static let maxTableEntries = 20_000
+    func capState(now: Date) {
+        let cap = Self.maxTableEntries
+        if thresholds.count > cap {
+            let maxWin = 3600.0
+            thresholds = thresholds.filter { !$0.value.isEmpty && now.timeIntervalSince($0.value.last!.0) < maxWin }
+            if thresholds.count > cap { thresholds.removeAll(keepingCapacity: true) }
+        }
+        if firstSeenKeys.count > cap * 5 { firstSeenKeys.removeAll(keepingCapacity: true) }
+        if imageFirstSeen.count > cap * 2 { imageFirstSeen.removeAll(keepingCapacity: true) }
+        if connected.count > cap * 2 { connected.removeAll(keepingCapacity: true) }
+        if beacons.count > cap { beacons.removeAll(keepingCapacity: true); beaconFired.removeAll(keepingCapacity: true) }
+        if beaconFired.count > cap { beaconFired.removeAll(keepingCapacity: true) }
+        if marks.count > cap { marks = marks.filter { !$0.value.isEmpty } }
+        if stories.count > cap {
+            stories = stories.filter { now.timeIntervalSince($0.value.lastActivity) < config.storyTTL }
+            if stories.count > cap {
+                let keep = stories.values.sorted { $0.lastActivity > $1.lastActivity }.prefix(cap * 3 / 4)
+                stories = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0) })
+            }
+        }
+    }
+
+    /// Sizes of the internal tables (tests / diagnostics).
+    public var stateSizes: [String: Int] {
+        lock.lock(); defer { lock.unlock() }
+        return ["thresholds": thresholds.count, "stories": stories.count, "firstSeenKeys": firstSeenKeys.count,
+                "imageFirstSeen": imageFirstSeen.count, "connected": connected.count, "beacons": beacons.count]
     }
 
     /// Assesses records without scoring or touching story state (baseline review lists).
@@ -261,11 +294,20 @@ public final class BehaviourEngine: @unchecked Sendable {
         return !activeMarks("pasteEntry", window: nil, now: now).isEmpty && ctx.chain.contains { nameIn($0.name, ["@terminals"]) }
     }
 
+    /// Positive name match on a node: its file name, or the name its Apple signature was shipped under (renamed copies).
+    func nodeNameIn(_ n: ProcessNode, _ patterns: [String]) -> Bool {
+        nameIn(n.name, patterns) || (n.shippedName.map { nameIn($0, patterns) } ?? false)
+    }
+
     func matches(_ m: Matcher, rule: Rule, _ ctx: Context) -> Bool {
         let e = ctx.event
         if let k = m.kinds, !k.contains(e.kind) { return false }
         let pname = ctx.node?.name ?? e.process.map { PathUtil.basename($0.path) }
-        if let p = m.process { guard let pname, nameIn(pname, p) else { return false } }
+        let shipped = ctx.node?.shippedName ?? e.process.flatMap { ProcessNode.shippedName(path: $0.path, signingID: $0.signingID, isPlatformBinary: $0.isPlatformBinary) }
+        if let p = m.process {
+            guard let pname, nameIn(pname, p) || (shipped.map { nameIn($0, p) } ?? false) else { return false }
+        }
+        // Exclusions use the real file name only: a shipped-name alias must never make something exempt.
         if let p = m.processNot, let pname, nameIn(pname, p) { return false }
         if let p = m.processPath { guard let ip = ctx.imagePath, anyRegex(p, ip) else { return false } }
         if let a = m.args { for p in rules.expand(a) ?? [] where !RegexCache.shared.matches(p, ctx.argv) { return false } }
@@ -284,12 +326,12 @@ public final class BehaviourEngine: @unchecked Sendable {
         if let d = m.detailNot {
             for (k, p) in d { if let v = e.detail[k], RegexCache.shared.matches(p, v) { return false } }
         }
-        if let p = m.parent { guard let par = ctx.chain.first, nameIn(par.name, p) else { return false } }
-        if let a = m.ancestor { guard ctx.chain.contains(where: { nameIn($0.name, a) }) else { return false } }
+        if let p = m.parent { guard let par = ctx.chain.first, nodeNameIn(par, p) else { return false } }
+        if let a = m.ancestor { guard ctx.chain.contains(where: { nodeNameIn($0, a) }) else { return false } }
         if let a = m.ancestorNot, ctx.chain.contains(where: { nameIn($0.name, a) }) { return false }
         if let s = m.sibling {
             guard let n = ctx.node else { return false }
-            let sibs = tracker.siblings(of: n, within: m.siblingWindow ?? 3).filter { nameIn($0.name, s) }
+            let sibs = tracker.siblings(of: n, within: m.siblingWindow ?? 3).filter { nodeNameIn($0, s) }
             let ok = sibs.contains { sib in !(m.siblingArgsNot.map { anyRegex($0, sib.argvText) } ?? false) }
             if !ok { return false }
         }
@@ -463,7 +505,8 @@ public final class BehaviourEngine: @unchecked Sendable {
             // R12 shell rc additions.
             let base = PathUtil.basename(p)
             if [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".bash_profile", ".bashrc", ".bash_login", ".profile"].contains(base)
-                || ["/etc/zshrc", "/etc/zprofile", "/etc/zshenv", "/etc/profile", "/etc/bashrc"].contains(p) {
+                || ["/etc/zshrc", "/etc/zprofile", "/etc/zshenv", "/etc/profile", "/etc/bashrc"].contains(p)
+                || (p.contains("/fish/") && base.hasSuffix(".fish") && (base == "config.fish" || p.contains("/conf.d/"))) {  // wms-o10
                 var added: [String] = []
                 if let a = e.detail["added_lines"] { added = a.components(separatedBy: "\n") }
                 else if let s = try? String(contentsOfFile: p, encoding: .utf8) {
@@ -491,6 +534,17 @@ public final class BehaviourEngine: @unchecked Sendable {
                 break
             }
         }
+        // EV1 / EV3 (wms-o6): renamed or relocated Apple tools, and programs dressed up as system processes.
+        if e.kind == .exec, let n = ctx.node {
+            let appleSigned = trustEval.isAppleSigned(path: n.path, platformHint: n.isPlatformBinary)
+            if appleSigned, PathClass.isRelocatedAppleToolPath(n.path), !isAllowlisted(node: n, rule: ruleByID["EV1"]) {
+                let shipped = n.shippedName.map { " (it ships as \($0))" } ?? ""
+                hit("EV1", "An Apple-signed tool runs from \(n.path)\(shipped), outside the system folders.", label: n.path)
+            }
+            if !appleSigned, let why = Self.systemNameDisguise(path: n.path, argv0: n.args.first) {
+                hit("EV3", why, label: n.path)
+            }
+        }
         // R41 first connection / R46 beaconing.
         if e.kind == .networkConnect, let n = ctx.node, e.detail["listen"] != "1" {
             let ip = e.detail["remote_ip"] ?? e.detail["remote"] ?? ""
@@ -515,6 +569,39 @@ public final class BehaviourEngine: @unchecked Sendable {
             }
         }
         return out
+    }
+
+    /// Names of macOS system processes that malware borrows to hide in process lists (T1036.004/.005).
+    static let systemProcessNames: Set<String> = [
+        "launchd", "kernel_task", "windowserver", "loginwindow", "mds", "mds_stores", "mdworker", "mdworker_shared",
+        "softwareupdated", "softwareupdate", "syspolicyd", "trustd", "cfprefsd", "distnoted", "coreaudiod", "bluetoothd",
+        "airportd", "xprotect", "xprotectservice", "coreservicesd", "securityd", "syslogd", "logd", "notifyd",
+        "configd", "sharingd", "systemuiserver", "controlcenter", "coreservicesuiagent", "nsurlsessiond", "rapportd",
+        "usernoted", "usereventagent", "diskarbitrationd", "fseventsd", "opendirectoryd", "powerd", "tccd", "amfid",
+        "apsd", "cloudd", "accountsd", "sysmond", "kextd", "spindump", "secd", "runningboardd",
+        "xpcproxy", "launchservicesd",
+    ]
+
+    /// Why a non-Apple program looks disguised as a system process, or nil.
+    static func systemNameDisguise(path: String, argv0: String?) -> String? {
+        let base = PathUtil.basename(path)
+        let lower = base.lowercased()
+        let sysDir = PathClass.classify(path) == .system
+        if !sysDir, systemProcessNames.contains(lower) || (lower.hasPrefix("com.apple.") && !path.contains(".app/Contents/")) {
+            // A same-named app bundle in /Applications (e.g. a third-party "Dock" utility) is not a disguise.
+            if !(path.hasPrefix("/Applications/") && path.contains(".app/Contents/MacOS/")) {
+                return "A non-Apple program named \"\(base)\" runs from \(path), outside the system folders, under a macOS process name."
+            }
+        }
+        if let a0 = argv0, !a0.isEmpty {
+            let raw = a0.hasPrefix("-") ? String(a0.dropFirst()) : a0
+            let n0 = PathUtil.basename(raw)
+            let l0 = n0.lowercased()
+            if l0 != lower, systemProcessNames.contains(l0) || (l0.hasPrefix("com.apple.") && l0.count > 10) {
+                return "\(path) started with argv[0] \"\(String(n0.prefix(80)))\", the name of a macOS system process, so it shows up as that in process lists."
+            }
+        }
+        return nil
     }
 
     static func isPrivateIP(_ ip: String) -> Bool {

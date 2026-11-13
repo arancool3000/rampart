@@ -24,9 +24,12 @@ public struct HelperProcessFacts: Sendable, Equatable {
     public var teamID: String?
     /// The executable at `path` still exists and is a RamPart service build.
     public var pathStillOurs: Bool
-    public init(pid: Int32, uid: uid_t, ruid: uid_t, path: String, startTime: Date, signingID: String?, teamID: String?, pathStillOurs: Bool) {
+    /// cdhash the kernel holds for the running process (nil = unknown).
+    public var cdhash: String?
+    public init(pid: Int32, uid: uid_t, ruid: uid_t, path: String, startTime: Date, signingID: String?, teamID: String?, pathStillOurs: Bool,
+                cdhash: String? = nil) {
         self.pid = pid; self.uid = uid; self.ruid = ruid; self.path = path; self.startTime = startTime
-        self.signingID = signingID; self.teamID = teamID; self.pathStillOurs = pathStillOurs
+        self.signingID = signingID; self.teamID = teamID; self.pathStillOurs = pathStillOurs; self.cdhash = cdhash
     }
 }
 
@@ -38,8 +41,11 @@ public struct HelperSelfFacts: Sendable, Equatable {
     public var installTime: Date
     public var signingID: String?
     public var teamID: String?
-    public init(pid: Int32, uid: uid_t, path: String, installTime: Date, signingID: String?, teamID: String?) {
+    /// cdhash of our binary on disk (nil = unknown).
+    public var cdhash: String?
+    public init(pid: Int32, uid: uid_t, path: String, installTime: Date, signingID: String?, teamID: String?, cdhash: String? = nil) {
         self.pid = pid; self.uid = uid; self.path = path; self.installTime = installTime; self.signingID = signingID; self.teamID = teamID
+        self.cdhash = cdhash
     }
 }
 
@@ -62,23 +68,33 @@ public enum StaleHelperPolicy {
         guard ht == mt else { return .keep("signed by a different identity (\(ht.isEmpty ? "ad-hoc" : ht) vs \(mt.isEmpty ? "ad-hoc" : mt))") }
         guard h.startTime < me.installTime else { return .keep("started after this copy was installed (not stale)") }
         let samePath = GuardPaths.normalize(h.path).lowercased() == GuardPaths.normalize(me.path).lowercased()
+        // wms-o7: "installed after it started" is read from the binary's ctime, which anyone who can see the file can bump
+        // without writing it (a hard link to it, then removing the link). That made the CURRENT helper look stale, so a
+        // second instance started by any local program stopped it and took its place. A running helper that is this
+        // very build (same cdhash) is never stale.
+        if samePath, let a = h.cdhash?.lowercased(), let b = me.cdhash?.lowercased(), !a.isEmpty, a == b {
+            return .keep("the running helper is this same build (not stale)")
+        }
         guard samePath || !h.pathStillOurs else { return .keep("a different, still-installed copy at \(h.path)") }
         return .stop(samePath ? "a helper from the copy this one replaced (pid \(h.pid))" : "a helper whose copy was moved or deleted (pid \(h.pid), \(h.path))")
     }
 
     // MARK: live facts
 
-    static func signing(pid: Int32) -> (id: String?, team: String?) {
+    static func signing(pid: Int32) -> (id: String?, team: String?) { let s = signingFull(pid: pid); return (s.id, s.team) }
+
+    static func signingFull(pid: Int32) -> (id: String?, team: String?, cdhash: String?) {
         var code: SecCode?
         guard SecCodeCopyGuestWithAttributes(nil, [kSecGuestAttributePid: NSNumber(value: pid)] as CFDictionary, [], &code) == errSecSuccess,
-              let code else { return (nil, nil) }
+              let code else { return (nil, nil, nil) }
         // A SecCode may be passed where a SecStaticCode is expected (Security.framework); this reads the identity the
         // kernel holds for the running process, so it works even when its executable was deleted or replaced.
         let asStatic = unsafeBitCast(code, to: SecStaticCode.self)
         var info: CFDictionary?
         guard SecCodeCopySigningInformation(asStatic, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
-              let d = info as? [String: Any] else { return (nil, nil) }
-        return (d[kSecCodeInfoIdentifier as String] as? String, d[kSecCodeInfoTeamIdentifier as String] as? String)
+              let d = info as? [String: Any] else { return (nil, nil, nil) }
+        let cd = (d[kSecCodeInfoUnique as String] as? Data).map { $0.map { String(format: "%02x", $0) }.joined() }
+        return (d[kSecCodeInfoIdentifier as String] as? String, d[kSecCodeInfoTeamIdentifier as String] as? String, cd)
     }
 
     static func signing(path: String) -> (id: String?, team: String?) {
@@ -92,11 +108,11 @@ public enum StaleHelperPolicy {
         guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0,
               proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) == Int32(MemoryLayout<proc_bsdinfo>.size) else { return nil }
         let path = String(cString: buf)
-        let sig = signing(pid: pid)
+        let sig = signingFull(pid: pid)
         let onDisk = signing(path: path)
         let start = Date(timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1_000_000)
         return HelperProcessFacts(pid: pid, uid: info.pbi_uid, ruid: info.pbi_ruid, path: path, startTime: start,
-                                  signingID: sig.id, teamID: sig.team, pathStillOurs: onDisk.id == serviceSigningID)
+                                  signingID: sig.id, teamID: sig.team, pathStillOurs: onDisk.id == serviceSigningID, cdhash: sig.cdhash)
     }
 
     public static func installTime(of path: String) -> Date? {
@@ -111,8 +127,8 @@ public enum StaleHelperPolicy {
     public static func selfFacts(binary: String, pid: Int32 = getpid()) -> HelperSelfFacts? {
         let path = URL(fileURLWithPath: binary).resolvingSymlinksInPath().path
         guard let t = installTime(of: path) else { return nil }
-        let s = signing(path: path)
-        return HelperSelfFacts(pid: pid, uid: getuid(), path: path, installTime: t, signingID: s.id, teamID: s.team)
+        let s = OwnCodeSignature.read(path).flatMap { $0.valid ? $0 : nil }
+        return HelperSelfFacts(pid: pid, uid: getuid(), path: path, installTime: t, signingID: s?.identifier, teamID: s?.teamID, cdhash: s?.cdhash)
     }
 
     /// The pid recorded in a state root's `rampartd.lock` (written by the helper that holds it).

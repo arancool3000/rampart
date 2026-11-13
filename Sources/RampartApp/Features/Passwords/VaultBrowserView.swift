@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import RampartVault
+import RampartShared
 
 /// Three columns: categories/folders/tags · item list · detail or editor.
 struct VaultBrowserView: View {
@@ -223,7 +224,7 @@ struct ItemDetail: View {
             }
             .padding(Spacing.xl)
         }
-        .confirmationDialog("Delete “\(item.title)”?", isPresented: $confirmDelete) {
+        .confirmationDialog("Delete “\(SafeText.line(item.title, max: 60))”?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) { model.delete(item.id) }
         } message: { Text("An encrypted backup of the vault is kept, but the item disappears from the vault now.") }
     }

@@ -25,6 +25,9 @@ public final class EsloggerSource: EventSource, CPUReporting {
         "exec", "fork", "exit", "open", "create", "rename", "close", "unlink", "deleteextattr",
         "btm_launch_item_add", "btm_launch_item_remove", "xp_malware_detected", "xp_malware_remediated",
         "tcc_modify", "gatekeeper_user_override", "profile_add",
+        // wms-o6: second names for a file (hard link / clone / copy) so decoy and credential-store reads through
+        // another path stay attributable.
+        "link", "clone", "copyfile",
     ]
 
     public let name = "eslogger"
@@ -68,7 +71,15 @@ public final class EsloggerSource: EventSource, CPUReporting {
         stop()
         let s = ChildLineStream(executable: Self.binary, arguments: subscribed, label: "eslogger")
         let parser = self.parser, cpu = self.cpu
-        s.onLine = { line in if let ev = cpu.measure({ parser.parse(data: line) }) { handler(ev) } }
+        let gaps = GapReporter(source: "eslogger")
+        s.onLine = { line in
+            if let ev = cpu.measure({ parser.parse(data: line) }) {
+                if let g = ev.detail["seq_gap"].flatMap(Int.init), let note = gaps.note(reason: "es_drop", lost: g, at: ev.date) { handler(note) }
+                handler(ev)
+            }
+        }
+        // Output the consumer couldn't keep up with was dropped (bounded backlog): say so instead of going quietly blind.
+        s.onGap = { bytes in if let note = gaps.note(reason: "backpressure", lost: bytes, at: Date()) { handler(note) } }
         s.onExit = { [weak self, weak s] status, stderr in
             guard let self else { return }
             let lower = stderr.lowercased()
@@ -90,4 +101,26 @@ public final class EsloggerSource: EventSource, CPUReporting {
     }
 
     deinit { stream?.stop() }
+}
+
+/// Turns telemetry loss (ES kernel drops, backpressure) into at most one `telemetry_gap` event per interval, so a
+/// flood meant to hide something is itself visible. Not thread-safe; used from one source queue.
+public final class GapReporter {
+    public let source: String
+    public var interval: TimeInterval = 10
+    private var last: Date?
+    private var pending = 0
+    private var pendingReasons: Set<String> = []
+    public init(source: String) { self.source = source }
+
+    public func note(reason: String, lost: Int, at date: Date) -> SecurityEvent? {
+        pending += max(0, lost); pendingReasons.insert(reason)
+        if let l = last, date.timeIntervalSince(l) < interval, date >= l { return nil }
+        last = date
+        let ev = SecurityEvent(date: date, kind: .other,
+                               detail: ["type": "telemetry_gap", "reason": pendingReasons.sorted().joined(separator: ","),
+                                        "lost": String(pending), "gap_source": source], source: source)
+        pending = 0; pendingReasons = []
+        return ev
+    }
 }

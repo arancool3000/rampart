@@ -46,11 +46,55 @@ public struct OwnInstallTrust: Sendable {
     public var trustedCDHashes: Set<String>
     /// Signature reader (injectable for tests).
     public var signature: @Sendable (String) -> OwnCodeSignature?
+    /// wms-o7: the real install is root-owned (rampart-setup.sh: chown -R root:wheel, chmod -R go-w). An administrator
+    /// can't write into it without the password, but can rename /Applications/RamPart.app and put a copy of their own in
+    /// its place (hard links keep the original files root-owned) with an extra file added. Such a file used to verify as
+    /// "ours" (bundle resources trusted because the main executable verifies; any app.rampart.* signed binary trusted
+    /// because the bundle's helper does), so it was never quarantined, never frozen, never a lockdown trigger, and a
+    /// manifest mismatch it caused was resealed as a "verified upgrade". When `requireRootOwnership` is on, a file is
+    /// vouched for only if it and every folder from it up to the bundle (or its own folder) is root-owned and not
+    /// group/world-writable. Default: on for the real install layout, off for scratch (dev / test) layouts.
+    public var requireRootOwnership: Bool
+    /// wms-o7: the bundle's code signature (strict, resources included) validates: an added or changed file breaks it.
+    /// Bundle resources and same-bundle executables are vouched for only when the bundle is sealed.
+    public var bundleSealed: @Sendable (String) -> Bool
+    /// Ownership rule (injectable for tests): see `requireRootOwnership`.
+    public var ownerOK: @Sendable (_ path: String, _ stopAt: String) -> Bool = OwnInstallTrust.rootOwnedChain
 
     public init(paths: GuardPaths = .standard, manifest: InstallManifest? = nil, trustedTeamIDs: Set<String> = [],
-                trustedCDHashes: Set<String> = [], signature: @escaping @Sendable (String) -> OwnCodeSignature? = OwnCodeSignature.read) {
+                trustedCDHashes: Set<String> = [], signature: @escaping @Sendable (String) -> OwnCodeSignature? = OwnCodeSignature.read,
+                requireRootOwnership: Bool? = nil, bundleSealed: (@Sendable (String) -> Bool)? = nil) {
         self.paths = paths; self.manifest = manifest; self.trustedTeamIDs = trustedTeamIDs
         self.trustedCDHashes = Set(trustedCDHashes.map { $0.lowercased() }); self.signature = signature
+        let strict = requireRootOwnership ?? (paths == .standard)
+        self.requireRootOwnership = strict
+        self.bundleSealed = bundleSealed ?? (strict ? { BundleSeal.isSealed($0) } : { _ in true })
+    }
+
+    /// `path` and every folder above it up to and including `stopAt` (or just its own folder when `stopAt` isn't an
+    /// ancestor): root-owned, not group/world-writable.
+    public static func rootOwnedChain(_ path: String, stopAt: String) -> Bool {
+        func safe(_ p: String) -> Bool {
+            var st = stat()
+            return lstat(p, &st) == 0 && st.st_uid == 0 && st.st_mode & 0o022 == 0
+        }
+        let p = GuardPaths.normalize(path), stop = GuardPaths.normalize(stopAt)
+        guard safe(p) else { return false }
+        var dir = (p as NSString).deletingLastPathComponent
+        let chain = p.hasPrefix(stop + "/")
+        var hops = 0
+        while hops < 64 {
+            hops += 1
+            guard safe(dir) else { return false }
+            if !chain || dir == stop || dir == "/" || dir.isEmpty { return true }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return false
+    }
+
+    private func owned(_ path: String) -> Bool {
+        guard requireRootOwnership else { return true }
+        return ownerOK(path, paths.isInAppBundle(path) ? paths.appBundle : (path as NSString).deletingLastPathComponent)
     }
 
     /// The trust anchors of the running service: its own cdhash, the root-owned install identity record and trusted
@@ -94,15 +138,16 @@ public struct OwnInstallTrust: Sendable {
     public func isVerifiedOwnExecutable(_ path: String) -> Bool {
         let p = GuardPaths.normalize(path)
         guard paths.isJobExecutable(p) || paths.binaries.map(GuardPaths.normalize).contains(p) || paths.isInAppBundle(p) else { return false }
+        guard owned(p) else { return false }
         if manifestMatches(p) { return true }
         guard let s = signature(p), s.valid, isOurIdentifier(s.identifier) else { return false }
         if let t = s.teamID, !t.isEmpty, trustedTeamIDs.contains(t) { return true }
         if trustedCDHashes.contains(s.cdhash.lowercased()) { return true }
         // Same build as a trusted helper: a bundle executable whose bundle ships a helper we trust.
-        if paths.isInAppBundle(p) {
+        if paths.isInAppBundle(p), bundleSealed(paths.appBundle) {
             let b = GuardPaths.normalize(paths.appBundle)
             for h in [b + "/Contents/Helpers/rampartd", b + "/Contents/MacOS/rampartd"] where h != p {
-                if let hs = signature(h), hs.valid, isOurIdentifier(hs.identifier),
+                if owned(h), let hs = signature(h), hs.valid, isOurIdentifier(hs.identifier),
                    trustedCDHashes.contains(hs.cdhash.lowercased()) || hs.teamID.map({ !$0.isEmpty && trustedTeamIDs.contains($0) }) == true {
                     return true
                 }
@@ -113,7 +158,7 @@ public struct OwnInstallTrust: Sendable {
 
     /// Our launch plist whose job runs our verified executable.
     public func isVerifiedOwnPlist(_ path: String) -> Bool {
-        guard paths.isPlist(path) else { return false }
+        guard paths.isPlist(path), owned(path) else { return false }
         if manifestMatches(path) { return true }
         guard RamPartIdentity.isOurPlist(path, paths: paths),
               let data = FileManager.default.contents(atPath: path),
@@ -130,8 +175,11 @@ public struct OwnInstallTrust: Sendable {
             return isVerifiedOwnExecutable(path)
         }
         if paths.isInAppBundle(path) {
+            guard owned(path) else { return false }
             if manifestMatches(path) { return true }
-            // Bundle resources: the bundle's own executables must verify (the signature seals the resources).
+            // Bundle resources: the bundle's own executables must verify AND the bundle's seal must still hold (an added
+            // or replaced resource breaks it; wms-o7: it used to be assumed, not checked).
+            guard bundleSealed(paths.appBundle) else { return false }
             let b = GuardPaths.normalize(paths.appBundle)
             return isVerifiedOwnExecutable(b + "/Contents/MacOS/Rampart") || isVerifiedOwnExecutable(b + "/Contents/Helpers/rampartd")
         }
@@ -156,6 +204,36 @@ public struct OwnInstallTrust: Sendable {
 
     /// The running process at `executable` is one of our verified executables.
     public func isVerifiedOwnProcess(executable: String) -> Bool { isVerifiedOwnExecutable(executable) }
+}
+
+/// wms-o7: strict static validation of a whole bundle (resources and nested code included). Read-only, never prompts.
+/// Cached per bundle for 60 s, keyed on the inode and modification times of the bundle's sealed folders, so an added
+/// file (which changes its folder's mtime) is noticed at once.
+public enum BundleSeal {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cache: [String: (key: String, at: Date, ok: Bool)] = [:]
+
+    static func cacheKey(_ bundle: String) -> String {
+        ["", "/Contents", "/Contents/MacOS", "/Contents/Resources", "/Contents/Helpers", "/Contents/Library/LaunchAgents", "/Contents/_CodeSignature"].map { sub -> String in
+            var st = stat()
+            guard lstat(bundle + sub, &st) == 0 else { return "-" }
+            return "\(st.st_ino):\(st.st_mtimespec.tv_sec).\(st.st_mtimespec.tv_nsec):\(st.st_uid)"
+        }.joined(separator: "|")
+    }
+
+    public static func isSealed(_ bundle: String) -> Bool {
+        let key = cacheKey(bundle)
+        lock.lock()
+        if let c = cache[bundle], c.key == key, Date().timeIntervalSince(c.at) < 60 { lock.unlock(); return c.ok }
+        lock.unlock()
+        var code: SecStaticCode?
+        var ok = false
+        if SecStaticCodeCreateWithPath(URL(fileURLWithPath: bundle) as CFURL, [], &code) == errSecSuccess, let code {
+            ok = SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckNestedCode), nil) == errSecSuccess
+        }
+        lock.lock(); cache[bundle] = (key, Date(), ok); if cache.count > 16 { cache.removeAll() }; lock.unlock()
+        return ok
+    }
 }
 
 // MARK: - Lockdown false-alarm re-check (daemon start)

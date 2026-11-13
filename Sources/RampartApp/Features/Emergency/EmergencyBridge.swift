@@ -239,8 +239,8 @@ enum KillSwitchScript {
     struct Result { var ok: Bool; var output: String }
 
     /// The script, only from this app's own signed bundle (its code signature must validate).
-    static func locate(bundle: String = Bundle.main.bundlePath) -> String? {
-        guard let p = KillSwitch.bundledScript(inBundle: bundle) else { return nil }
+    static func locate(bundle: String = Bundle.main.bundlePath, dryRun: Bool = false) -> String? {
+        guard let p = KillSwitch.bundledScript(inBundle: bundle, requireRootOwned: !dryRun) else { return nil }
         var code: SecStaticCode?
         guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: bundle) as CFURL, [], &code) == errSecSuccess, let code,
               SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), nil) == errSecSuccess else { return nil }

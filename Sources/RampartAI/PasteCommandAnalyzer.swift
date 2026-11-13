@@ -1,4 +1,5 @@
 import Foundation
+import RampartShared
 
 /// AI check for commands pasted into Terminal (structurally matches RampartBehaviour's `PasteAIAssessor`:
 /// `assess(command:decoded:sourceApp:) async -> PasteAIVerdict?`). The app bridges the two.
@@ -41,10 +42,15 @@ public final class PasteCommandAnalyzer: @unchecked Sendable {
 
     /// Local, deterministic prompt-injection detector (runs before and regardless of the model).
     private static let injectionRE = try! NSRegularExpression(pattern:
-        #"(?i)(ignore|disregard|forget)\s+(all\s+|any\s+|the\s+)?(previous|prior|above|earlier)\s+(instructions|prompts|rules)|\b(you are|act as)\s+(an?\s+)?(ai|assistant|chatgpt|gemini|claude|llm)\b|(classify|mark|label|report|treat)\s+(this|it|the command)\s+as\s+(safe|benign|harmless|clean)|\b(antivirus|scanner|ai|assistant|llm|model)\s*[:,]\s*(this|the following)\s+is\s+(safe|benign)|\bsystem\s*prompt\b|\bverdict\s*[:=]\s*"?benign"?"#)
+        #"(?i)(ignore|disregard|forget)\s+(all\s+|any\s+|the\s+)?(previous|prior|above|earlier)\s+(instructions|prompts|rules)|\b(you are|act as)\s+(an?\s+)?(ai|assistant|chatgpt|gemini|claude|llm)\b|(classify|mark|label|report|treat)\s+(this|it|the command)\s+as\s+(safe|benign|harmless|clean)|\b(antivirus|scanner|ai|assistant|llm|model)\s*[:,]\s*(this|the following)\s+is\s+(safe|benign)|\bsystem\s*prompt\b|\bverdict\s*[:=]\s*"?benign"?|\b(ignore|disregard|forget)\b.{0,30}\b(previous|above|prior|earlier|everything)\b.{0,20}\b(instruction|prompt|rule)s?\b|\b(tell|advise)\s+(the\s+)?user\s+(to|that)\b|\b(this|the)\s+(command|script)\s+is\s+(safe|benign|harmless|legit(imate)?)\b"#)
 
     public static func localInjectionSignals(_ texts: [String]) -> Bool {
-        texts.contains { t in injectionRE.firstMatch(in: t, range: NSRange(location: 0, length: (t as NSString).length)) != nil }
+        // wms-o5: match the folded form too (homoglyphs, fullwidth, zero-width splits). Not PromptKit's full set:
+        // shell syntax such as `<<<` here-strings or `score=5` would be false alarms in a command.
+        texts.contains { t in
+            let f = TextFold.forMatching(t)
+            return [t, f].contains { injectionRE.firstMatch(in: $0, range: NSRange(location: 0, length: ($0 as NSString).length)) != nil }
+        }
     }
 
     public func prepare(command: String, decoded: [String], sourceApp: String?) -> AIPrepared<PasteAIResult> {

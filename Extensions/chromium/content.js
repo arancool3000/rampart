@@ -164,16 +164,58 @@ button { cursor: pointer; font: 600 14px -apple-system, "Helvetica Neue", Arial,
     for (const c of children || []) e.appendChild(c);
     return e;
   }
-  /** Click handler that ignores synthetic events and clicks in the first 500 ms after the UI appeared. */
+  // wms-o3 (clickjacking): the top layer is ordered by insertion, so a page could open its own popover,
+  // modal dialog or fullscreen element AFTER our warning, give it pointer-events:none and draw a fake
+  // "Go back" label over our "Continue anyway". We note every foreign top-layer change (toggle and
+  // fullscreenchange are seen in the capture phase), put our surfaces back on top, and ignore clicks
+  // until they have been on top again for 500 ms (H.uiClickAllowed).
+  let lastForeignTopLayerAt = -1;
+  const isOurs = (n) => { for (const m of surfaces) if (m.host === n) return true; return false; };
+  function foreignTopLayer() {
+    try { for (const n of document.querySelectorAll(":popover-open, :modal, :fullscreen")) if (!isOurs(n)) return true; } catch {}
+    return !!(document.fullscreenElement && !isOurs(document.fullscreenElement));
+  }
+  function raiseSurfaces() {
+    for (const m of surfaces) {
+      if (!m.usePopover || !m.host.isConnected) continue;
+      try { m.host.hidePopover(); m.host.showPopover(); } catch {}
+      m.shownAt = performance.now();
+    }
+  }
+  function onForeignTopLayer(e) {
+    if (!surfaces.size || (e && (isOurs(e.target) || !foreignTopLayer()))) return;   // <details> toggles etc. don't count
+    lastForeignTopLayerAt = performance.now();
+    if (document.fullscreenElement && !isOurs(document.fullscreenElement)) { try { document.exitFullscreen(); } catch {} }
+    raiseSurfaces();
+  }
+  for (const t of ["toggle", "fullscreenchange", "webkitfullscreenchange"]) document.addEventListener(t, onForeignTopLayer, true);
+  /** Click handler that ignores synthetic events, clicks in the first 500 ms after the UI appeared or was
+   *  raised again, and clicks while something of the page's may sit above it. */
   function onTrusted(m, button, fn) {
     button.addEventListener("click", (e) => {
       e.stopPropagation();
       if (!e.isTrusted) return;
-      if (performance.now() - m.shownAt < 500) return;
+      const now = performance.now();
+      if (!H.uiClickAllowed(now, m.shownAt, lastForeignTopLayerAt)) return;
+      if (m.usePopover && foreignTopLayer()) { lastForeignTopLayerAt = now; raiseSurfaces(); return; }
       fn(e);
     });
   }
-  function removeUI() { for (const m of Array.from(surfaces)) if (m.kind !== "clip") m.remove(); document.documentElement.classList.remove("rampart-locked"); stopWatchdog(); }
+  // Scroll lock while the block is up: an inline style set only then (wms-o3; a manifest stylesheet in
+  // every page let any site detect RamPart).
+  let savedOverflow = null;
+  function lockScroll() {
+    const st = document.documentElement.style;
+    if (savedOverflow === null) savedOverflow = [st.getPropertyValue("overflow"), st.getPropertyPriority("overflow")];
+    st.setProperty("overflow", "hidden", "important");
+  }
+  function unlockScroll() {
+    if (savedOverflow === null) return;
+    const st = document.documentElement.style;
+    if (savedOverflow[0]) st.setProperty("overflow", savedOverflow[0], savedOverflow[1]); else st.removeProperty("overflow");
+    savedOverflow = null;
+  }
+  function removeUI() { for (const m of Array.from(surfaces)) if (m.kind !== "clip") m.remove(); unlockScroll(); stopWatchdog(); }
   const send = (msg) => api.runtime.sendMessage(msg).catch(() => null);
 
   // Watchdog: if the page removes or hides a RamPart surface, put it back (banner, 3 times), or move
@@ -182,7 +224,11 @@ button { cursor: pointer; font: 600 14px -apple-system, "Helvetica Neue", Arial,
   function startWatchdog() {
     if (watchdog) return;
     let banners = 0;
+    let foreignSeen = false;
     watchdog = setInterval(() => {
+      const f = foreignTopLayer();
+      if (f && !foreignSeen) onForeignTopLayer(null);   // newly appeared: raise once (not every tick, so a site's own open dialog can't lock our buttons)
+      foreignSeen = f;
       for (const m of Array.from(surfaces)) {
         if (m.intact()) continue;
         if (m.kind === "full" && shownLevel === "block" && !userContinued) { stopWatchdog(); send({ type: "openInterstitial" }); return; }
@@ -215,7 +261,8 @@ button { cursor: pointer; font: 600 14px -apple-system, "Helvetica Neue", Arial,
       ]),
     ]));
     m.attach();
-    document.documentElement.classList.add("rampart-locked");
+    lockScroll();
+    if (document.fullscreenElement) { try { document.exitFullscreen(); } catch {} }   // wms-o3: nothing of the page's above the warning
     back.focus();
     onTrusted(m, back, () => { send({ type: "decision", decision: "wentBack" }); if (history.length > 1) history.back(); else location.replace("about:blank"); });
     onTrusted(m, cont, async () => {

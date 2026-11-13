@@ -40,7 +40,18 @@ public final class PFManager: @unchecked Sendable {
     }
 
     /// Never block these: the DoH upstreams (a bad feed must not take DNS down with it).
-    public static let protectedAddresses: [String] = DoHClient.bootstrapAddresses.values.flatMap { $0 }
+    /// o4: plus the well-known public resolvers. The DNS watchdog hands DNS back to the system's original servers
+    /// when the filter fails, and those are very often one of these: a feed (or an App Firewall block of an app
+    /// that happened to talk to 8.8.8.8) must never be able to leave the Mac offline after that fail-safe.
+    public static let publicResolvers: [String] = [
+        "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "1.1.1.3", "1.0.0.3", "9.9.9.11", "149.112.112.11",
+        "208.67.222.222", "208.67.220.220", "94.140.14.14", "94.140.15.15",
+        "2001:4860:4860::8888", "2001:4860:4860::8844", "2606:4700:4700::1111", "2606:4700:4700::1001",
+        "2620:119:35::35", "2620:119:53::53",
+    ]
+    public static let protectedAddresses: [String] = DoHClient.bootstrapAddresses.values.flatMap { $0 } + publicResolvers
+    /// o4: run-time additions (the user's original DNS servers from the DNS snapshot, VPN servers). Never blocked.
+    public var alsoProtect: [String] = []
 
     /// Ranges a feed may never cover (in whole or part): this-network, RFC 1918, loopback, link-local, CGNAT,
     /// multicast/reserved, and the IPv6 equivalents including IPv4-mapped space.
@@ -51,6 +62,9 @@ public final class PFManager: @unchecked Sendable {
         ([UInt8](repeating: 0, count: 10) + [0xFF, 0xFF, 0, 0, 0, 0], 96), ([UInt8](repeating: 0, count: 16), 96),
         ([0xFC] + [UInt8](repeating: 0, count: 15), 7), ([0xFE, 0x80] + [UInt8](repeating: 0, count: 14), 10),
         ([0xFF] + [UInt8](repeating: 0, count: 15), 8),
+        // o4: NAT64 (RFC 6052/8215). On an IPv6-only network every IPv4 site lives under these prefixes.
+        ([0, 0x64, 0xFF, 0x9B] + [UInt8](repeating: 0, count: 12), 96),
+        ([0, 0x64, 0xFF, 0x9B, 0, 1] + [UInt8](repeating: 0, count: 10), 48),
     ]
 
     /// Two prefixes overlap iff they agree on the first min(prefix) bits.
@@ -90,7 +104,10 @@ public final class PFManager: @unchecked Sendable {
 
     /// Accepts IPv4/IPv6 addresses and CIDRs. Rejects private, loopback, link-local, multicast,
     /// unspecified and default routes so a feed can never cut off the LAN.
-    public static func sanitize(_ raw: String) -> String? {
+    public static func sanitize(_ raw: String) -> String? { sanitize(raw, protecting: []) }
+
+    /// `sanitize` that also refuses anything covering one of `extra` (non-address entries are ignored).
+    public static func sanitize(_ raw: String, protecting extra: [String]) -> String? {
         let s = raw.trimmingCharacters(in: .whitespaces)
         guard s.count <= 64 else { return nil }
         let parts = s.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
@@ -111,7 +128,7 @@ public final class PFManager: @unchecked Sendable {
             bytes[i] &= keep == 8 ? 0xFF : (keep == 0 ? 0 : ~(0xFF >> UInt8(keep)))
         }
         for (net, p) in reservedRanges where overlaps(bytes, prefix, net, p) { return nil }
-        for a in protectedAddresses {
+        for a in protectedAddresses + extra {
             if let pb = DNSWire.addressBytes(a), overlaps(bytes, prefix, pb, pb.count * 8) { return nil }
         }
         let text = DNSWire.addressString(bytes)
@@ -140,7 +157,7 @@ public final class PFManager: @unchecked Sendable {
     }
 
     public func tableContents(_ ips: [String]) -> String {
-        ips.compactMap(Self.sanitize).joined(separator: "\n") + "\n"
+        ips.compactMap { Self.sanitize($0, protecting: alsoProtect) }.joined(separator: "\n") + "\n"
     }
 
     // MARK: Files and commands

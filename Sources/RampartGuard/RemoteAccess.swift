@@ -382,7 +382,15 @@ public final class RemoteAccessMonitor: @unchecked Sendable {
             if let a = policy.allowance(for: f.toolID, at: now) {
                 // hx5: a pinned allowance covers only processes signed by the Team IDs seen when it was granted.
                 let pinned = a.teamIDs ?? []
-                let impostor = !pinned.isEmpty && f.pids.contains { pid in !pinned.contains(procByPID[pid]?.teamID ?? "") }
+                var impostor = !pinned.isEmpty && f.pids.contains { pid in !pinned.contains(procByPID[pid]?.teamID ?? "") }
+                // wms-o7: an allowance granted while the tool wasn't running has no pins, and used to cover anything that
+                // matched the tool by name or path (`~/Downloads/teamviewer/x`, an ad-hoc `codesign -i com.teamviewer.x`).
+                // When signing facts are known and not one of the tool's processes carries a Team ID, it is a look-alike.
+                // Apple's own services carry no Team ID (platform binaries), so the rule is for third-party tools only.
+                if pinned.isEmpty, !f.isAppleService, !f.pids.isEmpty {
+                    let known = f.pids.compactMap { procByPID[$0] }.filter { $0.signingID != nil || $0.teamID != nil }
+                    if !known.isEmpty, !f.pids.contains(where: { !(procByPID[$0]?.teamID ?? "").isEmpty }) { impostor = true }
+                }
                 if !impostor { f.allowed = true; f.allowedUntil = a.expires }
                 else { f.matchedBy = Array(Set(f.matchedBy + ["signer differs from the approved one"])).sorted() }
             }

@@ -80,6 +80,11 @@ final class IPCServer {
         let t = Thread { [weak self] in self?.acceptLoop() }
         t.name = "rampartd.accept"; t.start()
         logInfo("IPC listening on \(path) (\(userMode ? "user" : "root") mode)")
+        if userMode {
+            logInfo(Self.userModeClientChecks
+                    ? "IPC: client identity checks on (packaged helper; \(Self.userModePins?.count ?? 0) bundle pins)"
+                    : "IPC: client identity checks off (development build; same-uid peers only)")
+        }
     }
 
     func stop() {
@@ -134,9 +139,12 @@ final class IPCServer {
         if getsockopt(fd, SOL_LOCAL, LOCAL_PEERTOKEN, &token, &tlen) == 0, tlen == socklen_t(MemoryLayout<audit_token_t>.size) {
             peer.auditToken = token
             peer.pid = pid_t(bitPattern: token.val.5)
-            if !userMode, let id = ClientIdentity.of(auditToken: token) {
-                peer.client = id.trustedKind(daemonTeamID: Self.daemonTeamID,
-                                             pinnedCDHashes: ClientIdentity.loadPins(router.p.runtime.root.appendingPathComponent("trusted-clients.json").path))
+            if !userMode || Self.userModeClientChecks, let id = ClientIdentity.of(auditToken: token) {
+                // Root daemon: optional install-time pins (trusted-clients.json). User helper (wms-fa): the app and CLI
+                // shipped in its own bundle, so with ad-hoc signing a look-alike identifier is not enough.
+                let pins = userMode ? Self.userModePins
+                                    : ClientIdentity.loadPins(router.p.runtime.root.appendingPathComponent("trusted-clients.json").path)
+                peer.client = id.trustedKind(daemonTeamID: Self.daemonTeamID, pinnedCDHashes: pins)
                 if peer.client == nil, DLog.shared.verbose {
                     logInfo("IPC: untrusted client \(LogRedact.clean(id.identifier, max: 80)) cdhash \(id.cdhash.prefix(16)) uid \(uid)")
                 }
@@ -147,6 +155,11 @@ final class IPCServer {
 
     /// The daemon's own Team ID (nil when ad-hoc signed); a client must carry the same one when it is set.
     static let daemonTeamID: String? = ClientIdentity.ofSelf()?.teamID
+    /// wms-fa: a packaged user-session helper verifies its clients' code identity (IPCAuthz.userModeClientChecks).
+    static let userModeClientChecks: Bool = IPCAuthz.userModeClientChecks(selfIdentity: ClientIdentity.ofSelf())
+    /// wms-fa: cdhashes of the app and CLI in the helper's own bundle (nil = identifier-only trust). The helper's own
+    /// path comes from the kernel (launchd's BundleProgram leaves argv[0] as a bare "rampartd").
+    static let userModePins: Set<String>? = IPCAuthz.siblingClientPins(executable: IPCAuthz.executablePath(pid: getpid()) ?? CommandLine.arguments[0])
 
     private func serve(_ fd: Int32, cid: Int) {
         var subscription: UUID?
@@ -186,7 +199,8 @@ final class IPCServer {
                 do { req = try JSONDecoder.rampart.decode(IPCRequest.self, from: frame) }
                 catch { _ = send(.error("malformed request")); return nil }
                 if DLog.shared.verbose { logInfo("IPC \(Router.name(req)) from uid \(peer.uid) pid \(peer.pid)") }
-                return router.handle(req, peer: peer, requireAdminForPrivileged: !userMode, send: send)
+                return router.handle(req, peer: peer, requireAdminForPrivileged: !userMode,
+                                     userModeClientChecks: userMode && Self.userModeClientChecks, send: send)
             }
             guard let routed else { return }
             switch routed {
