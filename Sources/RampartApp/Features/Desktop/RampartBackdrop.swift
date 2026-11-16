@@ -45,8 +45,24 @@ struct RampartAnimatedBackdrop: View {
             ctx.fill(Path(CGRect(x: x.rounded(), y: y.rounded(), width: s, height: s)), with: .color(Color.white.opacity(0.15 + 0.55 * tw * tw)))
         }
 
-        // 3. The Pixel Guard: huge, faint, standing behind the horizon. Eyes glow and blink.
+        // 2b. Aurora: soft teal and violet ribbons high in the sky.
+        for (i, c) in [(0, cyan), (1, Color(red: 0.45, green: 0.35, blue: 0.95)), (2, teal)] {
+            var band = Path()
+            let y0 = horizon * (0.18 + 0.12 * CGFloat(i)), amp = horizon * 0.06
+            band.move(to: CGPoint(x: 0, y: y0))
+            for k in stride(from: 0, through: 40, by: 1) {
+                let x = w * CGFloat(k) / 40
+                band.addLine(to: CGPoint(x: x, y: y0 + amp * CGFloat(sin(Double(k) * 0.35 + Double(i) * 1.7))))
+            }
+            ctx.stroke(band, with: .color(c.opacity(0.07)), style: StrokeStyle(lineWidth: horizon * 0.07, lineCap: .round))
+            ctx.stroke(band, with: .color(c.opacity(0.06)), style: StrokeStyle(lineWidth: horizon * 0.02, lineCap: .round))
+        }
+
+        // 3. The Pixel Guard standing watch behind the wall. Eyes glow and blink.
         drawGuard(&ctx, w: w, horizon: horizon, h: h, t: t)
+
+        // 3b. The rampart: a pixel fortress wall with crenellations and towers along the horizon.
+        drawRampart(&ctx, w: w, horizon: horizon)
 
         // 4. Perspective grid floor scrolling toward you.
         let vanish = CGPoint(x: w / 2, y: horizon)
@@ -119,10 +135,10 @@ struct RampartAnimatedBackdrop: View {
     private static let guardRows = PixelGuard.head(PixelGuard.chosen).count
 
     static func drawGuard(_ ctx: inout GraphicsContext, w: CGFloat, horizon: CGFloat, h: CGFloat, t: Double) {
-        let cell = (h * 0.42 / CGFloat(guardRows)).rounded(.down)
+        let cell = (h * 0.30 / CGFloat(guardRows)).rounded(.down)
         let gw = cell * CGFloat(PixelGuard.cols)
         let bob = CGFloat(sin(t * 0.7)) * cell * 0.25
-        let origin = CGPoint(x: ((w - gw) / 2).rounded(), y: (horizon - cell * CGFloat(guardRows) * 0.92 + bob).rounded())
+        let origin = CGPoint(x: ((w - gw) / 2).rounded(), y: (horizon - wallHeight(horizon) - cell * CGFloat(guardRows) * 0.78 + bob).rounded())
         let blink = t.truncatingRemainder(dividingBy: 5.5) < 0.16
         let scanRow = Int(t * 3) % 3
         for c in guardCells {
@@ -130,12 +146,16 @@ struct RampartAnimatedBackdrop: View {
             let col: Color, a: Double
             switch c.key {
             case "e":
-                if blink && c.y == PixelGuard.face(PixelGuard.chosen).eyeL.y { continue }
-                col = teal; a = 0.55
+                let f = PixelGuard.face(PixelGuard.chosen)
+                guard (f.eyeL.y..<(f.eyeL.y + f.eyeH)).contains(c.y) else { continue }   // eyes only, no cheeks
+                if blink { continue }
+                col = teal; a = 0.85
             case "R": col = red; a = 0.35 + 0.25 * (0.5 + 0.5 * sin(t * 2))
-            case "X": col = cyan; a = 0.16
-            case "S", "V": col = Color(red: 0.02, green: 0.05, blue: 0.09); a = 0.55
-            default: col = Color(red: 0.18, green: 0.26, blue: 0.34); a = 0.10
+            case "X": col = cyan; a = 0.45
+            case "S", "V": col = Color(red: 0.01, green: 0.03, blue: 0.06); a = 0.92
+            case "E": col = cyan; a = 0.30
+            case "d": col = Color(red: 0.10, green: 0.15, blue: 0.21); a = 0.85
+            default: col = Color(red: 0.17, green: 0.24, blue: 0.31); a = 0.85
             }
             ctx.fill(Path(r), with: .color(col.opacity(a)))
             if c.key == "e" {   // eye glow
@@ -149,6 +169,51 @@ struct RampartAnimatedBackdrop: View {
         let sy = origin.y + CGFloat(rows[scanRow % rows.count]) * cell
         ctx.fill(Path(CGRect(x: origin.x + CGFloat(f.screenX.lowerBound) * cell, y: sy + cell * 0.45, width: CGFloat(f.screenX.count) * cell, height: max(1, cell * 0.1))),
                  with: .color(teal.opacity(0.18)))
+    }
+
+    static func wallHeight(_ horizon: CGFloat) -> CGFloat { (horizon * 0.075).rounded() }
+
+    /// Pixel fortress silhouette: a crenellated wall with taller towers, lit windows, and a teal rim light on top.
+    static func drawRampart(_ ctx: inout GraphicsContext, w: CGFloat, horizon: CGFloat) {
+        let px = max(4, (horizon / 90).rounded())
+        let wallH = wallHeight(horizon)
+        let stone = Color(red: 0.04, green: 0.08, blue: 0.13), rim = teal
+        var wall = Path(), rimPath = Path()
+        // wall body
+        wall.addRect(CGRect(x: 0, y: horizon - wallH, width: w, height: wallH))
+        // crenellations
+        var x: CGFloat = 0
+        while x < w { wall.addRect(CGRect(x: x, y: horizon - wallH - px * 2, width: px * 3, height: px * 2)); rimPath.addRect(CGRect(x: x, y: horizon - wallH - px * 2, width: px * 3, height: 1)); x += px * 6 }
+        // towers at fixed fractions, symmetric around the Guard
+        for f in [0.06, 0.2, 0.34, 0.66, 0.8, 0.94] as [CGFloat] {
+            let tw = px * 8, th = wallH * (f == 0.34 || f == 0.66 ? 2.6 : 1.9)
+            let tx = (w * f - tw / 2).rounded()
+            wall.addRect(CGRect(x: tx, y: horizon - th, width: tw, height: th))
+            for k in 0..<3 { wall.addRect(CGRect(x: tx + CGFloat(k) * px * 3, y: horizon - th - px * 2, width: px * 2, height: px * 2))
+                rimPath.addRect(CGRect(x: tx + CGFloat(k) * px * 3, y: horizon - th - px * 2, width: px * 2, height: 1)) }
+            // windows
+            for r in 0..<2 {
+                let wy = horizon - th + px * 3 + CGFloat(r) * px * 4
+                ctx.fill(Path(CGRect(x: tx + px * 3, y: wy, width: px * 2, height: px * 2)), with: .color(teal.opacity(hash(Int(f * 100), r) > 0.4 ? 0.55 : 0.12)))
+            }
+        }
+        // gate under the Guard
+        let gw = px * 14
+        ctx.fill(wall, with: .color(stone))
+        ctx.fill(Path(CGRect(x: (w - gw) / 2, y: horizon - wallH * 0.85, width: gw, height: wallH * 0.85)), with: .color(Color(red: 0.01, green: 0.02, blue: 0.04)))
+        ctx.fill(rimPath, with: .color(rim.opacity(0.5)))
+        ctx.fill(Path(CGRect(x: 0, y: horizon - wallH, width: w, height: 1)), with: .color(rim.opacity(0.18)))
+        // brick lines
+        var bricks = Path()
+        var row: CGFloat = horizon - wallH + px * 2
+        var odd = false
+        while row < horizon - 1 {
+            bricks.addRect(CGRect(x: 0, y: row, width: w, height: 1))
+            var bx: CGFloat = odd ? px * 3 : 0
+            while bx < w { bricks.addRect(CGRect(x: bx, y: row - px * 2, width: 1, height: px * 2)); bx += px * 6 }
+            row += px * 2; odd.toggle()
+        }
+        ctx.fill(bricks, with: .color(Color.black.opacity(0.35)))
     }
 
     /// Deterministic 0…1 noise.
@@ -207,7 +272,7 @@ final class BackdropNSView: NSView {
         typealias B = RampartAnimatedBackdrop
 
         // 1. Still image: sky, stars, Guard, floor rays, scanlines, vignette.
-        let still = ImageRenderer(content: Canvas { ctx, sz in B.draw(&ctx, sz, t: 0, still: true) }.frame(width: w, height: h))
+        let still = ImageRenderer(content: Canvas { ctx, sz in B.draw(&ctx, sz, t: 1, still: true) }.frame(width: w, height: h))
         still.scale = scale
         let base = CALayer()
         base.frame = CGRect(origin: .zero, size: size)
@@ -307,9 +372,9 @@ final class BackdropNSView: NSView {
 
         // 7. The Guard blinks: dark lids flash over its eyes every 5.5 s; its red crest light breathes.
         let rows = CGFloat(PixelGuard.head(PixelGuard.chosen).count)
-        let cell = (h * 0.42 / rows).rounded(.down)
+        let cell = (h * 0.30 / rows).rounded(.down)
         let gw = cell * CGFloat(PixelGuard.cols)
-        let origin = CGPoint(x: ((w - gw) / 2).rounded(), y: (horizon - cell * rows * 0.92).rounded())
+        let origin = CGPoint(x: ((w - gw) / 2).rounded(), y: (horizon - B.wallHeight(horizon) - cell * rows * 0.78).rounded())
         let f = PixelGuard.face(PixelGuard.chosen)
         for eye in [f.eyeL, f.eyeR] {
             let lid = CALayer()
@@ -329,6 +394,25 @@ final class BackdropNSView: NSView {
             r.backgroundColor = cg(B.red)
             r.add(pulse("opacity", from: 0.2, to: 0.6, dur: 1.6), forKey: "breathe")
             root.addSublayer(r)
+        }
+
+        // 7b. Shooting stars: a streak crosses the sky now and then.
+        for i in 0..<3 {
+            let streak = CAGradientLayer()
+            streak.colors = [NSColor.white.withAlphaComponent(0).cgColor, NSColor.white.withAlphaComponent(0.9).cgColor]
+            streak.startPoint = CGPoint(x: 0, y: 0.5); streak.endPoint = CGPoint(x: 1, y: 0.5)
+            streak.bounds = CGRect(x: 0, y: 0, width: 140, height: 2)
+            streak.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 7))
+            let y0 = horizon * (0.08 + 0.18 * B.hash(i, 31)), x0 = w * (0.1 + 0.5 * B.hash(i, 32))
+            let move = CABasicAnimation(keyPath: "position")
+            move.fromValue = NSValue(point: CGPoint(x: x0, y: y0)); move.toValue = NSValue(point: CGPoint(x: x0 + w * 0.25, y: y0 + w * 0.25 * 0.48))
+            let fade = CAKeyframeAnimation(keyPath: "opacity"); fade.values = [0, 1, 0]; fade.keyTimes = [0, 0.3, 1]
+            let shot = CAAnimationGroup(); shot.animations = [move, fade]; shot.duration = 0.9
+            let cycle = CAAnimationGroup(); cycle.animations = [shot]; cycle.duration = 9 + Double(i) * 6; cycle.repeatCount = .infinity
+            cycle.timeOffset = Double(B.hash(i, 33)) * cycle.duration
+            streak.opacity = 0
+            streak.add(cycle, forKey: "shoot")
+            root.addSublayer(streak)
         }
 
         // 8. A soft bright band rolling down the screen (CRT shimmer).

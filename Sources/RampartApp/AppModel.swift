@@ -355,10 +355,14 @@ final class AppModel {
     var quarantine: [QuarantineRecord] = [] { didSet { recountNeedsYou() } }
     /// Cached: views read it many times per frame and the full policy pass over every detection is not cheap.
     private(set) var needsYouCount = 0
+    @ObservationIgnored private var quarantinedHashes = Set<String>()
+    @ObservationIgnored private var quarantinedPaths = Set<String>()
     private func recountNeedsYou() {
-        let hashes = Set(quarantine.compactMap(\.sha256)), paths = Set(quarantine.map(\.originalPath))
-        let n = DetectionPolicy.needsYouCount(detections) { d in (d.sha256.map(hashes.contains) ?? false) || (d.path.map(paths.contains) ?? false) }
+        quarantinedHashes = Set(quarantine.compactMap(\.sha256)); quarantinedPaths = Set(quarantine.map(\.originalPath))
+        let n = DetectionPolicy.needsYouCount(detections, quarantined: isQuarantined)
         if n != needsYouCount { needsYouCount = n }
+        let open = detections.filter { DetectionPolicy.tier($0, quarantined: isQuarantined($0)) == .needsYou }
+        if open.map(\.id) != openDetections.map(\.id) { openDetections = open }
     }
     var posture: [PostureCheck] = []
     var persistence: [PersistenceItem] = []
@@ -420,10 +424,11 @@ final class AppModel {
     static let demoRequested = CommandLine.arguments.contains("--demo")
     /// "Needs you" only: open, likely or confirmed threats (see `DetectionPolicy`). Possible findings, notes, test files
     /// and quarantined items are not counted anywhere (badge, "Needs attention" footer, menu bar).
-    var openDetections: [Detection] { detections.filter { DetectionPolicy.tier($0, quarantined: isQuarantined($0)) == .needsYou } }
+    /// Cached with needsYouCount (see recountNeedsYou): the policy pass is too costly to repeat per view render.
+    private(set) var openDetections: [Detection] = []
     /// Rows in "Needs you" (one per file, process or login item): the sidebar badge number.
     func isQuarantined(_ d: Detection) -> Bool {
-        quarantine.contains { ($0.sha256 == d.sha256 && d.sha256 != nil) || $0.originalPath == d.path }   // one-off checks; counts use the cache
+        (d.sha256.map(quarantinedHashes.contains) ?? false) || (d.path.map(quarantinedPaths.contains) ?? false)
     }
     var isScanning: Bool { if case .running = scanPhase { return true }; return false }
     var scanProgress: ScanProgress? { if case .running(let p) = scanPhase { return p }; return nil }
