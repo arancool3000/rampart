@@ -44,11 +44,11 @@ final class DesktopInfo {
         interval = want
         timer?.invalidate(); timer = nil
         guard let want else { return }
-        sample()
         let t = Timer(timeInterval: want, repeats: true) { _ in MainActor.assumeIsolated { DesktopInfo.shared.sample() } }
         t.tolerance = want * 0.25   // lets macOS coalesce wake-ups
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        sample()   // after the timer exists, so sample() → reschedule() can't recurse
     }
 
     /// One sample. Cheap reads only (host statistics, getifaddrs, IOKit); disk and Wi-Fi less often.
@@ -65,21 +65,41 @@ final class DesktopInfo {
         }
         lastNet = n; lastNetAt = now
         if ticks % 15 == 0 { disk = DiskReading.read() }
-        if ticks % 5 == 0 { battery = BatteryReading.read(); wifi = Self.readWiFi(); reschedule() }
+        let tick = ticks
         ticks += 1
+        if tick % 5 == 0 {
+            battery = BatteryReading.read()
+            refreshWiFi()
+            reschedule()
+        }
+    }
+
+    @ObservationIgnored private var wifiInFlight = false
+
+    /// CoreWiFi talks to a system daemon with a synchronous XPC call; never do that on the main thread.
+    private func refreshWiFi() {
+        guard !wifiInFlight else { return }
+        wifiInFlight = true
+        DispatchQueue.global(qos: .utility).async {
+            let w = Self.readWiFi()
+            DispatchQueue.main.async { MainActor.assumeIsolated {
+                DesktopInfo.shared.wifi = w
+                DesktopInfo.shared.wifiInFlight = false
+            } }
+        }
     }
 
     private func push(_ a: inout [Double], _ v: Double) { a.append(v); if a.count > 30 { a.removeFirst(a.count - 30) } }
 
     /// Network name needs Location access on recent macOS; RamPart never asks for it, so the name may be hidden.
-    private static func readWiFi() -> WiFi? {
+    nonisolated private static func readWiFi() -> WiFi? {
         guard !Headless.active, let i = CWWiFiClient.shared().interface() else { return nil }
         guard i.powerOn(), i.wlanChannel() != nil else { return WiFi(connected: false, name: nil, security: "Not connected", weak: false) }
         let (label, weak) = describe(i.security())
         return WiFi(connected: true, name: i.ssid(), security: label, weak: weak)
     }
 
-    static func describe(_ s: CWSecurity) -> (String, Bool) {
+    nonisolated static func describe(_ s: CWSecurity) -> (String, Bool) {
         switch s {
         case .none: return ("Open network, not encrypted", true)
         case .WEP, .dynamicWEP: return ("WEP (weak)", true)
