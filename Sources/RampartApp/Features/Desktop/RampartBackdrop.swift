@@ -1,15 +1,16 @@
+import RampartShared
 import SwiftUI
 
 /// The custom animated RamPart desktop: a deep-navy night with a receding neon pixel grid, data packets racing along
 /// it, a slow radar sweep, a giant faint Pixel Guard watching over the screen (it blinks), drifting pixel dust and
-/// a soft CRT shimmer. Drawn in one Canvas at 15 fps only while the desktop is actually visible; static with
+/// a soft CRT shimmer. Drawn in one Canvas at 10 fps (4 on battery) only while the desktop is actually visible; static with
 /// Reduce Motion. Pure function of time, so there's no state to leak.
 struct RampartAnimatedBackdrop: View {
     var running: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 15, paused: !running || reduceMotion)) { tl in
+        TimelineView(.animation(minimumInterval: PowerThrottle.shared.factor > 1 ? 1.0 / 4 : 1.0 / 10, paused: !running || reduceMotion)) { tl in
             Canvas(rendersAsynchronously: true) { ctx, size in
                 Self.draw(&ctx, size, t: reduceMotion ? 3 : tl.date.timeIntervalSinceReferenceDate)
             }

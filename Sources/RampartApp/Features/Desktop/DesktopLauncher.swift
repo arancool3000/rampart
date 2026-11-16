@@ -113,7 +113,17 @@ struct DesktopSearchBar: View {
                     .font(.system(size: 16, weight: .regular, design: .rounded))
                     .focused($focused)
                     .onSubmit { if let f = results.first { open(f) } }
-                    .onExitCommand { query = ""; focused = false }
+                    .onExitCommand { query = ""; focused = false; DesktopMode.shared.launcherOpen = false }
+                    .onChange(of: focused) { _, f in if f { withAnimation(.easeOut(duration: 0.2)) { DesktopMode.shared.launcherOpen = true } } }
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) { DesktopMode.shared.launcherOpen.toggle() }
+                } label: {
+                    Image(systemName: DesktopMode.shared.launcherOpen ? "chevron.up" : "square.grid.2x2")
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .help(DesktopMode.shared.launcherOpen ? "Hide apps" : "Show apps")
+                .accessibilityLabel(DesktopMode.shared.launcherOpen ? "Hide apps" : "Show apps")
                 if !query.isEmpty {
                     Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.white.opacity(0.5)) }
                         .buttonStyle(.plain).accessibilityLabel("Clear search")

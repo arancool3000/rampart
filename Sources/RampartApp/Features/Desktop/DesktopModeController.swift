@@ -57,6 +57,8 @@ final class DesktopMode {
 
     @ObservationIgnored private var layers: [Layer] = []
     @ObservationIgnored private var monitors: [Any] = []
+    /// The apps panel stays hidden so the backdrop shows; the search bar or its Apps button opens it.
+    var launcherOpen = false
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private var displaysAwake = true
     @ObservationIgnored private var hotKey: EventHotKeyRef?

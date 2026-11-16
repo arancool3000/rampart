@@ -120,7 +120,8 @@ public final class SocketSource: EventSource, CPUReporting {
             sweepNo = 0; known.removeAll(); procs.removeAll()
             let t = DispatchSource.makeTimerSource(queue: queue)
             t.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(Int(interval * 100)))
-            t.setEventHandler { [weak self] in self?.sweep() }
+            var tick = 0
+            t.setEventHandler { [weak self] in tick += 1; if PowerThrottle.shared.shouldRun(tick: tick) { self?.sweep() } }
             timer = t
             t.resume()
         }

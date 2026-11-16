@@ -68,7 +68,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { !isDuplicate }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if isDuplicate { return false }
+        // Desktop Mode's layer windows count as "visible", which made the Dock icon do nothing. Always bring the app up.
+        if DesktopMode.shared.isOn { DesktopMode.shared.openMain(); return false }
+        return true
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if isDuplicate { return }

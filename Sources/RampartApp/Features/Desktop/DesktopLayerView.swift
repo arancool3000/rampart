@@ -30,6 +30,8 @@ struct DesktopCardModifier: ViewModifier {
             .background {
                 ZStack {
                     if Headless.active { shape.fill(Color(red: 0.06, green: 0.10, blue: 0.16).opacity(0.82)) }
+                    // A behind-window blur over the animated backdrop re-blurs every frame; use a plain tint there.
+                    else if DesktopMode.shared.backdrop == .full { shape.fill(Color(red: 0.03, green: 0.06, blue: 0.11).opacity(0.78)) }
                     else { BehindWindowBlur().clipShape(shape); shape.fill(Color.black.opacity(0.22)) }
                     shape.fill(LinearGradient(colors: [Color.white.opacity(0.07), .clear], startPoint: .top, endPoint: .center))
                 }
@@ -118,8 +120,11 @@ struct DesktopLayerView: View {
                         VStack(spacing: DS.Space.l) {
                             DesktopSearchBar()
                                 .zIndex(2)
-                            DesktopLauncher()
-                                .zIndex(1)
+                            if desktop.launcherOpen {
+                                DesktopLauncher()
+                                    .zIndex(1)
+                                    .transition(.opacity.combined(with: .move(edge: .top)))
+                            }
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                         .modifier(Entrance(appeared: appeared, delay: 0.06))

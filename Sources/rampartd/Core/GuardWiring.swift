@@ -243,10 +243,10 @@ final class GuardService {
     func revoke(_ id: String) { var p = loadPolicy(); p.revoke(id); savePolicy(p) }
     func setLockdown(_ on: Bool) { var p = loadPolicy(); p.lockdownEnabled = on; savePolicy(p) }
 
-    /// Every 5 s: report, alert on unapproved active tools, enforce (installed root daemon only).
+    /// Every 15 s (45 s on battery): report, alert on unapproved active tools, enforce (installed root daemon only).
     func startMonitor() {
         let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "app.rampart.guard.remote", qos: .utility))
-        t.schedule(deadline: .now() + 10, repeating: 5, leeway: .seconds(1))
+        t.schedule(deadline: .now() + 10, repeating: 15, leeway: .seconds(3))
         // At start: anything held from before is decided now, and the install is checked once.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
@@ -261,7 +261,8 @@ final class GuardService {
             for d in self.detector.flushPending() { self.onDetection?(d) }
             // Every minute: re-verify the install manifest. (Held changes are decided by flushPending above, which
             // also treats anything past the hold horizon as due; forcing here would cut a legitimate update's grace.)
-            if tick % 12 == 0, let d = self.verifyManifest() { self.onDetection?(d) }
+            if tick % 4 == 0, let d = self.verifyManifest() { self.onDetection?(d) }
+            guard PowerThrottle.shared.shouldRun(tick: tick) else { return }
             let policy = self.loadPolicy()
             let r = self.monitor.report(policy: policy)
             for d in self.monitor.detections(from: r) { self.onDetection?(d) }

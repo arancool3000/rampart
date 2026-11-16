@@ -56,10 +56,10 @@ enum DaemonWiring {
             hub.add(FSEventsSource(paths: runtime.watchPaths,
                                    stateURL: runtime.root.appendingPathComponent("fsevents-state.json"),
                                    excludedPrefixes: runtime.ownDataRoots))
-            hub.add(ProcessSweepSource(interval: isRoot ? 0.5 : 1.0))
+            hub.add(ProcessSweepSource(interval: isRoot ? 0.5 : 1.5))
             hub.add(UnifiedLogSource())
             hub.add(ExecWatchSource())
-            hub.add(SocketSource(interval: 2))
+            hub.add(SocketSource(interval: 4))
             DaemonWiring.hub = hub
             s.sourceCPU = { hub.cpuBySource }
             DaemonHooks.ingestClipboard = { e in hub.ingest(e) }

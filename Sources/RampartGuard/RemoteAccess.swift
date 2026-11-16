@@ -69,13 +69,18 @@ public enum RemoteToolCatalogue {
     public static let mdmPathPrefixes = ["/system/library/privateframeworks/remotemanagement.framework/",
                                          "/system/library/privateframeworks/managedconfiguration.framework/"]
 
+    private static let lowPrefixes: [[String]] = all.map { $0.signingIDPrefixes.map { $0.lowercased() } }
+
     public static func identify(signingID: String?, teamID: String?, path: String?, bundleID: String? = nil, label: String? = nil) -> (RemoteTool, [String])? {
         let lowPath = (path ?? "").lowercased()
         if mdmPathPrefixes.contains(where: { lowPath.hasPrefix($0) }) { return nil }
         if let sid = (signingID ?? bundleID)?.lowercased(), sid.hasPrefix("com.apple.remotemanagement") || sid.hasPrefix("com.apple.managedclient") { return nil }
-        for t in all {
+        let ids = [signingID, bundleID, label].compactMap { $0 }
+        let lowIDs = ids.map { $0.lowercased() }
+        for (ti, t) in all.enumerated() {
             var why: [String] = []
-            for s in [signingID, bundleID, label].compactMap({ $0 }) where t.signingIDPrefixes.contains(where: { s.lowercased().hasPrefix($0.lowercased()) }) {
+            let prefixes = lowPrefixes[ti]
+            for (s, ls) in zip(ids, lowIDs) where prefixes.contains(where: { ls.hasPrefix($0) }) {
                 why.append("identifier \(s)")
             }
             if let tid = teamID, t.teamIDs.contains(tid) { why.append(strongTeamIDs.contains(tid) ? "Team ID \(tid)" : "Team ID \(tid) (hint)") }
