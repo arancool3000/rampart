@@ -66,11 +66,22 @@ struct RampartAnimatedBackdrop: View {
 
         // 4. Perspective grid floor scrolling toward you.
         let vanish = CGPoint(x: w / 2, y: horizon)
+        // Floor: fog glowing at the horizon, deep navy near you.
+        ctx.fill(Path(CGRect(x: 0, y: horizon, width: w, height: h - horizon)),
+                 with: .linearGradient(Gradient(colors: [Color(red: 0.03, green: 0.14, blue: 0.19), Color(red: 0.01, green: 0.03, blue: 0.07), Color(red: 0.005, green: 0.015, blue: 0.04)]),
+                                       startPoint: CGPoint(x: 0, y: horizon), endPoint: CGPoint(x: 0, y: h)))
+        let road = roadGeometry(w: w, h: h, horizon: horizon)
         var grid = Path()
-        for i in -24...24 {   // rays to the vanishing point
+        for i in -24...24 {   // rays to the vanishing point, leaving the road clear
             let xb = w / 2 + CGFloat(i) * w / 14
-            grid.move(to: vanish); grid.addLine(to: CGPoint(x: xb, y: h))
+            if abs(xb - w / 2) < road.bottomHalf * 1.15 { continue }
+            let start = CGPoint(x: w / 2 + (xb - w / 2) * (road.topHalf / road.bottomHalf), y: horizon)
+            grid.move(to: start); grid.addLine(to: CGPoint(x: xb, y: h))
         }
+        var glowFloor = ctx
+        glowFloor.clip(to: Path(CGRect(x: 0, y: horizon, width: w, height: h - horizon)))
+        glowFloor.stroke(grid, with: .linearGradient(Gradient(colors: [cyan.opacity(0.0), cyan.opacity(0.10)]),
+                                                     startPoint: CGPoint(x: 0, y: horizon), endPoint: CGPoint(x: 0, y: h)), lineWidth: 5)
         let scroll = (t * 0.35).truncatingRemainder(dividingBy: 1)
         for k in 0..<(still ? 0 : 18) {   // horizontal lines, spaced by depth
             let z = (Double(k) + 1 - scroll) / 18          // 0 near horizon … 1 at the bottom
@@ -79,7 +90,7 @@ struct RampartAnimatedBackdrop: View {
         }
         var floor = ctx
         floor.clip(to: Path(CGRect(x: 0, y: horizon, width: w, height: h - horizon)))
-        floor.stroke(grid, with: .linearGradient(Gradient(colors: [cyan.opacity(0.05), cyan.opacity(0.45)]),
+        floor.stroke(grid, with: .linearGradient(Gradient(colors: [cyan.opacity(0.10), cyan.opacity(0.55)]),
                                                  startPoint: CGPoint(x: 0, y: horizon), endPoint: CGPoint(x: 0, y: h)), lineWidth: 1)
         // horizon line
         ctx.fill(Path(CGRect(x: 0, y: horizon - 1, width: w, height: 2)), with: .color(teal.opacity(0.55 * glowPulse)))
@@ -169,6 +180,13 @@ struct RampartAnimatedBackdrop: View {
         let sy = origin.y + CGFloat(rows[scanRow % rows.count]) * cell
         ctx.fill(Path(CGRect(x: origin.x + CGFloat(f.screenX.lowerBound) * cell, y: sy + cell * 0.45, width: CGFloat(f.screenX.count) * cell, height: max(1, cell * 0.1))),
                  with: .color(teal.opacity(0.18)))
+    }
+
+    /// The road from the fortress gate to the bottom of the screen.
+    struct Road { var topHalf: CGFloat; var bottomHalf: CGFloat }
+    static func roadGeometry(w: CGFloat, h: CGFloat, horizon: CGFloat) -> Road {
+        let px = max(4, (horizon / 90).rounded())
+        return Road(topHalf: px * 7, bottomHalf: w * 0.17)
     }
 
     static func wallHeight(_ horizon: CGFloat) -> CGFloat { (horizon * 0.075).rounded() }
@@ -296,8 +314,10 @@ final class BackdropNSView: NSView {
         root.addSublayer(floorClip)
         for k in 0..<lines {
             let line = CALayer()
-            line.frame = CGRect(x: 0, y: 0, width: w, height: 1)
+            line.frame = CGRect(x: 0, y: 0, width: w, height: 1.5)
             line.backgroundColor = cg(B.cyan)
+            line.shadowColor = cg(B.cyan); line.shadowOpacity = 0.9; line.shadowRadius = 4; line.shadowOffset = .zero
+            line.shadowPath = CGPath(rect: line.bounds, transform: nil)
             let steps = 24
             let ys = (0...steps).map { i -> NSNumber in let z = Double(i) / Double(steps); return NSNumber(value: Double(floorH) * z * z) }
             let ops = (0...steps).map { i -> NSNumber in let z = Double(i) / Double(steps); return NSNumber(value: 0.05 + 0.45 * z) }
@@ -307,6 +327,78 @@ final class BackdropNSView: NSView {
             g.timeOffset = period * Double(k) / Double(lines)
             line.add(g, forKey: "move")
             floorClip.addSublayer(line)
+        }
+
+        // 3b. The road into the gate: dark lane with neon edges, a glow reflected from the Guard,
+        //     chasing runway lights along both edges and centre dashes rushing toward you.
+        let road = B.roadGeometry(w: w, h: h, horizon: horizon)
+        func edgeX(_ side: CGFloat, _ s: CGFloat) -> CGFloat { w / 2 + side * (road.topHalf + (road.bottomHalf - road.topHalf) * s) }
+        let lane = CGMutablePath()
+        lane.move(to: CGPoint(x: edgeX(-1, 0), y: horizon)); lane.addLine(to: CGPoint(x: edgeX(1, 0), y: horizon))
+        lane.addLine(to: CGPoint(x: edgeX(1, 1), y: h)); lane.addLine(to: CGPoint(x: edgeX(-1, 1), y: h)); lane.closeSubpath()
+        let laneFill = CAGradientLayer()
+        laneFill.frame = CGRect(origin: .zero, size: size)
+        laneFill.colors = [NSColor(red: 0.05, green: 0.16, blue: 0.20, alpha: 1).cgColor, NSColor(red: 0.015, green: 0.035, blue: 0.07, alpha: 1).cgColor]
+        laneFill.startPoint = CGPoint(x: 0.5, y: horizon / h); laneFill.endPoint = CGPoint(x: 0.5, y: 1)
+        let laneMask = CAShapeLayer(); laneMask.path = lane; laneFill.mask = laneMask
+        root.addSublayer(laneFill)
+        // reflection of the Guard's glow on the road
+        let reflect = CAGradientLayer()
+        reflect.type = .radial
+        reflect.frame = CGRect(x: w / 2 - road.bottomHalf, y: horizon, width: road.bottomHalf * 2, height: (h - horizon) * 0.7)
+        reflect.colors = [cg(B.teal.opacity(0.22)), cg(B.teal.opacity(0))]
+        reflect.startPoint = CGPoint(x: 0.5, y: 0); reflect.endPoint = CGPoint(x: 1, y: 1)
+        let rm = CAShapeLayer(); var t = CGAffineTransform(translationX: -reflect.frame.minX, y: -reflect.frame.minY); rm.path = lane.copy(using: &t); reflect.mask = rm
+        reflect.add(pulse("opacity", from: 0.6, to: 1, dur: 3.1), forKey: "p")
+        root.addSublayer(reflect)
+        // neon edges
+        for side: CGFloat in [-1, 1] {
+            let e = CAShapeLayer()
+            let ep = CGMutablePath(); ep.move(to: CGPoint(x: edgeX(side, 0), y: horizon)); ep.addLine(to: CGPoint(x: edgeX(side, 1), y: h))
+            e.path = ep; e.strokeColor = cg(B.teal); e.lineWidth = 2.5; e.fillColor = nil
+            e.shadowColor = cg(B.teal); e.shadowOpacity = 1; e.shadowRadius = 10; e.shadowOffset = .zero
+            root.addSublayer(e)
+        }
+        // runway lights chasing toward you
+        let lights = 12, chase = 1.8
+        for side: CGFloat in [-1, 1] {
+            for k in 0..<lights {
+                let sDepth = pow(Double(k + 1) / Double(lights + 1), 2)
+                let sz = CGFloat(3 + 9 * sDepth)
+                let l = CALayer()
+                l.bounds = CGRect(x: 0, y: 0, width: sz, height: sz * 0.6)
+                l.cornerRadius = sz * 0.3
+                l.position = CGPoint(x: edgeX(side, CGFloat(sDepth)) + side * sz, y: horizon + (h - horizon) * CGFloat(sDepth))
+                l.backgroundColor = NSColor.white.cgColor
+                l.shadowColor = cg(B.teal); l.shadowOpacity = 1; l.shadowRadius = sz; l.shadowOffset = .zero
+                let a = CAKeyframeAnimation(keyPath: "opacity")
+                a.values = [0.15, 1, 0.15, 0.15]; a.keyTimes = [0, 0.08, 0.3, 1]; a.duration = chase; a.repeatCount = .infinity
+                a.timeOffset = chase - chase * Double(k) / Double(lights)
+                l.opacity = 0.15
+                l.add(a, forKey: "chase")
+                root.addSublayer(l)
+            }
+        }
+        // centre dashes rushing toward you
+        let dashes = 7, dashPeriod = 1.4, dSteps = 20
+        for k in 0..<dashes {
+            let d = CALayer()
+            d.backgroundColor = cg(B.teal)
+            d.shadowColor = cg(B.teal); d.shadowOpacity = 0.9; d.shadowRadius = 6; d.shadowOffset = .zero
+            var pos: [NSValue] = [], bnd: [NSValue] = [], op: [NSNumber] = []
+            for i in 0...dSteps {
+                let q = Double(i) / Double(dSteps), z = CGFloat(q * q)
+                pos.append(NSValue(point: CGPoint(x: w / 2, y: horizon + (h - horizon) * z)))
+                bnd.append(NSValue(rect: CGRect(x: 0, y: 0, width: max(1, 10 * z), height: max(1, 70 * z))))
+                op.append(NSNumber(value: 0.2 + 0.8 * Double(z)))
+            }
+            let pa = CAKeyframeAnimation(keyPath: "position"); pa.values = pos
+            let ba = CAKeyframeAnimation(keyPath: "bounds"); ba.values = bnd
+            let oa = CAKeyframeAnimation(keyPath: "opacity"); oa.values = op
+            let g = CAAnimationGroup(); g.animations = [pa, ba, oa]; g.duration = dashPeriod * Double(dashes) / 2.5; g.repeatCount = .infinity
+            g.timeOffset = g.duration * Double(k) / Double(dashes)
+            d.add(g, forKey: "dash")
+            root.addSublayer(d)
         }
 
         // 4. Data packets racing down the rays, with a glow trail; every 7th one is a red threat.
