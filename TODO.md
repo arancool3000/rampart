@@ -3,12 +3,12 @@
 Kept up to date while working. [x] done, [ ] to do, [~] in progress.
 
 ## Right now (2026-11-16 evening)
-- [~] Rebuild + install: taller Guard head and new icons, true-perspective grid, marching Guard bots,
+- [x] Rebuild + install: taller Guard head and new icons, true-perspective grid, marching Guard bots,
       continuous force-field shimmer, cheaper widget blinks, Stage Manager margin, user-helper retirement,
       memory relief (malloc pressure relief) in app + daemon
 - [ ] After install: check CPU/RAM settle (app < 10% idle, root daemon < 5% idle, no `rampartd --user`)
-- [ ] Re-render the wallpaper with the new Guard + bots and set it again
-- [ ] Render the desktop offscreen and check the bots and grid look right
+- [x] Re-render the wallpaper with the new Guard + bots and set it again
+- [x] Render the desktop offscreen and check the bots and grid look right
 
 ## Your Mac theme
 - [x] RamPart wallpaper, teal highlight, green accent, dark mode (old values saved in ~/Pictures/RamPart/previous-theme.txt)
@@ -25,8 +25,8 @@ Kept up to date while working. [x] done, [ ] to do, [~] in progress.
 - [x] Scans: half the cores on power, one on battery; scheduled scans wait for power
 - [x] Remote-access + nettop sampling slowed, battery-aware throttling
 - [x] Cached Needs-you / open detections in the app
-- [~] Retire the redundant user daemon when the root daemon runs
-- [~] Return freed memory every minute (root daemon had 158 MB of fragmented free heap)
+- [x] Retire the redundant user daemon when the root daemon runs
+- [x] Return freed memory every minute (root daemon had 158 MB of fragmented free heap)
 - [ ] eslogger subscribes to `open`/`close` (very chatty): measure and trim
 - [ ] SSD writes: detections.json (~480 KB) and persistence-snapshot.json rewritten on every change → append-only or debounce
 - [ ] Root daemon IPC: Protection.status waits on the blocklist lock during reloads
@@ -35,7 +35,7 @@ Kept up to date while working. [x] done, [ ] to do, [~] in progress.
 ## False alarms
 - [x] Apple impersonation on Safari's BTM helpers
 - [x] `date -r` clock tamper, data: URLs, local IPs, reverse-DNS entitlement strings
-- [ ] "Process impersonating RamPart" fires for my own dev builds in ~/Rampart/dist → ignore unsigned dev copies inside the source tree
+- [x] "Process impersonating RamPart" fires for my own dev builds in ~/Rampart/dist → ignore unsigned dev copies inside the source tree
 
 ## UI
 - [x] Tech/HUD look for the app, Live Feed + Defense Grid widgets
