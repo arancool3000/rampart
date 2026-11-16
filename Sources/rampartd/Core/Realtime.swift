@@ -39,7 +39,9 @@ final class RealtimePipeline: RealtimeService {
     var onPersistenceEvent: (() -> Void)?
 
     private let q = DispatchQueue(label: "app.rampart.realtime", qos: .utility)
-    private let scanQ = DispatchQueue(label: "app.rampart.onwrite", qos: .utility, attributes: .concurrent)
+    // Serial and background QoS: one efficiency core at most. A concurrent queue fanned out across every core during
+    // big file bursts (a build, an unzip) and pinned the Mac at 800%.
+    private let scanQ = DispatchQueue(label: "app.rampart.onwrite", qos: .background)
     private var pending: [String: Date] = [:]
     private var started = false
     private var timer: DispatchSourceTimer?
@@ -110,11 +112,19 @@ final class RealtimePipeline: RealtimeService {
         }
     }
 
+    static let buildDirs = ["/.build/", "/.build-", "/DerivedData/", "/.swiftpm/", "/__pycache__/", "/target/debug/", "/target/release/", "/.gradle/", "/.next/cache/"]
+    static let intermediateExts: Set<String> = ["o", "d", "dia", "swiftdeps", "swiftmodule", "swiftdoc", "swiftsourceinfo", "pcm", "swiftinterface",
+                                                "abi.json", "priors", "pyc", "tmp", "lock", "log", "json-e"]
+
     private func shouldScan(_ p: String) -> Bool {
         let vault = runtime.quarantineDir.path
         if p.hasPrefix(vault) || p.hasPrefix(runtime.root.path) { return false }
         for e in ["/System/", "/dev/", "/private/var/db/", "/private/var/folders/", "/Library/Caches/"] where p.hasPrefix(e) { return false }
         if p.contains("/Library/Caches/") || p.contains("/.git/") || p.hasSuffix(".sb-") { return false }
+        // Build output churns thousands of files per build; compiler intermediates are never run directly.
+        for d in Self.buildDirs where p.contains(d) { return false }
+        let ext = (p as NSString).pathExtension.lowercased()
+        if Self.intermediateExts.contains(ext) { return false }
         return true
     }
 

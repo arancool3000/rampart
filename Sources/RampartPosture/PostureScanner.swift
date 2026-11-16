@@ -171,11 +171,11 @@ public enum PostureChecks {
             PostureParsers.autoUpdates(softwareUpdate: c.systemPlist("/Library/Preferences/com.apple.SoftwareUpdate"),
                                        appStoreAutoUpdate: c.success("/usr/bin/defaults", ["read", "/Library/Preferences/com.apple.commerce", "AutoUpdate"]))
         },
-        spec("osUpToDate", "macOS is up to date", 8) { c in
+        spec("osUpToDate", "macOS updates", 8) { c in
             PostureParsers.osUpToDate(softwareUpdate: c.systemPlist("/Library/Preferences/com.apple.SoftwareUpdate"),
                                       currentVersion: c.output("/usr/bin/sw_vers", []).flatMap(PostureParsers.productVersion))
         },
-        spec("xprotectFresh", "XProtect definitions are current", 4) { c in
+        spec("xprotectFresh", "XProtect definitions", 4) { c in
             let bundles = ["/var/protected/xprotect/XProtect.bundle/Contents/Info.plist",
                            "/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info.plist"].map { p in
                 (version: PostureParsers.plistDictionary(c.env.readFile(p))?["CFBundleShortVersionString"] as? String,

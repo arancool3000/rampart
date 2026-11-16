@@ -1,3 +1,4 @@
+import RampartShared
 import SwiftUI
 
 extension PixelRGBA {
@@ -81,9 +82,10 @@ struct PixelBotView: View {
 
     /// Idle only needs blinks and the occasional visor scan: 12 fps is plenty. Busy states use 30.
     private var interval: Double {
+        let battery = PowerThrottle.shared.factor > 1
         switch state {
-        case .idle, .sleeping: return 1.0 / 12
-        default: return 1.0 / 30
+        case .idle, .sleeping: return battery ? 1.0 / 4 : 1.0 / 12   // blinks still read fine at 4 fps
+        default: return battery ? 1.0 / 12 : 1.0 / 30
         }
     }
 
