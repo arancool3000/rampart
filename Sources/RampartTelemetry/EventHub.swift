@@ -250,6 +250,22 @@ public final class EventHub {
                                       score: 85)])
     }
 
+    /// A RamPart developer build: inside a RamPart source checkout (Package.swift + Sources/rampartd beside it),
+    /// under its .build*/ or dist/ output. Those are unsigned-by-design copies, not impostors.
+    static func isRampartDevBuild(_ path: String) -> Bool {
+        var dir = (path as NSString).deletingLastPathComponent
+        let fm = FileManager.default
+        while dir.count > 1 {
+            let name = (dir as NSString).lastPathComponent
+            if name == "dist" || name.hasPrefix(".build") {
+                let repo = (dir as NSString).deletingLastPathComponent
+                return fm.fileExists(atPath: repo + "/Package.swift") && fm.fileExists(atPath: repo + "/Sources/rampartd")
+            }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return false
+    }
+
     static func impostorDetection(path: String?, pid: Int32?, reason: String) -> Detection {
         Detection(path: path, pid: pid, name: "Process impersonating \(Product.name)",
                   category: .suspicious, severity: .medium, confidence: 45,
@@ -356,6 +372,7 @@ public final class EventHub {
         // Impostor check: a process named like a RamPart helper that isn't an installed, RamPart-signed binary.
         if ev.kind == .exec, let p = ev.process, p.pid != selfPid,
            RampartService.names.contains((p.path as NSString).lastPathComponent),
+           !Self.isRampartDevBuild(p.path),
            let reason = RampartService.impostorReason(name: (p.path as NSString).lastPathComponent, path: p.path,
                                                        signingID: p.signingID, installPaths: config.rampartInstallPaths) {
             ev.detail["impostor_rampart"] = "1"

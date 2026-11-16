@@ -472,7 +472,10 @@ final class AppModel {
         if ProcessInfo.processInfo.arguments.contains("--demo") { enterDemo(); return }
         Task { await connect(autoLaunch: true) }
         pollTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in
-            Task { @MainActor in await AppModel.shared.periodic() }
+            Task { @MainActor in
+                await AppModel.shared.periodic()
+                malloc_zone_pressure_relief(nil, 0)   // return freed heap pages to macOS (keeps the footprint low)
+            }
         }
     }
 
@@ -515,6 +518,7 @@ final class AppModel {
             mode = .live
             demoTimer?.invalidate()
             await refresh()
+            if health?.mode == "root" { DaemonLauncher.shared.retireUserHelper() }
             subscribe()
             EmergencyModel.shared.startAlways()
         } else {

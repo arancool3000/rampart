@@ -85,7 +85,7 @@ struct RampartAnimatedBackdrop: View {
         let scroll = (t * 0.35).truncatingRemainder(dividingBy: 1)
         for k in 0..<(still ? 0 : 18) {   // horizontal lines, spaced by depth
             let z = (Double(k) + 1 - scroll) / 18          // 0 near horizon … 1 at the bottom
-            let y = horizon + (h - horizon) * CGFloat(z * z)
+            let y = horizon + (h - horizon) * floorS(z, ratio: road.topHalf / road.bottomHalf)
             grid.move(to: CGPoint(x: 0, y: y)); grid.addLine(to: CGPoint(x: w, y: y))
         }
         var floor = ctx
@@ -103,9 +103,9 @@ struct RampartAnimatedBackdrop: View {
             let threat = i % 7 == 3                       // the odd red one: caught and stopped by the shield line
             for trail in 0..<6 {
                 let q = max(0, p - Double(trail) * 0.012)
-                let z = q * q
+                let z = Double(floorS(q, ratio: road.topHalf / road.bottomHalf))
                 let xb = w / 2 + CGFloat(ray) * w / 14
-                let x = vanish.x + (xb - vanish.x) * CGFloat(z), y = horizon + (h - horizon) * CGFloat(z)
+                let x = floorX(xb, s: CGFloat(z), w: w, ratio: road.topHalf / road.bottomHalf), y = horizon + (h - horizon) * CGFloat(z)
                 let s = max(2, CGFloat(2 + z * 7)).rounded()
                 let a = (1 - Double(trail) / 6) * (0.3 + 0.7 * z)
                 ctx.fill(Path(CGRect(x: (x - s / 2).rounded(), y: (y - s / 2).rounded(), width: s, height: s)),
@@ -181,6 +181,18 @@ struct RampartAnimatedBackdrop: View {
         ctx.fill(Path(CGRect(x: origin.x + CGFloat(f.screenX.lowerBound) * cell, y: sy + cell * 0.45, width: CGFloat(f.screenX.count) * cell, height: max(1, cell * 0.1))),
                  with: .color(teal.opacity(0.18)))
     }
+
+    /// True perspective for the floor. Every floor line converges on one vanishing point above the horizon
+    /// (where the road edges meet). `q` is travel progress (0 = horizon, 1 = bottom of the screen); the result is the
+    /// screen fraction `s` of the floor (0 = horizon, 1 = bottom) with distance shrinking as 1/D.
+    static func floorS(_ q: Double, ratio r: CGFloat) -> CGFloat {
+        let dMax = 1 / Double(max(0.02, r))            // ground distance at the horizon (bottom = 1)
+        let d = dMax - (dMax - 1) * min(max(q, 0), 1)
+        // screen y ∝ 1/d measured from the vanishing point; normalise so d=dMax → 0 and d=1 → 1.
+        return CGFloat((1 / d - 1 / dMax) / (1 - 1 / dMax))
+    }
+    /// x on the floor at fraction `s` for a line that hits the bottom edge at `xb`.
+    static func floorX(_ xb: CGFloat, s: CGFloat, w: CGFloat, ratio r: CGFloat) -> CGFloat { w / 2 + (xb - w / 2) * (r + (1 - r) * s) }
 
     /// The road from the fortress gate to the bottom of the screen.
     struct Road { var topHalf: CGFloat; var bottomHalf: CGFloat }
@@ -307,7 +319,9 @@ final class BackdropNSView: NSView {
         root.addSublayer(glow)
 
         // 3. Grid lines rushing toward you: each line follows y = horizon + depth² · floor, staggered.
-        let floorH = h - horizon, lines = 16, period = 3.2
+        let floorH = h - horizon, lines = 14, period = 2.6
+        let road = B.roadGeometry(w: w, h: h, horizon: horizon)
+        let ratio = road.topHalf / road.bottomHalf
         let floorClip = CALayer()
         floorClip.frame = CGRect(x: 0, y: horizon, width: w, height: floorH)
         floorClip.masksToBounds = true
@@ -319,11 +333,13 @@ final class BackdropNSView: NSView {
             line.shadowColor = cg(B.cyan); line.shadowOpacity = 0.9; line.shadowRadius = 4; line.shadowOffset = .zero
             line.shadowPath = CGPath(rect: line.bounds, transform: nil)
             let steps = 24
-            let ys = (0...steps).map { i -> NSNumber in let z = Double(i) / Double(steps); return NSNumber(value: Double(floorH) * z * z) }
+            let ys = (0...steps).map { i -> NSNumber in NSNumber(value: Double(floorH) * Double(B.floorS(Double(i) / Double(steps), ratio: ratio))) }
             let ops = (0...steps).map { i -> NSNumber in let z = Double(i) / Double(steps); return NSNumber(value: 0.05 + 0.45 * z) }
             let a = CAKeyframeAnimation(keyPath: "position.y"); a.values = ys
             let o = CAKeyframeAnimation(keyPath: "opacity"); o.values = ops
-            let g = CAAnimationGroup(); g.animations = [a, o]; g.duration = period; g.repeatCount = .infinity
+            let th = CAKeyframeAnimation(keyPath: "bounds")
+            th.values = (0...steps).map { i in NSValue(rect: CGRect(x: 0, y: 0, width: w, height: 0.6 + 2.2 * B.floorS(Double(i) / Double(steps), ratio: ratio))) }
+            let g = CAAnimationGroup(); g.animations = [a, o, th]; g.duration = period; g.repeatCount = .infinity
             g.timeOffset = period * Double(k) / Double(lines)
             line.add(g, forKey: "move")
             floorClip.addSublayer(line)
@@ -331,7 +347,6 @@ final class BackdropNSView: NSView {
 
         // 3b. The road into the gate: dark lane with neon edges, a glow reflected from the Guard,
         //     chasing runway lights along both edges and centre dashes rushing toward you.
-        let road = B.roadGeometry(w: w, h: h, horizon: horizon)
         func edgeX(_ side: CGFloat, _ s: CGFloat) -> CGFloat { w / 2 + side * (road.topHalf + (road.bottomHalf - road.topHalf) * s) }
         let lane = CGMutablePath()
         lane.move(to: CGPoint(x: edgeX(-1, 0), y: horizon)); lane.addLine(to: CGPoint(x: edgeX(1, 0), y: horizon))
@@ -363,7 +378,7 @@ final class BackdropNSView: NSView {
         let lights = 12, chase = 1.8
         for side: CGFloat in [-1, 1] {
             for k in 0..<lights {
-                let sDepth = pow(Double(k + 1) / Double(lights + 1), 2)
+                let sDepth = Double(B.floorS(Double(k + 1) / Double(lights + 1), ratio: ratio))
                 let sz = CGFloat(3 + 9 * sDepth)
                 let l = CALayer()
                 l.bounds = CGRect(x: 0, y: 0, width: sz, height: sz * 0.6)
@@ -387,7 +402,7 @@ final class BackdropNSView: NSView {
             d.shadowColor = cg(B.teal); d.shadowOpacity = 0.9; d.shadowRadius = 6; d.shadowOffset = .zero
             var pos: [NSValue] = [], bnd: [NSValue] = [], op: [NSNumber] = []
             for i in 0...dSteps {
-                let q = Double(i) / Double(dSteps), z = CGFloat(q * q)
+                let q = Double(i) / Double(dSteps), z = B.floorS(q, ratio: ratio)
                 pos.append(NSValue(point: CGPoint(x: w / 2, y: horizon + (h - horizon) * z)))
                 bnd.append(NSValue(rect: CGRect(x: 0, y: 0, width: max(1, 10 * z), height: max(1, 70 * z))))
                 op.append(NSNumber(value: 0.2 + 0.8 * Double(z)))
@@ -401,18 +416,82 @@ final class BackdropNSView: NSView {
             root.addSublayer(d)
         }
 
+        // 3c. Guard bots: a patrol walking the wall and a squad marching up the road into the gate.
+        let botImage: CGImage? = {
+            let r = ImageRenderer(content: PixelBotView(state: .idle, stateStarted: .distantPast, cell: 4, paused: true)
+                .environment(\.colorScheme, .dark))
+            r.scale = scale
+            return r.cgImage
+        }()
+        let botSize = PixelBotView.size(cell: 4)
+        func bobbing(_ layer: CALayer, period: Double, offset: Double) {
+            let b = CAKeyframeAnimation(keyPath: "transform.translation.y")
+            b.values = [0, -3, 0, -3, 0]; b.keyTimes = [0, 0.25, 0.5, 0.75, 1]; b.calculationMode = .discrete
+            b.duration = period; b.repeatCount = .infinity; b.timeOffset = offset
+            layer.add(b, forKey: "bob")
+        }
+        if let img = botImage {
+            // Patrol: two bots pacing the wall top, turning at the ends.
+            let wallTop = horizon - B.wallHeight(horizon) - max(4, (horizon / 90).rounded()) * 2
+            let patrolH: CGFloat = horizon * 0.07, patrolW = patrolH * botSize.width / botSize.height
+            for (i, span) in [(0, (w * 0.08, w * 0.30)), (1, (w * 0.70, w * 0.92))] {
+                let bot = CALayer()
+                bot.contents = img; bot.contentsGravity = .resizeAspect; bot.magnificationFilter = .nearest
+                bot.bounds = CGRect(x: 0, y: 0, width: patrolW, height: patrolH)
+                bot.position = CGPoint(x: span.0, y: wallTop - patrolH / 2 + patrolH * 0.12)
+                let walk = CAKeyframeAnimation(keyPath: "position.x")
+                walk.values = [span.0, span.1, span.1, span.0, span.0]; walk.keyTimes = [0, 0.45, 0.5, 0.95, 1]
+                walk.duration = 16 + Double(i) * 3; walk.repeatCount = .infinity; walk.timeOffset = Double(i) * 5
+                bot.add(walk, forKey: "patrol")
+                let face = CAKeyframeAnimation(keyPath: "transform.scale.x")
+                face.values = [1, 1, -1, -1, 1]; face.keyTimes = [0, 0.475, 0.476, 0.975, 0.976]; face.calculationMode = .discrete
+                face.duration = walk.duration; face.repeatCount = .infinity; face.timeOffset = walk.timeOffset
+                bot.add(face, forKey: "turn")
+                bobbing(bot, period: 0.6, offset: Double(i) * 0.3)
+                root.addSublayer(bot)
+            }
+            // Squad: three bots marching from near the viewer up the road into the gate, shrinking with distance.
+            let march = 14.0, mSteps = 24
+            for (i, lane) in [(0, CGFloat(-0.45)), (1, CGFloat(0.45)), (2, CGFloat(0))] {
+                let bot = CALayer()
+                bot.contents = img; bot.contentsGravity = .resizeAspect; bot.magnificationFilter = .nearest
+                var pos: [NSValue] = [], bnd: [NSValue] = [], op: [NSNumber] = []
+                for k in 0...mSteps {
+                    let q = 0.92 - 0.9 * Double(k) / Double(mSteps)            // walking away from you
+                    let sF = B.floorS(q, ratio: ratio)
+                    let half = road.topHalf + (road.bottomHalf - road.topHalf) * sF
+                    let scaleAt = ratio + (1 - ratio) * sF
+                    let bh = max(6, horizon * 0.22 * scaleAt), bw = bh * botSize.width / botSize.height
+                    let y = horizon + (h - horizon) * sF
+                    pos.append(NSValue(point: CGPoint(x: w / 2 + lane * half * 0.55, y: y - bh / 2)))
+                    bnd.append(NSValue(rect: CGRect(x: 0, y: 0, width: bw, height: bh)))
+                    op.append(NSNumber(value: k == mSteps ? 0 : min(1, 0.25 + Double(scaleAt) * 1.5)))
+                }
+                let pa = CAKeyframeAnimation(keyPath: "position"); pa.values = pos
+                let ba = CAKeyframeAnimation(keyPath: "bounds"); ba.values = bnd
+                let oa = CAKeyframeAnimation(keyPath: "opacity"); oa.values = op
+                let g = CAAnimationGroup(); g.animations = [pa, ba, oa]; g.duration = march; g.repeatCount = .infinity
+                g.timeOffset = march * Double(i) / 3 + (i == 2 ? 1.2 : 0)
+                bot.opacity = 0
+                bot.add(g, forKey: "march")
+                bobbing(bot, period: 0.5, offset: Double(i) * 0.17)
+                root.addSublayer(bot)
+            }
+        }
+
         // 4. Data packets racing down the rays, with a glow trail; every 7th one is a red threat.
         let vanish = CGPoint(x: w / 2, y: horizon)
         for i in 0..<14 {
-            let ray = Int(B.hash(i, 7) * 30) - 15
+            var ray = Int(B.hash(i, 7) * 30) - 15
+            if abs(CGFloat(ray) * w / 14) < road.bottomHalf * 1.15 { ray = ray < 0 ? ray - 3 : ray + 3 }   // never on the road
             let xb = w / 2 + CGFloat(ray) * w / 14
             let threat = i % 7 == 3
             let color = cg(threat ? B.red : B.teal)
             let steps = 20
             var pts: [NSValue] = [], sizes: [NSValue] = [], ops: [NSNumber] = []
             for s in 0...steps {
-                let q = Double(s) / Double(steps), z = CGFloat(q * q)
-                pts.append(NSValue(point: CGPoint(x: vanish.x + (xb - vanish.x) * z, y: horizon + (h - horizon) * z)))
+                let q = Double(s) / Double(steps), z = B.floorS(q, ratio: ratio)
+                pts.append(NSValue(point: CGPoint(x: B.floorX(xb, s: z, w: w, ratio: ratio), y: horizon + (h - horizon) * z)))
                 let px = max(2, 2 + z * 8)
                 sizes.append(NSValue(rect: CGRect(x: 0, y: 0, width: px, height: px)))
                 ops.append(NSNumber(value: 0.25 + 0.75 * Double(z)))
@@ -535,11 +614,21 @@ final class BackdropNSView: NSView {
         shimmer.locations = [0, 0.05, 0.1]
         let sweep = CABasicAnimation(keyPath: "locations")
         sweep.fromValue = [-0.2, -0.1, 0]; sweep.toValue = [1, 1.1, 1.2]
-        sweep.duration = 2.4
-        let sweepCycle = CAAnimationGroup(); sweepCycle.animations = [sweep]; sweepCycle.duration = 7; sweepCycle.repeatCount = .infinity
-        shimmer.add(sweepCycle, forKey: "sweep")
+        sweep.duration = 3.6; sweep.repeatCount = .infinity   // continuous: one wave after another, never pausing
+        shimmer.add(sweep, forKey: "sweep")
         shimmer.mask = shimmerHex
         field.addSublayer(shimmer)
+        // a second, slower wave rolling down from the top of the dome
+        let downHex = CALayer(); downHex.frame = field.bounds; downHex.contents = hexImg; downHex.contentsGravity = .resize
+        let down = CAGradientLayer(); down.frame = field.bounds
+        down.colors = [cg(B.teal.opacity(0)), cg(B.teal.opacity(0.35)), cg(B.teal.opacity(0))]
+        down.startPoint = CGPoint(x: 0.5, y: 0); down.endPoint = CGPoint(x: 0.5, y: 1)
+        let dsweep = CABasicAnimation(keyPath: "locations")
+        dsweep.fromValue = [-0.3, -0.15, 0]; dsweep.toValue = [1, 1.15, 1.3]
+        dsweep.duration = 5.3; dsweep.repeatCount = .infinity
+        down.add(dsweep, forKey: "sweep")
+        down.mask = downHex
+        field.addSublayer(down)
         root.addSublayer(field)
         let rim = CAShapeLayer(); rim.frame = domeRect; rim.path = domeLocal
         rim.fillColor = nil; rim.strokeColor = cg(B.teal.opacity(0.45)); rim.lineWidth = 1.5
@@ -554,7 +643,7 @@ final class BackdropNSView: NSView {
         beam.shadowColor = cg(B.teal); beam.shadowOpacity = 1; beam.shadowRadius = 12; beam.shadowOffset = .zero
         beam.shadowPath = CGPath(rect: beam.bounds, transform: nil)
         let bSteps = 24
-        let bys = (0...bSteps).map { i -> NSNumber in let z = Double(i) / Double(bSteps); return NSNumber(value: Double(horizon) + Double(h - horizon) * z * z) }
+        let bys = (0...bSteps).map { i -> NSNumber in NSNumber(value: Double(horizon) + Double(h - horizon) * Double(B.floorS(Double(i) / Double(bSteps), ratio: ratio))) }
         let bop = (0...bSteps).map { i -> NSNumber in let z = Double(i) / Double(bSteps); return NSNumber(value: sin(z * .pi) * 0.9) }
         let by = CAKeyframeAnimation(keyPath: "position.y"); by.values = bys; by.duration = 2.2
         let bo = CAKeyframeAnimation(keyPath: "opacity"); bo.values = bop; bo.duration = 2.2

@@ -211,6 +211,17 @@ final class DaemonLauncher {
         do { try svc.register(); return svc.status == .enabled } catch { return false }
     }
 
+    /// The full (root) service is running: the no-root user helper only duplicates its work (CPU, RAM, battery).
+    /// Stops our child and unregisters the user LaunchAgent; `registerAgent` brings it back if the root service goes away.
+    func retireUserHelper() {
+        guard !Headless.active else { return }
+        stopChild()
+        if #available(macOS 13, *) {
+            let svc = SMAppService.agent(plistName: Self.agentPlist)
+            if svc.status == .enabled { try? svc.unregister() }
+        }
+    }
+
     /// Called from applicationWillTerminate.
     func appWillTerminate() {
         guard let c = child, c.isRunning else { return }

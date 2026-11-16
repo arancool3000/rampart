@@ -143,6 +143,7 @@ struct DesktopLayerView: View {
                     }
                 }
                 .padding(DS.Space.xl)
+                .padding(.leading, desktop.stageManagerOn ? 190 : 0)   // clear of Stage Manager's window strip
                 if primary && welcomeOverride == true {   // live: shown in its own window (DesktopMode.showWelcome)
                     DesktopWelcomeCard().frame(maxWidth: 560).padding(.top, 120).zIndex(5)
                 }

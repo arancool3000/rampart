@@ -59,6 +59,11 @@ final class DesktopMode {
     @ObservationIgnored private var monitors: [Any] = []
     /// The apps panel stays hidden so the backdrop shows; the search bar or its Apps button opens it.
     var launcherOpen = false
+    /// Stage Manager keeps recent windows in a strip on the left; widgets move right so they don't sit under it.
+    var stageManagerOn = false
+    static func readStageManager() -> Bool {
+        CFPreferencesCopyAppValue("GloballyEnabled" as CFString, "com.apple.WindowManager" as CFString) as? Bool ?? false
+    }
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private var displaysAwake = true
     @ObservationIgnored private var hotKey: EventHotKeyRef?
@@ -124,6 +129,7 @@ final class DesktopMode {
     static let widgetLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
 
     private func show() {
+        stageManagerOn = Self.readStageManager()
         DesktopCleaner.apply()   // hide Finder's desktop files and macOS widgets: only RamPart's layer shows
         rebuild()
         installTracking()

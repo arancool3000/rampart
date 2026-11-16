@@ -108,7 +108,6 @@ struct DesktopDefenseGrid: View {
                     .buttonStyle(.plain)
                 }
             }
-            .overlay { ScanSweep(running: desktop.visible) }
         }
         .desktopCard(padding: DS.Space.m + 2)
     }
@@ -128,36 +127,27 @@ struct StatusLED: View {
 struct PulsingDot: View {
     var color: Color
     var running: Bool
-    @StateVar private var on = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    // A 1 Hz step blink (TimelineView, no continuous animation): repeatForever animations re-rendered the
+    // whole layer every frame and cost ~40% CPU.
     var body: some View {
-        Circle().fill(color).frame(width: 7, height: 7)
-            .shadow(color: color, radius: on ? 5 : 1)
-            .opacity(on ? 1 : 0.35)
-            .onAppear { restart() }
-            .onChange(of: running) { _, _ in restart() }
-            .accessibilityHidden(true)
-    }
-    private func restart() {
-        guard running, !reduceMotion else { on = true; return }
-        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) { on.toggle() }
+        TimelineView(.periodic(from: .now, by: 1)) { tl in
+            let on = !running || reduceMotion || Int(tl.date.timeIntervalSinceReferenceDate) % 2 == 0
+            Circle().fill(color).frame(width: 7, height: 7).opacity(on ? 1 : 0.3)
+        }
+        .accessibilityHidden(true)
     }
 }
 
 struct BlinkingCursor: View {
     var running: Bool
-    @StateVar private var on = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
-        Rectangle().fill(Palette.teal).frame(width: 7, height: 12)
-            .opacity(on ? 0.9 : 0)
-            .onAppear { restart() }
-            .onChange(of: running) { _, _ in restart() }
-            .accessibilityHidden(true)
-    }
-    private func restart() {
-        guard running, !reduceMotion else { on = true; return }
-        withAnimation(.linear(duration: 0.01).delay(0.55).repeatForever(autoreverses: true)) { on.toggle() }
+        TimelineView(.periodic(from: .now, by: 0.6)) { tl in
+            let on = !running || reduceMotion || Int(tl.date.timeIntervalSinceReferenceDate / 0.6) % 2 == 0
+            Rectangle().fill(Palette.teal).frame(width: 7, height: 12).opacity(on ? 0.9 : 0)
+        }
+        .accessibilityHidden(true)
     }
 }
 

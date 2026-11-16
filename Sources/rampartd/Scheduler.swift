@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import RampartShared
 
 /// Periodic work: quick scans, signature updates, persistence diffing, posture refresh, vault purge.
@@ -39,6 +40,9 @@ final class Scheduler {
     }
 
     private func tick() {
+        // Hand freed heap pages back to macOS. Scans and blocklist builds allocate big transient buffers; without
+        // this the daemon kept ~160 MB of already-freed (fragmented) memory resident.
+        malloc_zone_pressure_relief(nil, 0)
         let cfg = p.runtime.config, st = p.state.value
         // Scheduled scans wait for the charger (unless one hasn't finished in 3 days).
         let onBattery = PowerThrottle.shared.factor > 1

@@ -23,9 +23,24 @@ enum UIRenderer {
         w.close()
     }
 
+    /// The RamPart desktop scene (fortress, road, aurora, Guard) as a still wallpaper at the main screen's pixel size.
+    static func renderWallpaper(to url: URL) {
+        let screen = NSScreen.main ?? NSScreen.screens.first
+        let size = screen?.frame.size ?? CGSize(width: 1512, height: 982)
+        let scale = screen?.backingScaleFactor ?? 2
+        let r = ImageRenderer(content: Canvas { ctx, sz in
+            RampartAnimatedBackdrop.draw(&ctx, sz, t: 2.6, still: false)
+        }.frame(width: size.width, height: size.height))
+        r.scale = scale
+        guard let cg = r.cgImage else { return }
+        let rep = NSBitmapImageRep(cgImage: cg)
+        try? rep.representation(using: .png, properties: [:])?.write(to: url)
+    }
+
     static func renderAll(to dir: URL) async {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         if CommandLine.arguments.contains("--render-desktop") { await DesktopPreviews.renderAll(to: dir); return }
+        if CommandLine.arguments.contains("--render-wallpaper") { renderWallpaper(to: dir.appendingPathComponent("RamPart-wallpaper.png")); return }
         let model = AppModel.shared
         // Wait for demo/live data.
         for _ in 0..<40 where model.mode == .connecting { await sleep(0.1) }
