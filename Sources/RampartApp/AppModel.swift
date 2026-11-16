@@ -406,6 +406,8 @@ final class AppModel {
     @ObservationIgnored private var lastHeavyRefresh = Date.distantPast
     @ObservationIgnored private var lastNetworkStats: NetworkStats?
     @ObservationIgnored private var lastActivitySignature = ""
+    @ObservationIgnored private var lastDetectionsFetch = Date.distantPast
+    @ObservationIgnored private var lastOpenCount = -1
     /// Daemon entries by id (merged across light and full fetches), newest kept for 90 days.
     @ObservationIgnored private var daemonActivity: [UUID: ActivityEntry] = [:]
     @ObservationIgnored private var lastFullActivityFetch = Date.distantPast
@@ -570,7 +572,13 @@ final class AppModel {
                 source = .systemService
             }
         }
-        if case .detections(let d)? = try? await client.request(.listDetections) { set(\.detections, d.sorted { $0.date > $1.date }) }
+        // The full list is big (hundreds of KB to decode): fetch it when the open count changes, on a heavy refresh,
+        // or at most every 2 minutes, instead of every 15 s.
+        if heavy || status.openDetections != lastOpenCount || Date().timeIntervalSince(lastDetectionsFetch) > 120 {
+            if case .detections(let d)? = try? await client.request(.listDetections) {
+                set(\.detections, d.sorted { $0.date > $1.date }); lastDetectionsFetch = Date(); lastOpenCount = status.openDetections
+            }
+        }
         if case .quarantine(let q)? = try? await client.request(.listQuarantine) { set(\.quarantine, q.sorted { $0.date > $1.date }) }
         if case .settings(let st)? = try? await client.request(.getSettings) { set(\.settings, st) }
         if case .allowRules(let r)? = try? await client.request(.listAllowRules) { set(\.allowRules, r.sorted { $0.created > $1.created }) }
@@ -662,7 +670,13 @@ final class AppModel {
     }
 
     /// Daemon entries (annotated with who did it) + the app's own entries, newest first.
+    @ObservationIgnored private var lastRebuildSignature = ""
     func rebuildActivity() {
+        // Skip the full rebuild (thousands of rows + daily stats) when nothing changed since last time.
+        let newestDaemon = daemonActivity.values.max { $0.date < $1.date }
+        let sig = "\(daemonActivity.count)|\(newestDaemon?.id.uuidString ?? "")|\(localActivity.entries.count)|\(localActivity.entries.last?.id.uuidString ?? "")|\(Calendar.current.component(.day, from: Date()))"
+        if sig == lastRebuildSignature, !activity.isEmpty { return }
+        lastRebuildSignature = sig
         let cutoff = Date().addingTimeInterval(-AppActivityLog.retention)
         var all: [ActivityEntry] = []
         all.reserveCapacity(daemonActivity.count + localActivity.entries.count)
