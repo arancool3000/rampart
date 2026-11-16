@@ -502,9 +502,13 @@ struct DesktopWelcomeCard: View {
                     .buttonStyle(GlowButtonStyle()).controlSize(.large)
             }
         }
-        .desktopCard(padding: DS.Space.xl)
-        // Opaque under the frost: it floats over other widgets in the same window, which a behind-window blur can't hide.
+        .padding(DS.Space.xl)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous).fill(Color(red: 0.05, green: 0.08, blue: 0.13)))
+        .overlay { RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous).strokeBorder(Color.white.opacity(0.15), lineWidth: 1) }
+        .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
+        // Solid, not frosted: it floats over other widgets, which a behind-window blur can't hide.
+        .desktopHit()
         .transition(.opacity)
     }
     private func bullet(_ s: String, _ t: String) -> some View {

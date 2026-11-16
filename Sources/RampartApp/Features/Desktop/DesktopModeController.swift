@@ -173,13 +173,15 @@ final class DesktopMode {
     /// sat below macOS's own desktop widgets (Calendar, Clock…), which covered half of it.
     private func showWelcome() {
         guard welcomePanel == nil, !Headless.active, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
-        let host = FirstMouseHostingView(rootView: DesktopWelcomeCard().frame(width: 560).environment(self)
+        // Margin so the card's soft shadow isn't clipped into a hard rectangle at the window edge.
+        let host = FirstMouseHostingView(rootView: DesktopWelcomeCard().frame(width: 560).padding(40).environment(self)
             .environment(\.colorScheme, .dark).tint(.rampartTeal))
+        host.wantsLayer = true; host.layer?.backgroundColor = .clear
         let size = host.fittingSize
         let vf = screen.visibleFrame
         let p = NSPanel(contentRect: NSRect(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2, width: size.width, height: size.height),
                         styleMask: [.borderless], backing: .buffered, defer: false)
-        p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
+        p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = false
         p.isReleasedWhenClosed = false; p.level = .normal; p.isMovableByWindowBackground = true
         p.collectionBehavior = [.moveToActiveSpace, .fullScreenNone]
         p.contentView = host
