@@ -140,7 +140,7 @@ public struct URLAnalyzer: Sendable {
         case "javascript":
             signals.append(ScamSignal(id: "url.scheme.javascript", category: .urlStructure, title: "Runs code instead of opening a page",
                                       explanation: "A javascript: link executes script in the current page. Legitimate links never need this.", score: 85, evidence: [ScamHighlight(text: u.original, kind: .link)]))
-        case "data":
+        case "data" where Self.isRiskyDataURL(u.original):
             signals.append(ScamSignal(id: "url.scheme.data", category: .urlStructure, title: "Page embedded inside the link",
                                       explanation: "A data: link carries a whole hidden page inside it, a common way to host a fake login form with no server to take down.", score: 80, evidence: [ScamHighlight(text: String(u.original.prefix(60)), kind: .link)]))
         default: break
@@ -150,7 +150,7 @@ public struct URLAnalyzer: Sendable {
         }
 
         // Structure
-        if u.isIPLiteral {
+        if u.isIPLiteral, !Self.isLocalAddress(u.asciiHost) {
             signals.append(ScamSignal(id: "url.ip", category: .urlStructure, title: "Uses a raw IP address instead of a name",
                                       explanation: "Real companies use their domain name. Raw addresses hide who owns the site.", score: 45, evidence: [hostHL]))
         }
@@ -479,5 +479,25 @@ public final class FileBlocklistProvider: WebBlocklistProvider, @unchecked Senda
             h = String(h[h.index(after: dot)...])
             if !h.contains(".") { return nil }
         }
+    }
+}
+
+
+extension URLAnalyzer {
+    /// Only data: links that render a page or run script are risky. `data:image/png;…` icons are everywhere, and
+    /// text like `data::ptr` or `data:options:` (code, logs) isn't a link at all.
+    static func isRiskyDataURL(_ s: String) -> Bool {
+        let body = s.dropFirst(5).lowercased().trimmingCharacters(in: .whitespaces)
+        return ["text/html", "application/xhtml", "text/javascript", "application/javascript", "application/x-javascript", "image/svg+xml;base64,phn2zy", "text/xml"]
+            .contains { body.hasPrefix($0) }
+            && !(body.hasPrefix("image/svg+xml") && !body.contains("script"))
+    }
+
+    /// Loopback, private and link-local addresses: your own Mac or LAN, not a phishing host.
+    static func isLocalAddress(_ host: String) -> Bool {
+        let p = host.split(separator: ".").compactMap { Int($0) }
+        guard p.count == 4 else { return host == "::1" || host == "[::1]" }
+        return p[0] == 127 || p[0] == 10 || (p[0] == 192 && p[1] == 168) || (p[0] == 172 && (16...31).contains(p[1]))
+            || (p[0] == 169 && p[1] == 254) || p == [0, 0, 0, 0]
     }
 }

@@ -351,8 +351,15 @@ final class AppModel {
         selection = items[i]
     }
     var status = ProtectionStatus()
-    var detections: [Detection] = [] { didSet { syncChrome() } }
-    var quarantine: [QuarantineRecord] = []
+    var detections: [Detection] = [] { didSet { recountNeedsYou(); syncChrome() } }
+    var quarantine: [QuarantineRecord] = [] { didSet { recountNeedsYou() } }
+    /// Cached: views read it many times per frame and the full policy pass over every detection is not cheap.
+    private(set) var needsYouCount = 0
+    private func recountNeedsYou() {
+        let hashes = Set(quarantine.compactMap(\.sha256)), paths = Set(quarantine.map(\.originalPath))
+        let n = DetectionPolicy.needsYouCount(detections) { d in (d.sha256.map(hashes.contains) ?? false) || (d.path.map(paths.contains) ?? false) }
+        if n != needsYouCount { needsYouCount = n }
+    }
     var posture: [PostureCheck] = []
     var persistence: [PersistenceItem] = []
     var activity: [ActivityItem] = []
@@ -415,9 +422,8 @@ final class AppModel {
     /// and quarantined items are not counted anywhere (badge, "Needs attention" footer, menu bar).
     var openDetections: [Detection] { detections.filter { DetectionPolicy.tier($0, quarantined: isQuarantined($0)) == .needsYou } }
     /// Rows in "Needs you" (one per file, process or login item): the sidebar badge number.
-    var needsYouCount: Int { DetectionPolicy.needsYouCount(detections, quarantined: isQuarantined) }
     func isQuarantined(_ d: Detection) -> Bool {
-        quarantine.contains { ($0.sha256 == d.sha256 && d.sha256 != nil) || $0.originalPath == d.path }
+        quarantine.contains { ($0.sha256 == d.sha256 && d.sha256 != nil) || $0.originalPath == d.path }   // one-off checks; counts use the cache
     }
     var isScanning: Bool { if case .running = scanPhase { return true }; return false }
     var scanProgress: ScanProgress? { if case .running(let p) = scanPhase { return p }; return nil }

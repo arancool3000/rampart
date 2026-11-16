@@ -77,10 +77,12 @@ struct DesktopBackdropView: View {
             case .tinted:
                 LinearGradient(colors: [Palette.navy.opacity(0.62), Palette.deepTeal.opacity(0.42)], startPoint: .topLeading, endPoint: .bottomTrailing)
             case .full:
-                AppBackdrop().environment(\.colorScheme, .dark)
+                RampartAnimatedBackdrop(running: desktop.visible)
             }
             // A soft vignette keeps white text readable on bright wallpapers.
-            LinearGradient(colors: [Color.black.opacity(0.28), .clear, .clear, Color.black.opacity(0.22)], startPoint: .top, endPoint: .bottom)
+            if desktop.backdrop != .full {
+                LinearGradient(colors: [Color.black.opacity(0.28), .clear, .clear, Color.black.opacity(0.22)], startPoint: .top, endPoint: .bottom)
+            }
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)

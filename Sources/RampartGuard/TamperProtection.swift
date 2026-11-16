@@ -282,7 +282,15 @@ public final class TamperDetector: @unchecked Sendable {
             switch tool {
             case "systemsetup": sets = lower.contains("-setdate") || lower.contains("-settime") || lower.contains("-setusingnetworktime")
                 || lower.contains("-setnetworktimeserver") || lower.contains("-settimezone")
-            case "date": sets = args.dropFirst().contains { !$0.hasPrefix("-") && !$0.hasPrefix("+") && $0.rangeOfCharacter(from: .decimalDigits) != nil }
+            case "date":
+                // `date -r <secs>` / `date -j …` only *format* a date; `-v`, `-f`, `-z` take their own operand.
+                // Only a bare [[[mm]dd]HH]MM[[cc]yy][.ss] operand with neither -r nor -j actually sets the clock.
+                let a = Array(args.dropFirst())
+                if a.contains(where: { $0.hasPrefix("-") && !$0.hasPrefix("--") && ($0.contains("r") || $0.contains("j")) }) { sets = false; break }
+                var operandTaken = Set<Int>()
+                for (i, x) in a.enumerated() where ["-v", "-f", "-z"].contains(x) { operandTaken.insert(i + 1) }
+                sets = a.enumerated().contains { i, x in !operandTaken.contains(i) && !x.hasPrefix("-") && !x.hasPrefix("+")
+                    && x.allSatisfy { $0.isNumber || $0 == "." } && x.count >= 4 }
             case "sntp": sets = flags.contains { !$0.hasPrefix("--") && ($0.contains("s") || $0.contains("S")) }
             default: sets = true   // ntpdate, timed control tools
             }

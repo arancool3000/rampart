@@ -65,7 +65,7 @@ final class DesktopMode {
     private init() {
         let d = UserDefaults.standard
         isOn = !Headless.active && d.bool(forKey: Self.enabledKey)
-        backdrop = DesktopBackdropStyle(rawValue: d.string(forKey: Self.backdropKey) ?? "") ?? .tinted
+        backdrop = DesktopBackdropStyle(rawValue: d.string(forKey: Self.backdropKey) ?? "") ?? .full
         allDisplays = d.object(forKey: Self.allDisplaysKey) as? Bool ?? true
         welcomeSeen = d.bool(forKey: Self.welcomeKey)
     }
@@ -77,7 +77,10 @@ final class DesktopMode {
         guard !started, !Headless.active else { return }
         started = true
         registerHotKey()
-        if isOn { show() }
+        if isOn { show() } else { DesktopCleaner.restoreIfNeeded() }   // RamPart quit while Desktop Mode was on
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+            DesktopCleaner.restoreIfNeeded()
+        }
     }
 
     func toggle() { setOn(!isOn) }
@@ -119,12 +122,14 @@ final class DesktopMode {
     static let widgetLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
 
     private func show() {
+        DesktopCleaner.apply()   // hide Finder's desktop files and macOS widgets: only RamPart's layer shows
         rebuild()
         installTracking()
         recomputeVisible()
     }
 
     private func hide() {
+        DesktopCleaner.restoreIfNeeded()
         for l in layers { l.widgets.orderOut(nil); l.backdrop.orderOut(nil); l.widgets.contentView = nil; l.backdrop.contentView = nil }
         layers = []
         closeWelcome()

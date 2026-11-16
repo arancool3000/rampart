@@ -72,10 +72,11 @@ enum PixelGuard {
             "..DDDDDGGDDDDD..",
             ".XDDDDDDDDDDDDX.",
             "EXSSSSSSSSSSSSXE",
+            "EXSSSSSSSSSSSSXE",
+            "EXSSSSSSSSSSSSXE",
             "EXVVVVVVVVVVVVXE",
             ".XDDDDDDDDDDDDX.",
             ".DDdDdDDDDdDdDD.",
-            "..DDdDdDDdDdDD..",
             "...DDDDDDDDDD...",
             "....dddddddd....",
         ]
@@ -135,7 +136,7 @@ enum PixelGuard {
         switch v {
         case .capGuard: return Face(eyeL: (4, 9), eyeR: (10, 9), eyeW: 2, eyeH: 2, screenX: 3...12, screenY: 8...11, mouthY: 11, blush: [(3, 11), (12, 11)])
         case .visorSentinel: return Face(eyeL: (4, 7), eyeR: (9, 7), eyeW: 3, eyeH: 1, screenX: 3...12, screenY: 6...8, mouthY: nil, blush: [])
-        case .cyberSentinel: return Face(eyeL: (3, 5), eyeR: (10, 5), eyeW: 3, eyeH: 1, screenX: 2...13, screenY: 5...5, mouthY: nil, blush: [])
+        case .cyberSentinel: return Face(eyeL: (4, 5), eyeR: (10, 5), eyeW: 2, eyeH: 2, screenX: 2...13, screenY: 5...7, mouthY: 7, blush: [(3, 7), (12, 7)])
         case .beaconBot: return Face(eyeL: (4, 5), eyeR: (10, 5), eyeW: 2, eyeH: 2, screenX: 2...13, screenY: 4...8, mouthY: 8, blush: [(3, 8), (12, 8)])
         }
     }

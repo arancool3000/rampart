@@ -121,6 +121,9 @@ public enum AppleImpersonation {
         let plistApple = item.label.lowercased().hasPrefix("com.apple.")
         // Real com.apple launch plists live in /System/Library; a com.apple.* plist in /Library or ~/Library is odd on its own.
         let target = item.target ?? item.location
+        // We can only accuse when we actually checked a real file: a background-task record with no resolvable
+        // executable, or a signature we couldn't read, is "unknown", not "not Apple" (Safari's own helpers are BTM items).
+        guard target.hasPrefix("/"), item.signing?.status != .unknown || targetIsPlatform else { return nil }
         let s = Subject(path: target, label: item.label, isLaunchItem: true, signing: item.signing, isPlatformBinary: targetIsPlatform)
         if var e = assess(s) {
             e.detail += " (launch item \(item.location))"
