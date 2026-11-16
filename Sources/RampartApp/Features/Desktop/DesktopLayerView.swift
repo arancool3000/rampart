@@ -110,7 +110,7 @@ struct DesktopLayerView: View {
                     VStack(alignment: .leading, spacing: DS.Space.l) {
                         DesktopClock()
                         DesktopProtectionCard()
-                        if !compact { DesktopQuickActions() }
+                        if !compact { DesktopQuickActions(); DesktopDefenseGrid() }
                         if compact { DesktopSystemGrid() }
                         Spacer(minLength: 0)
                     }
@@ -130,7 +130,7 @@ struct DesktopLayerView: View {
                         .modifier(Entrance(appeared: appeared, delay: 0.06))
                         VStack(spacing: DS.Space.l) {
                             DesktopSystemGrid()
-                            DesktopActivityCard()
+                            DesktopLiveFeed()
                             DesktopCatchesCard()
                             Spacer(minLength: 0)
                             // Bottom-right is kept clear for the floating RamPart bot.
@@ -182,10 +182,10 @@ struct DesktopClock: View {
         TimelineView(.everyMinute) { ctx in
             VStack(alignment: .leading, spacing: 2) {
                 Text(ctx.date.formatted(date: .omitted, time: .shortened))
-                    .font(.system(size: 76, weight: .thin, design: .rounded))
+                    .font(.system(size: 76, weight: .thin, design: .monospaced))
                     .monospacedDigit()
                 Text(ctx.date.formatted(.dateTime.weekday(.wide).day().month(.wide)))
-                    .font(.system(size: 20, weight: .medium, design: .rounded))
+                    .font(.system(size: 20, weight: .medium, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.85))
                 Text(Self.greeting(ctx.date)).font(DS.Font.body).foregroundStyle(.white.opacity(0.6))
             }
@@ -332,7 +332,7 @@ struct DesktopSystemGrid: View {
                 GridRow {
                     Meter(title: "CPU", value: info.cpu.map { "\(Int(($0 * 100).rounded()))%" } ?? "–", fraction: info.cpu, tint: Palette.teal, history: info.cpuHistory)
                     Meter(title: "Memory", value: info.memory.map { "\(Int(($0.fraction * 100).rounded()))%" } ?? "–", fraction: info.memory?.fraction, tint: Palette.mint,
-                          caption: info.memory.map { "\(DesktopFormat.bytes($0.used)) of \(DesktopFormat.bytes($0.total))" })
+                          caption: info.memory.map { "\(DesktopFormat.memory($0.used)) of \(DesktopFormat.memory($0.total))" })
                 }
                 GridRow {
                     Meter(title: "Disk", value: info.disk.map { "\(DesktopFormat.bytes($0.free)) free" } ?? "–", fraction: info.disk?.fraction, tint: Color(red: 0.55, green: 0.6, blue: 1),
@@ -377,7 +377,7 @@ struct DesktopSystemGrid: View {
         var body: some View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(DS.Font.caption).foregroundStyle(.white.opacity(0.6))
-                Text(value).font(.system(size: 17, weight: .semibold, design: .rounded)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.7)
+                Text(value).font(.system(size: 17, weight: .semibold, design: .monospaced)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.7)
                     .contentTransition(.numericText())
                     .animation(.easeOut(duration: 0.3), value: value)
                 if let f = fraction {
@@ -460,7 +460,7 @@ struct DesktopCatchesCard: View {
                     .font(DS.Font.caption).foregroundStyle(.white.opacity(0.6))
             } else {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    CountUpNumber(value: catches.count).font(.system(size: 26, weight: .bold, design: .rounded))
+                    CountUpNumber(value: catches.count).font(.system(size: 26, weight: .bold, design: .monospaced))
                     Text(catches.count == 1 ? "catch" : "catches").font(DS.Font.caption).foregroundStyle(.white.opacity(0.6))
                 }
                 ForEach(catches.prefix(2)) { c in

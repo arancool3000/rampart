@@ -127,7 +127,7 @@ private struct DropHintOverlay: View {
                 .strokeBorder(Color.rampartTeal.opacity(0.8), style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
             VStack(spacing: Spacing.s) {
                 Image(systemName: "arrow.down.doc").font(.system(size: 40, weight: .semibold)).foregroundStyle(Color.rampartTeal)
-                Text("Drop to scan").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("Drop to scan").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 Text("Files and folders are added to a Custom Scan.").font(.callout).foregroundStyle(.secondary)
             }
         }
@@ -150,7 +150,7 @@ struct ScanChoiceCard: View {
                 Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                     .font(.title3).foregroundStyle(selected ? Color.rampartTeal : Color.secondary.opacity(0.5))
             }
-            Text(kind.title).font(.title3.weight(.semibold)).fontDesign(.rounded).padding(.top, 4)
+            Text(kind.title).font(.title3.weight(.semibold)).fontDesign(.monospaced).padding(.top, 4)
             Text(kind.detail).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let subtitle {
                 Text(SafeText.path(subtitle)).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
@@ -236,7 +236,7 @@ struct RadarView: View {
             VStack(spacing: 0) {
                 if let f = fraction {
                     Text("\(Int(f * 100))%")
-                        .font(.system(size: size * 0.17, weight: .bold, design: .rounded)).monospacedDigit()
+                        .font(.system(size: size * 0.17, weight: .bold, design: .monospaced)).monospacedDigit()
                         .contentTransition(.numericText())
                 } else {
                     Image(systemName: "magnifyingglass").font(.system(size: size * 0.12, weight: .semibold))
@@ -272,11 +272,11 @@ struct RunningScanView: View {
                         .font(.headline).foregroundStyle(Color.rampartTeal)
                     if progress.walkFinished && progress.total > 0 {
                         (Text(Fmt.count(progress.scanned)).foregroundStyle(.primary) + Text(" of \(Fmt.count(progress.total)) files").foregroundStyle(.secondary))
-                            .font(.title.weight(.bold)).fontDesign(.rounded).monospacedDigit()
+                            .font(.title.weight(.bold)).fontDesign(.monospaced).monospacedDigit()
                             .contentTransition(.numericText())
                     } else {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Finding files…").font(.title.weight(.bold)).fontDesign(.rounded)
+                            Text("Finding files…").font(.title.weight(.bold)).fontDesign(.monospaced)
                             if progress.total > 0 {
                                 Text("\(Fmt.count(progress.total)) found so far, \(Fmt.count(progress.scanned)) checked")
                                     .font(.title3).foregroundStyle(.secondary).monospacedDigit()
@@ -368,14 +368,14 @@ struct ScanResultView: View {
                         RippleOnce(tint: .statusProtected).frame(width: 150, height: 150)
                         StatusMark(size: 130, badge: "checkmark.circle.fill", tint: .statusProtected)
                     }
-                    Text("All clear").font(.system(size: 44, weight: .bold, design: .rounded))
+                    Text("All clear").font(.system(size: 44, weight: .bold, design: .monospaced))
                         .revealText(duration: 0.9)
-                    Text("No threats found").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                    Text("No threats found").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                     Text("Scanned \(Fmt.count(record.scanned)) files in \(Fmt.duration(record.seconds)).")
                         .font(.title3).foregroundStyle(.secondary)
                 } else {
                     Image(systemName: "archivebox.fill").font(.system(size: 64)).foregroundStyle(.secondary)
-                    Text(found.count == 1 ? "1 item found" : "\(found.count) items found").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+                    Text(found.count == 1 ? "1 item found" : "\(found.count) items found").font(.largeTitle.weight(.bold)).fontDesign(.monospaced)
                         .revealText(duration: 0.9)
                     Text("They've been moved to quarantine and can't run.").font(.title3).foregroundStyle(.secondary)
                     VStack(spacing: 0) {

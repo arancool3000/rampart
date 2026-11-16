@@ -67,8 +67,9 @@ final class NetGuardService {
         guard timer == nil else { return }
         if firewall.status().rules.contains(where: { $0.decision == .block }) { queue.async { [weak self] in self?.firewall.reapplyAll() } }
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + 3, repeating: 10, leeway: .seconds(2))
-        t.setEventHandler { [weak self] in self?.tick() }
+        t.schedule(deadline: .now() + 3, repeating: 15, leeway: .seconds(3))
+        var n = 0
+        t.setEventHandler { [weak self] in n += 1; if PowerThrottle.shared.shouldRun(tick: n) { self?.tick() } }
         t.resume(); timer = t
     }
 
@@ -85,7 +86,7 @@ final class NetGuardService {
             firewall.extraProtectedAddresses = Array(Set(orig + firewall.extraProtectedAddresses)).sorted()
         }
         let conns = monitor.snapshot()
-        if Date().timeIntervalSince(bytesAt) > 30 { bytes = AppFirewall.byteCounts(); bytesAt = Date() }
+        if Date().timeIntervalSince(bytesAt) > 120 { bytes = AppFirewall.byteCounts(); bytesAt = Date() }
         let prompts = firewall.update(connections: conns, bytes: bytes)
         if !prompts.isEmpty {
             for p in prompts { logInfo("app firewall: first connection by untrusted app \(LogRedact.clean(p.name, max: 80))") }

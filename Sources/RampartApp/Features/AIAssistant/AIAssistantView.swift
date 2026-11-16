@@ -100,7 +100,7 @@ struct AIAssistantView: View {
         HStack(alignment: .center, spacing: Spacing.l) {
             IconBadge(symbol: "sparkles", tint: .rampartTeal, size: 52)
             VStack(alignment: .leading, spacing: 4) {
-                Text("AI Assistant").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("AI Assistant").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 Text("Plain-language explanations and a second opinion, powered by Google Gemini.")
                     .font(.callout).foregroundStyle(.secondary)
                 HStack(spacing: Spacing.s) {
@@ -345,7 +345,7 @@ private struct MessageRow: View {
             HStack(alignment: .top, spacing: Spacing.m) {
                 IconBadge(symbol: isError ? "exclamationmark.bubble" : (isLocal ? "checkmark.shield" : "sparkles"), tint: isError ? .orange : .rampartTeal, size: 28)
                 VStack(alignment: .leading, spacing: Spacing.s) {
-                    if let t = message.title { Text(verbatim: SafeText.line(t)).font(.headline).fontDesign(.rounded) }
+                    if let t = message.title { Text(verbatim: SafeText.line(t)).font(.headline).fontDesign(.monospaced) }
                     // Who is speaking: model text is always labelled as the AI's, so it can't pass as RamPart's own voice.
                     Text(verbatim: isLocal ? "RamPart" : (isError ? "RamPart · couldn't get an answer" : "AI answer (Google Gemini) · can be wrong"))
                         .font(.caption2.weight(.medium)).foregroundStyle(.secondary)

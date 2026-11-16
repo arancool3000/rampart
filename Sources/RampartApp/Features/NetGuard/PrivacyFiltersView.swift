@@ -43,7 +43,7 @@ struct PrivacyFiltersView: View {
         HStack(spacing: Spacing.l) {
             IconBadge(symbol: "line.3.horizontal.decrease.circle", tint: .rampartTeal, size: 44)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Filters & Privacy").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("Filters & Privacy").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 Text("Choose what this Mac can reach, set quiet hours, and see who tried to track you.").font(.callout).foregroundStyle(.secondary)
             }
             Spacer()
@@ -152,7 +152,7 @@ struct PrivacyFiltersView: View {
 
     private func stat(_ title: String, _ v: Int) -> some View {
         VStack(alignment: .leading) {
-            Text(Fmt.count(v)).font(.title.weight(.semibold)).fontDesign(.rounded)
+            Text(Fmt.count(v)).font(.title.weight(.semibold)).fontDesign(.monospaced)
             Text(title).font(.caption).foregroundStyle(.secondary)
         }
     }

@@ -110,7 +110,7 @@ struct DesktopSearchBar: View {
                 Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.6))
                 TextField("Search apps and \(Product.name)…", text: $query)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 16, weight: .regular, design: .rounded))
+                    .font(.system(size: 16, weight: .regular, design: .monospaced))
                     .focused($focused)
                     .onSubmit { if let f = results.first { open(f) } }
                     .onExitCommand { query = ""; focused = false; DesktopMode.shared.launcherOpen = false }

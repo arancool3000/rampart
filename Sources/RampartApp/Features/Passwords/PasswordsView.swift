@@ -141,7 +141,7 @@ struct VaultLockScreen: View {
                 ShieldHero(symbol: creating ? "key.viewfinder" : "lock.shield.fill", tint: .rampartTeal, breathe: false, size: 130)
                 VStack(spacing: 6) {
                     Text(creating ? "Create your password vault" : "Your vault is locked")
-                        .font(.largeTitle.weight(.semibold)).fontDesign(.rounded)
+                        .font(.largeTitle.weight(.semibold)).fontDesign(.monospaced)
                     if creating {
                         Text("Everything is encrypted on this Mac. Only your master password, or your fingerprint once you turn on Touch ID, can open it. \(Product.name) can't recover a forgotten master password.")
                             .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 460)

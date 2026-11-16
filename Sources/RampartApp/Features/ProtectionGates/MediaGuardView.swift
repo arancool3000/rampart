@@ -48,7 +48,7 @@ struct MediaGuardView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
-            Text("Camera & Mic").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+            Text("Camera & Mic").font(.largeTitle.weight(.bold)).fontDesign(.monospaced)
             Text(model.cameraOn || model.micOn ? (serious ? "In use now." : "Someone's on air right now.") : (serious ? "Camera and microphone are off." : "All quiet. Nobody's watching or listening."))
                 .font(.title3).foregroundStyle(.secondary)
             Text("RamPart tells you when an app you haven't trusted turns on your camera or microphone, or when either is used while your Mac is locked or you're away.")

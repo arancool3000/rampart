@@ -28,7 +28,7 @@ struct RefreshView: View {
     private var header: some View {
         HStack(alignment: .center, spacing: Spacing.l) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Refresh").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("Refresh").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 Text("Free up space safely and see what's slowing your Mac down. Everything goes to the Trash first, so you can put it back.")
                     .font(.callout).foregroundStyle(.secondary)
             }
@@ -118,19 +118,19 @@ struct RefreshStorageSection: View {
             VStack(alignment: .leading, spacing: Spacing.m) {
                 switch model.phase {
                 case .scanning(let what):
-                    Text("Looking for space…").font(.title3.weight(.semibold)).fontDesign(.rounded)
+                    Text("Looking for space…").font(.title3.weight(.semibold)).fontDesign(.monospaced)
                     HStack(spacing: 8) { ProgressView().controlSize(.small); Text(SafeText.line(what)).font(.callout).foregroundStyle(.secondary).contentTransition(.opacity) }
                     Button("Stop") { model.cancelScan() }.secondaryActionStyle()
                 case .cleaning:
-                    Text("Moving to the Trash…").font(.title3.weight(.semibold)).fontDesign(.rounded)
+                    Text("Moving to the Trash…").font(.title3.weight(.semibold)).fontDesign(.monospaced)
                     ProgressView().controlSize(.small)
                 default:
                     if model.results.isEmpty {
-                        Text("Smart Refresh").font(.title3.weight(.semibold)).fontDesign(.rounded)
+                        Text("Smart Refresh").font(.title3.weight(.semibold)).fontDesign(.monospaced)
                         Text("RamPart looks for caches, old logs, build leftovers and more, explains each one and pre-selects only what is safe.")
                             .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     } else {
-                        Text("\(model.selectedBytes.refreshFormatted) selected").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                        Text("\(model.selectedBytes.refreshFormatted) selected").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                             .contentTransition(.numericText())
                         Text("\(model.reclaimableBytes.refreshFormatted) found in \(model.actionable.filter { !$0.items.isEmpty }.count) categories. Only safe items are selected; review the rest below.")
                             .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -205,7 +205,7 @@ struct RefreshRing: View {
             VStack(spacing: 2) {
                 if model.isScanning { ProgressView().controlSize(.small) }
                 Text(model.results.isEmpty ? "—" : model.selectedBytes.refreshFormatted)
-                    .font(.title3.weight(.semibold)).fontDesign(.rounded).monospacedDigit()
+                    .font(.title3.weight(.semibold)).fontDesign(.monospaced).monospacedDigit()
                 Text(model.results.isEmpty ? "not scanned" : "to free").font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -409,7 +409,7 @@ struct RefreshResultsCard: View {
                 .scaleEffect(appeared || reduceMotion ? 1 : 0.6).opacity(appeared ? 1 : 0)
             VStack(alignment: .leading, spacing: 4) {
                 Text(outcome.dryRun ? "Dry run: \(outcome.freedBytes.refreshFormatted) would be freed" : "\(outcome.freedBytes.refreshFormatted) moved to the Trash")
-                    .font(.title3.weight(.semibold)).fontDesign(.rounded)
+                    .font(.title3.weight(.semibold)).fontDesign(.monospaced)
                 Text(summary).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             Spacer()

@@ -166,6 +166,8 @@ final class EngineScanService: ScanService {
         o.walk.excludedPrefixes = Array(Set(WalkOptions.defaultExcludedPrefixes + ours + runtime.ownDataRoots + (extraExclusions?() ?? [])))
         o.walk.maxFileSize = UInt64(runtime.config.maxFileSizeMB) << 20
         o.unpackArchives = runtime.config.scanArchives
+        // Keep the Mac responsive: half the cores on power (min 2), one on battery or in Low Power Mode.
+        o.concurrency = PowerThrottle.shared.factor > 1 ? 1 : max(2, ProcessInfo.processInfo.activeProcessorCount / 2)
         return o
     }
 

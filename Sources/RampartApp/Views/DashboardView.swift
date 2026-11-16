@@ -466,7 +466,7 @@ struct FeatureTile: View {
             HStack(spacing: DS.Space.m) {
                 IconBadge(symbol: symbol, tint: tint, size: 38)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(title).font(.body.weight(.semibold)).fontDesign(.rounded).lineLimit(1)
+                    Text(title).font(.body.weight(.semibold)).fontDesign(.monospaced).lineLimit(1)
                     Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(2).fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
@@ -530,7 +530,7 @@ struct StatusTile<Accessory: View, ChartContent: View>: View {
                 }
                 if value == "On" || value == "Off" || value == "Paused" { Text(value).font(.caption.weight(.semibold)).foregroundStyle(tint) }
             } else {
-                Text(value).font(.title3.weight(.semibold)).fontDesign(.rounded)
+                Text(value).font(.title3.weight(.semibold)).fontDesign(.monospaced)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
             if let caption, number == nil || !caption.contains(unit) { Text(caption).font(.caption).foregroundStyle(.secondary).monospacedDigit() }

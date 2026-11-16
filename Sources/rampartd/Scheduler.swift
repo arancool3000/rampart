@@ -40,7 +40,10 @@ final class Scheduler {
 
     private func tick() {
         let cfg = p.runtime.config, st = p.state.value
-        if cfg.scheduledQuickScan, !busy.contains("quickScan"), !p.isScanning,
+        // Scheduled scans wait for the charger (unless one hasn't finished in 3 days).
+        let onBattery = PowerThrottle.shared.factor > 1
+        let overdue = st.lastQuickScan.map { Date().timeIntervalSince($0) > 3 * 86_400 } ?? true
+        if cfg.scheduledQuickScan, !busy.contains("quickScan"), !p.isScanning, !onBattery || overdue,
            Date().timeIntervalSince(started) > 600, Self.dailyDue(hour: cfg.scheduledScanHour, last: st.lastQuickScan),
            !Self.unfinishedAttemptBackoff(lastAttempt: st.lastQuickScanAttempt, lastFinished: st.lastQuickScan) {
             run("quickScan") { [p] in

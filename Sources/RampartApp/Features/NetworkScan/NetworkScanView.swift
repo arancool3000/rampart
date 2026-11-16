@@ -46,7 +46,7 @@ struct NetworkScanView: View {
     private var header: some View {
         HStack(alignment: .center, spacing: Spacing.l) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Home network").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("Home network").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 if let r = model.report {
                     Text("\(r.subnet.cidr) via \(SafeText.line(r.subnet.interface, max: 32))\(r.wifiSecurity.map { " · \(SafeText.line($0, max: 40))" } ?? "") · scanned \(Fmt.ago(r.date))")
                         .font(.callout).foregroundStyle(.secondary)
@@ -102,11 +102,11 @@ struct NetworkScanView: View {
             VStack(alignment: .leading, spacing: Spacing.m) {
                 if let r = model.report, !model.isScanning {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text("\(r.score)").font(.system(size: 56, weight: .bold, design: .rounded)).monospacedDigit()
+                        Text("\(r.score)").font(.system(size: 56, weight: .bold, design: .monospaced)).monospacedDigit()
                             .foregroundStyle(LinearGradient(colors: Palette.gradient(for: r.score), startPoint: .top, endPoint: .bottom))
                         Text("/ 100").font(.title3).foregroundStyle(.secondary)
                     }
-                    Text(NetScanScoring.label(for: r.score)).font(.title3.weight(.semibold)).fontDesign(.rounded)
+                    Text(NetScanScoring.label(for: r.score)).font(.title3.weight(.semibold)).fontDesign(.monospaced)
                     HStack(spacing: Spacing.xl) {
                         Stat(value: r.devices.count, label: "devices")
                         Stat(value: r.findings.filter { $0.severity >= .medium }.count, label: "to review")
@@ -353,7 +353,7 @@ struct DeviceDetail: View {
                 HStack(spacing: Spacing.m) {
                     IconBadge(symbol: device.type.symbol, tint: device.worstSeverity >= .medium ? .statusAttention : .rampartTeal, size: 48)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(SafeText.line(device.displayName, max: 80)).font(.title3.weight(.semibold)).fontDesign(.rounded).lineLimit(2)
+                        Text(SafeText.line(device.displayName, max: 80)).font(.title3.weight(.semibold)).fontDesign(.monospaced).lineLimit(2)
                         Text(device.type.label).foregroundStyle(.secondary)
                     }
                 }

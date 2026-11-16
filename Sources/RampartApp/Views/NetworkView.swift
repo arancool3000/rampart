@@ -183,7 +183,7 @@ struct Stat: View {
     let label: String
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("\(value)").font(.largeTitle.weight(.bold)).fontDesign(.rounded).monospacedDigit().contentTransition(.numericText())
+            Text("\(value)").font(.largeTitle.weight(.bold)).fontDesign(.monospaced).monospacedDigit().contentTransition(.numericText())
             Text(label).font(.callout).foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .combine)

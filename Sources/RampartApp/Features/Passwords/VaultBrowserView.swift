@@ -165,7 +165,7 @@ struct ItemDetail: View {
                 HStack(spacing: Spacing.m) {
                     IconBadge(symbol: item.kind.symbol, size: 44)
                     VStack(alignment: .leading) {
-                        Text(item.title).font(.title2.weight(.semibold)).fontDesign(.rounded)
+                        Text(item.title).font(.title2.weight(.semibold)).fontDesign(.monospaced)
                         Text(item.kind.label + (item.passwordModified.map { " · password changed " + Fmt.ago($0) } ?? "")).font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -480,7 +480,7 @@ struct LockedItemOverlay: View {
     var body: some View {
         VStack(spacing: Spacing.m) {
             IconBadge(symbol: "lock.fill", size: 56)
-            Text(item.title).font(.title2.weight(.semibold)).fontDesign(.rounded)
+            Text(item.title).font(.title2.weight(.semibold)).fontDesign(.monospaced)
             Text("This item is locked. It locks again when you leave it, hide the window or after a minute idle.")
                 .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 360)
             Button { Task { await model.unlockItem(item) } } label: {

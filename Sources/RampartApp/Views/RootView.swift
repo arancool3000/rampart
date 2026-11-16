@@ -269,7 +269,7 @@ struct SidebarBrand: View {
         HStack(spacing: 10) {
             RamPartMark(size: 30)
             VStack(alignment: .leading, spacing: 0) {
-                Text("\(Product.name)").font(.title3.weight(.bold)).fontDesign(.rounded)
+                Text("\(Product.name)").font(.title3.weight(.bold)).fontDesign(.monospaced)
                 Text("Mac security").font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
@@ -355,7 +355,7 @@ struct ScoreRing: View {
             VStack(spacing: 0) {
                 // Counts up in step with the ring as it draws (interpolated by SwiftUI's animation).
                 CountingNumber(value: value)
-                    .font(.system(size: size * 0.34, weight: .bold, design: .rounded))
+                    .font(.system(size: size * 0.34, weight: .bold, design: .monospaced))
                     .monospacedDigit()
                 if size >= 80 { Text("of 100").font(.caption).foregroundStyle(.secondary) }
             }
@@ -462,7 +462,7 @@ struct FeaturePlaceholderView: View {
     var body: some View {
         VStack(spacing: Spacing.l) {
             RamPartMark(size: 64)
-            Text(item.title).font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+            Text(item.title).font(.largeTitle.weight(.bold)).fontDesign(.monospaced)
             Text("This tool is on its way. It will appear here in a future update.")
                 .foregroundStyle(.secondary)
         }

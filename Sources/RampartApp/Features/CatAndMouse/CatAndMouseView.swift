@@ -62,7 +62,7 @@ struct CatAndMouseView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
-            Text("Cat & Mouse").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+            Text("Cat & Mouse").font(.largeTitle.weight(.bold)).fontDesign(.monospaced)
             Text(model.headline()).font(.title3).foregroundStyle(.secondary)
             Text(serious
                  ? "Decoy files and folders that no legitimate app opens. If something reads them, RamPart treats it as a high-confidence threat."

@@ -31,7 +31,7 @@ struct AppFirewallView: View {
         HStack(spacing: Spacing.l) {
             IconBadge(symbol: "flame", tint: Palette.coral, size: 44)
             VStack(alignment: .leading, spacing: 4) {
-                Text("App Firewall").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("App Firewall").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 Text("Which apps are talking to the internet, who signed them, and where they connect.")
                     .font(.callout).foregroundStyle(.secondary)
             }

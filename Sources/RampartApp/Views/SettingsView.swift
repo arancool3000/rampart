@@ -556,7 +556,7 @@ struct InstallFullProtectionSheet: View {
             HStack(spacing: Spacing.m) {
                 IconBadge(symbol: "lock.shield", tint: .rampartTeal, size: 44)
                 VStack(alignment: .leading) {
-                    Text("Enable full protection").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                    Text("Enable full protection").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                     Text("Optional. Basic protection keeps working either way.").foregroundStyle(.secondary)
                 }
             }

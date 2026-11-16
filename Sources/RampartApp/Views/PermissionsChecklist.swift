@@ -190,7 +190,7 @@ struct PermissionsChecklistView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.m) {
             if showsHeader {
-                Text("Set up \(Product.name)").font(.title2.weight(.bold)).fontDesign(.rounded)
+                Text("Set up \(Product.name)").font(.title2.weight(.bold)).fontDesign(.monospaced)
             }
             Text("macOS asks for each permission separately so no app can take everything with one click.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

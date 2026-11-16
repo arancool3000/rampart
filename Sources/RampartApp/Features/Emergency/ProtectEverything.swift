@@ -127,7 +127,7 @@ struct ProtectEverythingView: View {
         VStack(alignment: .leading, spacing: Spacing.m) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: Spacing.xs) {
-                    Text("Protect Everything").font(.title3.weight(.semibold)).fontDesign(.rounded)
+                    Text("Protect Everything").font(.title3.weight(.semibold)).fontDesign(.monospaced)
                     Text("One switch for every protection \(Product.name) has. Turn it off to go back to exactly how things were.")
                         .foregroundStyle(.secondary)
                 }
@@ -142,6 +142,9 @@ struct ProtectEverythingView: View {
         }
         .card()
         .task { await m.refresh() }
+        // Settings and status arrive after the screen opens; recompute so rows never show stale "Off".
+        .onChange(of: AppModel.shared.settings) { _, _ in Task { await m.refresh() } }
+        .onChange(of: AppModel.shared.status.webProtectionOn) { _, _ in Task { await m.refresh() } }
     }
 
     private func row(_ s: ProtectStep) -> some View {

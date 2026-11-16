@@ -57,7 +57,8 @@ struct SectionHeader: View {
     init(_ title: String, trailing: AnyView? = nil) { self.title = title; self.trailing = trailing }
     var body: some View {
         HStack {
-            Text(title).font(.title3.weight(.semibold)).fontDesign(.rounded)
+            Rectangle().fill(Color.rampartTeal).frame(width: 3, height: 16).shadow(color: .rampartTeal.opacity(0.8), radius: 4)
+            Text(title.uppercased()).font(.system(size: 15, weight: .semibold, design: .monospaced)).tracking(1.2)
                 .revealText(on: title)
             Spacer()
             if let trailing { trailing }
@@ -85,9 +86,11 @@ struct Badge: View {
     var tint: Color = .secondary
     var body: some View {
         Text(text)
-            .font(.caption.weight(.medium))
+            .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+            .textCase(.uppercase)
             .padding(.horizontal, 7).padding(.vertical, 2)
-            .background(tint.opacity(0.15), in: Capsule())
+            .background(tint.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
+            .overlay(RoundedRectangle(cornerRadius: 4).strokeBorder(tint.opacity(0.45), lineWidth: 0.75))
             .foregroundStyle(.primary)
     }
 }
@@ -189,18 +192,18 @@ enum DS {
         static let xs: CGFloat = 4, s: CGFloat = 8, m: CGFloat = 12, l: CGFloat = 16, xl: CGFloat = 24, xxl: CGFloat = 32, xxxl: CGFloat = 48
     }
     enum Radius {
-        static let control: CGFloat = 10, tile: CGFloat = 14, card: CGFloat = 16, panel: CGFloat = 22, hero: CGFloat = 28
+        static let control: CGFloat = 6, tile: CGFloat = 8, card: CGFloat = 8, panel: CGFloat = 12, hero: CGFloat = 16
     }
     /// Type scale: display 40 · title 22 · headline 17 · body 14 · callout 13 · caption 11.5 · eyebrow 11 (caps).
     enum Font {
-        static let display = SwiftUI.Font.system(size: 40, weight: .bold, design: .rounded)
-        static let title = SwiftUI.Font.system(size: 22, weight: .semibold, design: .rounded)
-        static let headline = SwiftUI.Font.system(size: 17, weight: .semibold, design: .rounded)
+        static let display = SwiftUI.Font.system(size: 40, weight: .bold, design: .monospaced)
+        static let title = SwiftUI.Font.system(size: 22, weight: .semibold, design: .monospaced)
+        static let headline = SwiftUI.Font.system(size: 17, weight: .semibold, design: .monospaced)
         static let body = SwiftUI.Font.system(size: 14)
         static let callout = SwiftUI.Font.system(size: 13)
         static let caption = SwiftUI.Font.system(size: 11.5)
-        static let eyebrow = SwiftUI.Font.system(size: 11, weight: .semibold, design: .rounded)
-        static let metric = SwiftUI.Font.system(size: 30, weight: .bold, design: .rounded)
+        static let eyebrow = SwiftUI.Font.system(size: 10.5, weight: .semibold, design: .monospaced)
+        static let metric = SwiftUI.Font.system(size: 30, weight: .bold, design: .monospaced)
     }
     /// Space the floating RamPart bot (bottom-right corner) needs kept clear on full-window layouts.
     static let botClearance: CGFloat = 170

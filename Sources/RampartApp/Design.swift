@@ -80,9 +80,12 @@ struct AppBackdrop: View {
             if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
             } else if #available(macOS 15, *) {
-                MeshGradient(width: 3, height: 3,
-                             points: [[0, 0], [0.5, 0], [1, 0], [0, 0.5], [0.58, 0.46], [1, 0.42], [0, 1], [0.45, 1], [1, 1]],
-                             colors: scheme == .dark ? dark : light)
+                ZStack {
+                    MeshGradient(width: 3, height: 3,
+                                 points: [[0, 0], [0.5, 0], [1, 0], [0, 0.5], [0.58, 0.46], [1, 0.42], [0, 1], [0.45, 1], [1, 1]],
+                                 colors: scheme == .dark ? dark : light)
+                    TechGrid(dark: scheme == .dark)
+                }
             } else {
                 ZStack {
                     LinearGradient(colors: scheme == .dark ? [Palette.navy, Palette.midnight] : [light[0], light[4]], startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -95,6 +98,43 @@ struct AppBackdrop: View {
     }
 }
 
+/// Static circuit-board grid: fine lines every 24 pt, brighter every 96 pt, node dots on the major crossings,
+/// faint scanlines. Drawn once per size change (no animation), so it costs nothing while idle.
+struct TechGrid: View {
+    var dark: Bool
+    var body: some View {
+        Canvas(rendersAsynchronously: true) { ctx, size in
+            let line = dark ? Color(red: 0.39, green: 0.95, blue: 0.81) : Color(red: 0.05, green: 0.45, blue: 0.5)
+            var minor = Path(), major = Path(), dots = Path()
+            var x: CGFloat = 0
+            while x <= size.width {
+                (Int(x) % 96 == 0 ? { major.addRect(CGRect(x: x, y: 0, width: 1, height: size.height)) } : { minor.addRect(CGRect(x: x, y: 0, width: 1, height: size.height)) })()
+                x += 24
+            }
+            var y: CGFloat = 0
+            while y <= size.height {
+                (Int(y) % 96 == 0 ? { major.addRect(CGRect(x: 0, y: y, width: size.width, height: 1)) } : { minor.addRect(CGRect(x: 0, y: y, width: size.width, height: 1)) })()
+                y += 24
+            }
+            for gx in stride(from: 0, through: size.width, by: 96) { for gy in stride(from: 0, through: size.height, by: 96) {
+                dots.addRect(CGRect(x: gx - 1, y: gy - 1, width: 3, height: 3)) } }
+            ctx.fill(minor, with: .color(line.opacity(dark ? 0.035 : 0.04)))
+            ctx.fill(major, with: .color(line.opacity(dark ? 0.07 : 0.07)))
+            ctx.fill(dots, with: .color(line.opacity(dark ? 0.25 : 0.2)))
+            if dark {
+                var scan = Path()
+                stride(from: 0, to: size.height, by: 3).forEach { scan.addRect(CGRect(x: 0, y: $0, width: size.width, height: 1)) }
+                ctx.fill(scan, with: .color(Color.black.opacity(0.12)))
+            }
+            // fade the grid out toward the bottom-right so content stays calm
+            ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .radialGradient(Gradient(colors: [.clear, (dark ? Color.black : Color.white).opacity(0.35)]),
+                     center: CGPoint(x: size.width * 0.3, y: size.height * 0.2), startRadius: 0, endRadius: max(size.width, size.height)))
+        }
+        .allowsHitTesting(false)
+        .drawingGroup()
+    }
+}
+
 // MARK: - Cards
 
 struct CardModifier: ViewModifier {
@@ -104,8 +144,9 @@ struct CardModifier: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
         let isDark = scheme == .dark
+        let accent = tint ?? .rampartTeal
         content
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -114,9 +155,11 @@ struct CardModifier: ViewModifier {
                     if reduceTransparency {
                         shape.fill(Color(nsColor: .controlBackgroundColor))
                     } else {
-                        shape.fill(isDark ? Color.white.opacity(0.055) : Color.white.opacity(0.78))
+                        shape.fill(isDark ? Color(red: 0.03, green: 0.07, blue: 0.12).opacity(0.72) : Color.white.opacity(0.82))
+                        // faint scan glow from the top edge
+                        shape.fill(LinearGradient(colors: [accent.opacity(isDark ? 0.07 : 0.05), .clear], startPoint: .top, endPoint: .init(x: 0.5, y: 0.35)))
                         if let tint {
-                            shape.fill(LinearGradient(colors: [tint.opacity(isDark ? 0.22 : 0.14), tint.opacity(0)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                            shape.fill(LinearGradient(colors: [tint.opacity(isDark ? 0.10 : 0.08), tint.opacity(0)], startPoint: .topLeading, endPoint: .bottomTrailing))
                         }
                     }
                 }
@@ -124,17 +167,39 @@ struct CardModifier: ViewModifier {
             }
             .overlay {
                 shape.strokeBorder(
-                    LinearGradient(colors: isDark ? [Color.white.opacity(0.16), Color.white.opacity(0.04)]
-                                                  : [Color.white.opacity(0.9), Color.black.opacity(0.06)],
-                                   startPoint: .top, endPoint: .bottom),
+                    LinearGradient(colors: isDark ? [accent.opacity(0.38), accent.opacity(0.08), Color.white.opacity(0.05)]
+                                                  : [accent.opacity(0.35), Color.black.opacity(0.06)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing),
                     lineWidth: 1)
             }
+            .overlay { HUDCorners(color: accent.opacity(isDark ? 0.85 : 0.6)) }
+    }
+}
+
+/// Targeting-bracket corners for HUD panels.
+struct HUDCorners: View {
+    var color: Color = .rampartTeal
+    var length: CGFloat = 12
+    var inset: CGFloat = -1
+    var body: some View {
+        GeometryReader { g in
+            Path { p in
+                let w = g.size.width, h = g.size.height, l = length, i = inset
+                p.move(to: CGPoint(x: i, y: i + l)); p.addLine(to: CGPoint(x: i, y: i)); p.addLine(to: CGPoint(x: i + l, y: i))
+                p.move(to: CGPoint(x: w - i - l, y: i)); p.addLine(to: CGPoint(x: w - i, y: i)); p.addLine(to: CGPoint(x: w - i, y: i + l))
+                p.move(to: CGPoint(x: w - i, y: h - i - l)); p.addLine(to: CGPoint(x: w - i, y: h - i)); p.addLine(to: CGPoint(x: w - i - l, y: h - i))
+                p.move(to: CGPoint(x: i + l, y: h - i)); p.addLine(to: CGPoint(x: i, y: h - i)); p.addLine(to: CGPoint(x: i, y: h - i - l))
+            }
+            .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .square))
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
 extension View {
     func card(padding: CGFloat = Spacing.l, tint: Color? = nil) -> some View { modifier(CardModifier(padding: padding, tint: tint)) }
-    func roundedDesign() -> some View { self.fontDesign(.rounded) }
+    func roundedDesign() -> some View { self.fontDesign(.monospaced) }
 }
 
 /// Rounded-square gradient icon (tiles, scan cards, onboarding).
@@ -144,13 +209,15 @@ struct IconBadge: View {
     var size: CGFloat = 36
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
-                .fill(LinearGradient(colors: [tint, tint.opacity(0.62)], startPoint: .topLeading, endPoint: .bottomTrailing))
-            RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.25), lineWidth: 1)
+            RoundedRectangle(cornerRadius: size * 0.18, style: .continuous)
+                .fill(tint.opacity(0.14))
+            RoundedRectangle(cornerRadius: size * 0.18, style: .continuous)
+                .strokeBorder(tint.opacity(0.7), lineWidth: 1)
+                .shadow(color: tint.opacity(0.6), radius: 4)
             Image(systemName: symbol)
                 .font(.system(size: size * 0.46, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(tint)
+                .shadow(color: tint.opacity(0.7), radius: 3)
                 .symbolRenderingMode(.hierarchical)
         }
         .frame(width: size, height: size)

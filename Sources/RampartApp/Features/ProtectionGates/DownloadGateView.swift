@@ -45,7 +45,7 @@ struct DownloadGateView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Spacing.s) {
-            Text("Download Gate").font(.largeTitle.weight(.bold)).fontDesign(.rounded)
+            Text("Download Gate").font(.largeTitle.weight(.bold)).fontDesign(.monospaced)
             Text(model.held.isEmpty ? "New downloads are checked before you open them." : "\(model.held.count) download\(model.held.count == 1 ? " is" : "s are") waiting for you.")
                 .font(.title3).foregroundStyle(.secondary)
             Text("RamPart checks each new download within about a second of it finishing: it scans it, makes sure macOS Gatekeeper will check it, and keeps unsigned programs from running until you decide.")

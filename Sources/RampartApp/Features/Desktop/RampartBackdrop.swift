@@ -488,6 +488,81 @@ final class BackdropNSView: NSView {
             root.addSublayer(r)
         }
 
+        // 7a. Force field: a hex-grid dome over the fortress with a shimmer sweeping across it.
+        let domeW = min(w * 0.42, h * 0.95), domeH = horizon * 0.55
+        let domeRect = CGRect(x: (w - domeW) / 2, y: horizon - domeH, width: domeW, height: domeH)
+        let dome = CGMutablePath()
+        dome.move(to: CGPoint(x: domeRect.minX, y: horizon))
+        dome.addCurve(to: CGPoint(x: domeRect.maxX, y: horizon),
+                      control1: CGPoint(x: domeRect.minX, y: domeRect.minY - domeH * 0.33), control2: CGPoint(x: domeRect.maxX, y: domeRect.minY - domeH * 0.33))
+        dome.closeSubpath()
+        let hexImg: CGImage? = {
+            let sz = CGSize(width: domeRect.width * scale, height: domeRect.height * scale)
+            guard let c = CGContext(data: nil, width: Int(sz.width), height: Int(sz.height), bitsPerComponent: 8, bytesPerRow: 0,
+                                    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+            c.setStrokeColor(NSColor.white.cgColor); c.setLineWidth(1 * scale)
+            let r = 14 * scale, hx = r * sqrt(3)
+            var row = 0
+            var yy: CGFloat = 0
+            while yy < sz.height + r {
+                var xx: CGFloat = row % 2 == 0 ? 0 : hx / 2
+                while xx < sz.width + hx {
+                    let p = CGMutablePath()
+                    for k in 0..<6 { let a = CGFloat(k) * .pi / 3 + .pi / 6
+                        let pt = CGPoint(x: xx + r * cos(a), y: yy + r * sin(a)); k == 0 ? p.move(to: pt) : p.addLine(to: pt) }
+                    p.closeSubpath(); c.addPath(p)
+                    xx += hx
+                }
+                yy += r * 1.5; row += 1
+            }
+            c.strokePath()
+            return c.makeImage()
+        }()
+        let domeLocal = { () -> CGPath in var t = CGAffineTransform(translationX: -domeRect.minX, y: -domeRect.minY); return dome.copy(using: &t)! }()
+        let field = CALayer(); field.frame = domeRect
+        let fieldMask = CAShapeLayer(); fieldMask.path = domeLocal; field.mask = fieldMask
+        let hexLayer = CALayer(); hexLayer.frame = field.bounds; hexLayer.contents = hexImg
+        hexLayer.contentsGravity = .resize
+        let tint = CALayer(); tint.frame = field.bounds; tint.backgroundColor = cg(B.teal)
+        tint.mask = hexLayer; tint.opacity = 0.06
+        tint.add(pulse("opacity", from: 0.03, to: 0.09, dur: 4.5), forKey: "breathe")
+        field.addSublayer(tint)
+        // shimmer: a bright band of hexes sweeping left → right
+        let shimmerHex = CALayer(); shimmerHex.frame = field.bounds; shimmerHex.contents = hexImg; shimmerHex.contentsGravity = .resize
+        let shimmer = CAGradientLayer(); shimmer.frame = field.bounds
+        shimmer.colors = [cg(B.teal.opacity(0)), cg(B.teal.opacity(0.55)), cg(B.teal.opacity(0))]
+        shimmer.startPoint = CGPoint(x: 0, y: 0.5); shimmer.endPoint = CGPoint(x: 1, y: 0.5)
+        shimmer.locations = [0, 0.05, 0.1]
+        let sweep = CABasicAnimation(keyPath: "locations")
+        sweep.fromValue = [-0.2, -0.1, 0]; sweep.toValue = [1, 1.1, 1.2]
+        sweep.duration = 2.4
+        let sweepCycle = CAAnimationGroup(); sweepCycle.animations = [sweep]; sweepCycle.duration = 7; sweepCycle.repeatCount = .infinity
+        shimmer.add(sweepCycle, forKey: "sweep")
+        shimmer.mask = shimmerHex
+        field.addSublayer(shimmer)
+        root.addSublayer(field)
+        let rim = CAShapeLayer(); rim.frame = domeRect; rim.path = domeLocal
+        rim.fillColor = nil; rim.strokeColor = cg(B.teal.opacity(0.45)); rim.lineWidth = 1.5
+        rim.shadowColor = cg(B.teal); rim.shadowOpacity = 0.8; rim.shadowRadius = 8; rim.shadowOffset = .zero
+        rim.add(pulse("opacity", from: 0.5, to: 1, dur: 4.5), forKey: "breathe")
+        root.addSublayer(rim)
+
+        // 7a2. Floor scan beam: a bright line sweeps from the gate toward you every few seconds.
+        let beam = CALayer()
+        beam.frame = CGRect(x: 0, y: 0, width: w, height: 3)
+        beam.backgroundColor = cg(B.teal)
+        beam.shadowColor = cg(B.teal); beam.shadowOpacity = 1; beam.shadowRadius = 12; beam.shadowOffset = .zero
+        beam.shadowPath = CGPath(rect: beam.bounds, transform: nil)
+        let bSteps = 24
+        let bys = (0...bSteps).map { i -> NSNumber in let z = Double(i) / Double(bSteps); return NSNumber(value: Double(horizon) + Double(h - horizon) * z * z) }
+        let bop = (0...bSteps).map { i -> NSNumber in let z = Double(i) / Double(bSteps); return NSNumber(value: sin(z * .pi) * 0.9) }
+        let by = CAKeyframeAnimation(keyPath: "position.y"); by.values = bys; by.duration = 2.2
+        let bo = CAKeyframeAnimation(keyPath: "opacity"); bo.values = bop; bo.duration = 2.2
+        let beamCycle = CAAnimationGroup(); beamCycle.animations = [by, bo]; beamCycle.duration = 8; beamCycle.repeatCount = .infinity
+        beam.opacity = 0
+        beam.add(beamCycle, forKey: "scan")
+        root.addSublayer(beam)
+
         // 7b. Shooting stars: a streak crosses the sky now and then.
         for i in 0..<3 {
             let streak = CAGradientLayer()

@@ -176,8 +176,11 @@ public struct DeepContentInspector: Sendable {
         Self.eachMatch(Self.brandDomainRegex, in: s, range: full, &c) { m, c in
             guard m.range(at: 1).location != NSNotFound else { return }
             let d = ns.substring(with: m.range(at: 1)).lowercased()
-            let first = d.split(separator: ".").first.map(String.init) ?? ""
-            if ["com", "org", "net", "io", "group", "app"].contains(first) { return }   // reverse-DNS identifier
+            // Reverse-DNS identifiers (com.apple.security.cs…), even with a stray length byte glued on the front
+            // as in Mach-O string tables ("6com.apple…").
+            let first = (d.split(separator: ".").first.map(String.init) ?? "").drop { $0.isNumber }
+            if ["com", "org", "net", "io", "group", "app"].contains(String(first)) { return }
+            if d.contains("com.apple.") || d.hasPrefix("apple.") { return }
             if s.contains("://" + d) || s.contains("@" + d) { return }                 // already a URL
             c.add(.domain, d, loc(m.range))
         }

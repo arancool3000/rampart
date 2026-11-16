@@ -35,7 +35,7 @@ struct RefreshDestinationView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(item.title).font(.title2.weight(.semibold)).fontDesign(.rounded)
+            Text(item.title).font(.title2.weight(.semibold)).fontDesign(.monospaced)
             Text(subtitle).font(.callout).foregroundStyle(.secondary)
         }
     }

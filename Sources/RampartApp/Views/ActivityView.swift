@@ -248,7 +248,7 @@ struct ActivityStat: View {
                 Text(title).font(.callout.weight(.medium)).foregroundStyle(.secondary)
                 Spacer()
             }
-            Text(Fmt.count(value)).font(.title.weight(.bold)).fontDesign(.rounded).monospacedDigit()
+            Text(Fmt.count(value)).font(.title.weight(.bold)).fontDesign(.monospaced).monospacedDigit()
             Text("Last 14 days").font(.caption).foregroundStyle(.secondary)
             Sparkline(values: values, tint: tint).frame(height: 36)
         }

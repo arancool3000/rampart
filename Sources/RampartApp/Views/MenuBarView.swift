@@ -123,7 +123,7 @@ struct MenuBarView: View {
                         ShieldHero(symbol: sym, tint: tint == .secondary ? .gray : tint, breathe: false, size: 64)
                     }
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(title).font(.headline).fontDesign(.rounded).fixedSize(horizontal: false, vertical: true)
+                        Text(title).font(.headline).fontDesign(.monospaced).fixedSize(horizontal: false, vertical: true)
                             .revealText(on: title, typewriter: true, duration: 0.5)
                             if model.hasData {
                             Text("Score \(model.securityScore) · \(AppModel.scoreLabel(model.securityScore))").font(.callout).foregroundStyle(.secondary)

@@ -78,7 +78,7 @@ struct BotBubbleView: View {
     private var bot: BotController { BotController.shared }
     var body: some View {
         Text(verbatim: bot.bubble ?? "")
-            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .font(.system(size: 12, weight: .semibold, design: .monospaced))
             .foregroundStyle(.primary)
             .lineLimit(3)
             .fixedSize(horizontal: false, vertical: true)

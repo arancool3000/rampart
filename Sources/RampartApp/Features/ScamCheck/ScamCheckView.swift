@@ -108,7 +108,7 @@ struct ScamCheckView: View {
         HStack(spacing: Spacing.l) {
             IconBadge(symbol: "text.magnifyingglass", tint: .rampartTeal, size: 52)
             VStack(alignment: .leading, spacing: 3) {
-                Text("Is this a scam?").font(.title2.weight(.bold)).fontDesign(.rounded)
+                Text("Is this a scam?").font(.title2.weight(.bold)).fontDesign(.monospaced)
                 Text("Paste a text message, email, chat message or link. RamPart checks it on your Mac, explains what it found, and nothing leaves your computer unless you ask for an AI opinion.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
@@ -216,7 +216,7 @@ struct VerdictCard: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: Spacing.s) {
-                        Text(report.verdict.title).font(.title.weight(.bold)).fontDesign(.rounded).foregroundStyle(tint)
+                        Text(report.verdict.title).font(.title.weight(.bold)).fontDesign(.monospaced).foregroundStyle(tint)
                         Badge(text: kindLabel)
                         if report.language != "en" { Badge(text: report.language.uppercased()) }
                     }
@@ -286,7 +286,7 @@ struct RiskGauge: View {
                 .rotationEffect(.degrees(-90))
                 .animation(.easeOut(duration: 0.9), value: animate)
             VStack(spacing: 0) {
-                Text("\(score)").font(.title3.weight(.bold)).fontDesign(.rounded).monospacedDigit()
+                Text("\(score)").font(.title3.weight(.bold)).fontDesign(.monospaced).monospacedDigit()
                 Text("risk").font(.caption2).foregroundStyle(.secondary)
             }
         }

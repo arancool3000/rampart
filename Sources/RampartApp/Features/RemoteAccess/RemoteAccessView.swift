@@ -50,7 +50,7 @@ struct RemoteAccessView: View {
         return HStack(spacing: Spacing.xl) {
             ShieldHero(symbol: lockdownOn ? "lock.shield" : "lock.open", tint: tint, breathe: lockdownOn && unapproved == 0, size: 110)
             VStack(alignment: .leading, spacing: Spacing.s) {
-                Text(title).font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text(title).font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 Text(RemoteAccessCopy.body).foregroundStyle(.secondary)
                 HStack(spacing: Spacing.m) {
                     Toggle("Lockdown", isOn: Binding(get: { lockdownOn }, set: { on in Task { await screen.setLockdown(on, client: model.client) } }))

@@ -108,7 +108,7 @@ struct OnboardingView: View {
             } else {
                 ShieldHero(symbol: symbol, tint: tint, breathe: false, size: 112)
             }
-            Text(title).font(.largeTitle.weight(.bold)).fontDesign(.rounded).multilineTextAlignment(.center)
+            Text(title).font(.largeTitle.weight(.bold)).fontDesign(.monospaced).multilineTextAlignment(.center)
             Text(body).font(.title3).foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
             content()
             Spacer()

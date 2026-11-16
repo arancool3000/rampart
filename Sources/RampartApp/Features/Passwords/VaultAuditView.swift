@@ -11,7 +11,7 @@ struct VaultAuditView: View {
             HStack(spacing: Spacing.xl) {
                 ScoreRing(score: audit.score, size: 96, lineWidth: 10)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Watchtower").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                    Text("Watchtower").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                     Text(summary(audit)).foregroundStyle(.secondary)
                     HStack {
                         if model.meta.settings.breachCheckEnabled {

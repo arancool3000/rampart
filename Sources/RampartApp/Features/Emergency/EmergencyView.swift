@@ -52,7 +52,7 @@ struct EmergencyView: View {
         HStack(alignment: .top, spacing: Spacing.xl) {
             ShieldHero(symbol: "lock.shield", tint: .statusProtected, breathe: false, size: 96)
             VStack(alignment: .leading, spacing: Spacing.s) {
-                Text("Emergency Lockdown").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("Emergency Lockdown").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 Text(EmergencyCopy.intro).foregroundStyle(.secondary)
                 Text(EmergencyCopy.auto).font(.callout).foregroundStyle(.secondary)
                 Button(role: .destructive) { confirmEngage = true } label: { Label("Emergency Lockdown", systemImage: "exclamationmark.octagon") }
@@ -71,7 +71,7 @@ struct EmergencyView: View {
                 Image(systemName: "lock.trianglebadge.exclamationmark.fill").font(.system(size: 40)).foregroundStyle(Color.statusAction)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: Spacing.xs) {
-                    Text("This Mac is locked down").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                    Text("This Mac is locked down").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                     Text(SafeText.line(s.state.reason?.summary ?? "", max: 240)).foregroundStyle(.secondary)
                     if let d = s.state.startedAt { Text("Since \(Fmt.ago(d)) · \(SafeText.line(s.mode, max: 40))").font(.caption).foregroundStyle(.secondary) }
                 }
@@ -183,7 +183,7 @@ struct EmergencyEscalationView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Spacing.l) {
-            Text(SafeText.line(escalation.headline, max: 160)).font(.title2.weight(.semibold)).fontDesign(.rounded)
+            Text(SafeText.line(escalation.headline, max: 160)).font(.title2.weight(.semibold)).fontDesign(.monospaced)
             Text("To stay safe:").font(.headline)
             HStack(alignment: .firstTextBaseline, spacing: Spacing.m) {
                 Text("1.").bold()

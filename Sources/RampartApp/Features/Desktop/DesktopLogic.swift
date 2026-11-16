@@ -433,6 +433,12 @@ enum DesktopFormat {
         if b >= 1e6 { return String(format: "%.1f MB/s", b / 1e6) }
         return String(format: "%.0f KB/s", b / 1e3)
     }
+    /// RAM is sold in binary units (a "24 GB" Mac has 24 × 1024³ bytes); decimal would show it as 26 GB.
+    static func memory(_ n: UInt64) -> String {
+        let g = Double(n) / 1_073_741_824
+        return g >= 1 ? String(format: "%.0f GB", g) : String(format: "%.0f MB", Double(n) / 1_048_576)
+    }
+
     static func bytes(_ n: UInt64) -> String {
         let b = Double(n)
         if b >= 1e12 { return String(format: "%.1f TB", b / 1e12) }

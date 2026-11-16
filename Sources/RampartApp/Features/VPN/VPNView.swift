@@ -56,7 +56,7 @@ struct VPNView: View {
         HStack(alignment: .top, spacing: Spacing.xl) {
             ShieldHero(symbol: phase == .connected ? "lock.shield" : "network.badge.shield.half.filled", tint: tint, breathe: phase == .connected, size: 100)
             VStack(alignment: .leading, spacing: Spacing.s) {
-                Text("RamPart VPN").font(.title2.weight(.semibold)).fontDesign(.rounded)
+                Text("RamPart VPN").font(.title2.weight(.semibold)).fontDesign(.monospaced)
                 StatusLabel(text: phase.label, symbol: phase == .connected ? "checkmark.circle.fill" : phase == .failed ? "xmark.octagon.fill" : "circle.dashed", tint: tint)
                     .font(.headline)
                 if let s = vpn.status, let p = s.profile {
