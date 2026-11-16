@@ -356,7 +356,7 @@ install_rampart() {
   # The old job may still be exiting (ExitTimeOut 20): retry, then fail loudly instead of leaving no service.
   local try=0
   until run launchctl bootstrap system "$DAEMON_PLIST"; do
-    try=$((try + 1)); [ "$try" -lt 10 ] || die "launchctl bootstrap system/$LABEL_D failed"
+    try=$((try + 1)); [ "$try" -lt 30 ] || die "launchctl bootstrap system/$LABEL_D failed"
     sleep 1
   done
   run launchctl enable "system/$LABEL_D" || true
