@@ -17,6 +17,22 @@ private final class ProbeDetector: FileDetector, @unchecked Sendable {
     var paths: Set<String> { lock.lock(); defer { lock.unlock() }; return Set(seen) }
 }
 
+/// Sleeps on every "*.stuck.sh" file and records how many such checks were running at once.
+private final class StuckDetector: FileDetector, @unchecked Sendable {
+    let name = "stuck"
+    private let lock = NSLock()
+    private var running = 0
+    private(set) var peak = 0
+    func inspect(_ facts: FileFacts) -> [Evidence] {
+        guard facts.path.hasSuffix(".stuck.sh") else { return [] }
+        lock.lock(); running += 1; peak = max(peak, running); lock.unlock()
+        Thread.sleep(forTimeInterval: 1.5)
+        lock.lock(); running -= 1; lock.unlock()
+        return []
+    }
+    var peakRunning: Int { lock.lock(); defer { lock.unlock() }; return peak }
+}
+
 // Scan performance: smart triage, low-risk trees, light cache rows, per-file deadline.
 extension SelfTest {
     static func scanPerfChecks() {
@@ -127,5 +143,23 @@ extension SelfTest {
               "scanperf: slow file abandoned at the deadline (\(rs.timedOut))")
         check(rs.scanned == 5 && s1 < 2.5, "scanperf: other files scanned and scan finished in \(String(format: "%.2f", s1)) s")
         _ = sawStall
+
+        // Abandoned threads keep running; replacing each one let many stuck files pile up into many busy
+        // cores (2026-11-15: ~500% CPU). Past the orphan cap replacements wait, and the scan still completes.
+        let stuckDir = work + "/stuck"
+        try? fm.createDirectory(atPath: stuckDir, withIntermediateDirectories: true)
+        for i in 0..<8 { fm.createFile(atPath: stuckDir + "/com.rampart.test.s\(i).stuck.sh", contents: Data("#!/bin/sh\n# \(i)\n".utf8)) }
+        for i in 0..<3 { fm.createFile(atPath: stuckDir + "/com.rampart.test.ok\(i).sh", contents: Data("#!/bin/sh\n# ok \(i)\n".utf8)) }
+        let stuck = StuckDetector()
+        let sc = ScanCoordinator(database: try? HashDatabase.inMemory(), extraDetectors: [stuck])
+        var so2 = ScanOptions(); so2.perFileDeadline = 0.2; so2.concurrency = 2; so2.useCache = false
+        let t2 = Date()
+        let rs2 = sc.scan(paths: [stuckDir], options: so2)
+        let s2 = Date().timeIntervalSince(t2)
+        check(rs2.timedOut == 8 && rs2.scanned == 3, "scanperf: all stuck files abandoned, others scanned (\(rs2.timedOut)/\(rs2.scanned))")
+        // 2 workers + at most 2 orphans, plus the one forced replacement when no live worker would remain.
+        check(stuck.peakRunning <= 5, "scanperf: abandoned threads capped (peak \(stuck.peakRunning) concurrent)")
+        check(s2 < 15, "scanperf: capped scan still finishes (\(String(format: "%.1f", s2)) s)")
+        Thread.sleep(forTimeInterval: 1.6)   // let the last abandoned threads end before later suites
     }
 }

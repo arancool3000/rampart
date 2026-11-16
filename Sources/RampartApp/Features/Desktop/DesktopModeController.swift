@@ -45,8 +45,12 @@ final class DesktopMode {
         didSet { if !Headless.active { UserDefaults.standard.set(allDisplays, forKey: Self.allDisplaysKey) }; if isOn { rebuild() } }
     }
     var welcomeSeen: Bool {
-        didSet { if !Headless.active { UserDefaults.standard.set(welcomeSeen, forKey: Self.welcomeKey) } }
+        didSet {
+            if !Headless.active { UserDefaults.standard.set(welcomeSeen, forKey: Self.welcomeKey) }
+            if welcomeSeen { closeWelcome() }
+        }
     }
+    @ObservationIgnored private var welcomePanel: NSPanel?
 
     /// Set by a SwiftUI view that has `openWindow` (RootView / menu bar), so the desktop can bring the main window back.
     @ObservationIgnored var openMainHandler: (() -> Void)?
@@ -123,6 +127,7 @@ final class DesktopMode {
     private func hide() {
         for l in layers { l.widgets.orderOut(nil); l.backdrop.orderOut(nil); l.widgets.contentView = nil; l.backdrop.contentView = nil }
         layers = []
+        closeWelcome()
         for m in monitors { NSEvent.removeMonitor(m) }
         monitors = []
         for o in observers { NotificationCenter.default.removeObserver(o); NSWorkspace.shared.notificationCenter.removeObserver(o) }
@@ -161,7 +166,27 @@ final class DesktopMode {
             panel.orderFront(nil)
             layers.append(Layer(screenNumber: num, backdrop: back, widgets: panel))
         }
+        if !welcomeSeen { showWelcome() }
     }
+
+    /// The welcome card gets its own normal-level window, centred on the main screen: inside the desktop layer it
+    /// sat below macOS's own desktop widgets (Calendar, Clock…), which covered half of it.
+    private func showWelcome() {
+        guard welcomePanel == nil, !Headless.active, let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let host = FirstMouseHostingView(rootView: DesktopWelcomeCard().frame(width: 560).environment(self)
+            .environment(\.colorScheme, .dark).tint(.rampartTeal))
+        let size = host.fittingSize
+        let vf = screen.visibleFrame
+        let p = NSPanel(contentRect: NSRect(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2, width: size.width, height: size.height),
+                        styleMask: [.borderless], backing: .buffered, defer: false)
+        p.isOpaque = false; p.backgroundColor = .clear; p.hasShadow = true
+        p.isReleasedWhenClosed = false; p.level = .normal; p.isMovableByWindowBackground = true
+        p.collectionBehavior = [.moveToActiveSpace, .fullScreenNone]
+        p.contentView = host
+        p.orderFrontRegardless()
+        welcomePanel = p
+    }
+    private func closeWelcome() { welcomePanel?.orderOut(nil); welcomePanel = nil }
 
     private func configure(_ w: NSWindow, level: NSWindow.Level) {
         w.level = level

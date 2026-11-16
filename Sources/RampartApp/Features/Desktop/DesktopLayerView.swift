@@ -136,7 +136,7 @@ struct DesktopLayerView: View {
                     }
                 }
                 .padding(DS.Space.xl)
-                if primary && (welcomeOverride ?? !desktop.welcomeSeen) {
+                if primary && welcomeOverride == true {   // live: shown in its own window (DesktopMode.showWelcome)
                     DesktopWelcomeCard().frame(maxWidth: 560).padding(.top, 120).zIndex(5)
                 }
             }

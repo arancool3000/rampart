@@ -38,6 +38,8 @@ public struct DeepContentInspector: Sendable {
     public var maxBytes = 16 << 20         // read cap per file
     public var maxZipEntryBytes = 4 << 20
     public var maxIndicators = 500
+    /// Wall-time budget per inspected file (below ScanOptions.perFileDeadline, 20 s).
+    public var timeBudget: TimeInterval = 5
 
     public init(analyzer: URLAnalyzer = URLAnalyzer(), classifyCommand: CommandClassifier? = nil) {
         self.analyzer = analyzer; self.classifyCommand = classifyCommand
@@ -66,7 +68,7 @@ public struct DeepContentInspector: Sendable {
 
     public func inspect(data: Data, name: String) -> DeepInspectionReport {
         let fmt = Self.detectFormat(data: data, name: name)
-        var c = Collector(limit: maxIndicators)
+        var c = Collector(limit: maxIndicators, budget: timeBudget)
         switch fmt {
         case .plist, .webloc, .terminal, .shortcut: inspectPlist(data, name: name, format: fmt, into: &c)
         case .urlFile: inspectINI(data, into: &c)
@@ -121,6 +123,17 @@ public struct DeepContentInspector: Sendable {
         var items: [ExtractedIndicator] = []
         var seen: Set<String> = []
         var extra: [Evidence] = []
+        /// Wall-time budget for one file. Text scanning stops (keeping what it found) once it passes, so one
+        /// pathological file can never pin a core: the scan watchdog abandons a slow file but cannot stop its thread.
+        var deadline: Date = .distantFuture
+        init(limit: Int, budget: TimeInterval? = nil) {
+            self.limit = limit
+            if let budget { deadline = Date().addingTimeInterval(budget) }
+        }
+        var isFull: Bool { items.count >= limit }
+        var outOfTime: Bool { Date() >= deadline }
+        /// True once nothing more can be recorded (full or out of time): extraction loops stop early.
+        var done: Bool { isFull || outOfTime }
         mutating func add(_ k: ExtractedIndicator.Kind, _ v: String, _ loc: String) {
             let v = v.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !v.isEmpty, items.count < limit, seen.insert(k.rawValue + "|" + v + "|" + loc).inserted else { return }
@@ -143,35 +156,53 @@ public struct DeepContentInspector: Sendable {
     ].map { try! NSRegularExpression(pattern: $0) }
 
     func scanString(_ s: String, baseOffset: Int?, keyPath: String?, into c: inout Collector, commands: Bool) {
+        guard !c.done else { return }
         let ns = s as NSString
+        // Byte offset + line are looked up through a one-pass index: rescanning the text from the start for
+        // every match (as this used to) is quadratic and pinned a core per large text file for many minutes.
+        let offsets = TextOffsets(ns)
         func loc(_ r: NSRange) -> String {
             if let kp = keyPath { return "key:" + kp }
-            let off = (baseOffset ?? 0) + ns.substring(to: r.location).utf8.count
-            let line = ns.substring(to: r.location).reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
-            return String(format: "offset:0x%x (line %d)", off, line)
+            let (off, line) = offsets.lookup(r.location)
+            return String(format: "offset:0x%x (line %d)", (baseOffset ?? 0) + off, line)
         }
         let full = NSRange(location: 0, length: ns.length)
-        for m in Self.urlRegex.matches(in: s, range: full) {
+        Self.eachMatch(Self.urlRegex, in: s, range: full, &c) { m, c in
             var u = ns.substring(with: m.range)
             while let last = u.last, ".,;:!?'\"".contains(last) { u.removeLast() }
             c.add(.url, u, loc(m.range))
         }
-        for m in Self.ipRegex.matches(in: s, range: full) { c.add(.ip, ns.substring(with: m.range), loc(m.range)) }
-        for m in Self.brandDomainRegex.matches(in: s, range: full) {
+        Self.eachMatch(Self.ipRegex, in: s, range: full, &c) { m, c in c.add(.ip, ns.substring(with: m.range), loc(m.range)) }
+        Self.eachMatch(Self.brandDomainRegex, in: s, range: full, &c) { m, c in
+            guard m.range(at: 1).location != NSNotFound else { return }
             let d = ns.substring(with: m.range(at: 1)).lowercased()
             let first = d.split(separator: ".").first.map(String.init) ?? ""
-            if ["com", "org", "net", "io", "group", "app"].contains(first) { continue }   // reverse-DNS identifier
-            if s.contains("://" + d) || s.contains("@" + d) { continue }                // already a URL
+            if ["com", "org", "net", "io", "group", "app"].contains(first) { return }   // reverse-DNS identifier
+            if s.contains("://" + d) || s.contains("@" + d) { return }                 // already a URL
             c.add(.domain, d, loc(m.range))
         }
         if commands {
             for re in Self.shellCallRegexes {
-                for m in re.matches(in: s, range: full) where m.numberOfRanges > 1 {
+                Self.eachMatch(re, in: s, range: full, &c) { m, c in
+                    guard m.numberOfRanges > 1, m.range(at: 1).location != NSNotFound else { return }
                     let cmd = ns.substring(with: m.range(at: 1)).replacingOccurrences(of: "\\\"", with: "\"")
                     c.add(.command, cmd, loc(m.range))
                 }
             }
         }
+    }
+
+    /// Enumerates matches until the collector is full or out of time. `.reportProgress` lets ICU call back during
+    /// a long match attempt, so a slow search is cut off at the deadline too.
+    static func eachMatch(_ re: NSRegularExpression, in s: String, range: NSRange, _ c: inout Collector,
+                          _ body: (NSTextCheckingResult, inout Collector) -> Void) {
+        guard !c.done else { return }
+        var col = c
+        re.enumerateMatches(in: s, options: [.reportProgress], range: range) { m, _, stop in
+            if let m { body(m, &col) }
+            if col.done { stop.pointee = true }
+        }
+        c = col
     }
 
     // MARK: formats
@@ -273,16 +304,21 @@ public struct DeepContentInspector: Sendable {
         guard isHTML else { return }
         let ns = s as NSString
         let full = NSRange(location: 0, length: ns.length)
+        let offsets = TextOffsets(ns)
         for (re, label) in [(RedirectChainInspector.metaRefreshRegex, "meta-refresh"), (RedirectChainInspector.jsLocationRegex, "js-location")] {
-            for m in re.matches(in: s, range: full) {
-                let off = ns.substring(to: m.range.location).utf8.count
-                c.add(.action, "\(label) -> \(ns.substring(with: m.range(at: 1)))", String(format: "offset:0x%x (%@)", off, label))
+            Self.eachMatch(re, in: s, range: full, &c) { m, c in
+                // jsLocationRegex has two alternatives ("location = '…'" fills group 1, "location.replace('…')"
+                // fills group 2). Reading an unmatched group threw NSRangeException and crashed the daemon.
+                guard let g = (1..<m.numberOfRanges).map({ m.range(at: $0) }).first(where: { $0.location != NSNotFound }) else { return }
+                let off = offsets.lookup(m.range.location).utf8Offset
+                c.add(.action, "\(label) -> \(ns.substring(with: g))", String(format: "offset:0x%x (%@)", off, label))
             }
         }
     }
 
     func inspectStrings(_ data: Data, into c: inout Collector) {
         for (off, str) in Self.printableStrings(data, minLength: 6) {
+            if c.done { break }
             scanString(str, baseOffset: off, keyPath: nil, into: &c, commands: true)
         }
     }
@@ -320,7 +356,7 @@ public struct DeepContentInspector: Sendable {
                     let tag = ns.substring(with: m.range)
                     guard tag.contains("TargetMode=\"External\"") || ns.substring(with: m.range(at: 1)).contains("://") else { continue }
                     let target = ns.substring(with: m.range(at: 1)).replacingOccurrences(of: "&amp;", with: "&")
-                    let off = ns.substring(to: m.range.location).utf8.count
+                    let off = ns.substring(to: m.range.location).utf8.count   // entries are capped at maxZipEntryBytes
                     c.add(.url, target, String(format: "zip:%@@0x%x", e.name, off))
                     if tag.contains("attachedTemplate") || tag.contains("oleObject") || tag.contains("frame") {
                         c.extra.append(Evidence(source: .heuristic, title: "Document loads a remote template or object",
@@ -438,6 +474,65 @@ public struct DeepContentInspector: Sendable {
         for e in ev where (best[e.title]?.score ?? -1) < e.score { best[e.title] = e }
         let outEv = best.values.sorted { $0.score > $1.score }
         return DeepInspectionReport(path: name, format: format.rawValue, indicators: c.items, evidence: Array(outEv.prefix(20)), urlReports: reports)
+    }
+}
+
+/// Maps UTF-16 match locations to (UTF-8 byte offset, 1-based line) in amortised constant time. Built lazily
+/// in one pass over the text on the first lookup (most strings never produce a match).
+final class TextOffsets {
+    private let ns: NSString
+    private var built = false
+    private var lineStarts: [Int] = []     // UTF-16 index at which each line starts
+    private var checkpoints: [Int] = []    // UTF-8 bytes before UTF-16 index k * stride
+    private static let stride = 1024
+
+    init(_ ns: NSString) { self.ns = ns }
+
+    @inline(__always) private static func utf8Width(_ u: unichar) -> Int {
+        if u < 0x80 { return 1 }
+        if u < 0x800 { return 2 }
+        if u >= 0xD800 && u <= 0xDBFF { return 4 }   // high surrogate: the whole pair is 4 bytes
+        if u >= 0xDC00 && u <= 0xDFFF { return 0 }   // low surrogate: counted with its high half
+        return 3
+    }
+
+    private func build() {
+        built = true
+        let n = ns.length
+        lineStarts = [0]
+        checkpoints.reserveCapacity(n / Self.stride + 2)
+        var buf = [unichar](repeating: 0, count: 1 << 16)
+        var utf8 = 0, pos = 0
+        while pos < n {
+            let len = min(buf.count, n - pos)
+            buf.withUnsafeMutableBufferPointer { ns.getCharacters($0.baseAddress!, range: NSRange(location: pos, length: len)) }
+            for i in 0..<len {
+                let idx = pos + i
+                if idx % Self.stride == 0 { checkpoints.append(utf8) }
+                let u = buf[i]
+                if u == 10 { lineStarts.append(idx + 1) }
+                utf8 += Self.utf8Width(u)
+            }
+            pos += len
+        }
+        if n % Self.stride == 0 { checkpoints.append(utf8) }
+    }
+
+    func lookup(_ location: Int) -> (utf8Offset: Int, line: Int) {
+        if !built { build() }
+        let loc = max(0, min(location, ns.length))
+        let k = loc / Self.stride
+        var off = k < checkpoints.count ? checkpoints[k] : (checkpoints.last ?? 0)
+        let from = k * Self.stride
+        if loc > from {
+            var buf = [unichar](repeating: 0, count: loc - from)
+            buf.withUnsafeMutableBufferPointer { ns.getCharacters($0.baseAddress!, range: NSRange(location: from, length: loc - from)) }
+            for u in buf { off += Self.utf8Width(u) }
+        }
+        // Line = number of line starts at or before loc (binary search).
+        var lo = 0, hi = lineStarts.count
+        while lo < hi { let mid = (lo + hi) / 2; if lineStarts[mid] <= loc { lo = mid + 1 } else { hi = mid } }
+        return (off, max(1, lo))
     }
 }
 

@@ -84,6 +84,9 @@ struct DaemonState: Codable {
     var fdaGrantCDHash: String?
     var lastScan: Date?
     var lastQuickScan: Date?
+    /// When the scheduler last started a quick scan. Newer than `lastQuickScan` means that scan never finished
+    /// (the daemon crashed or was stopped mid-scan); the scheduler then backs off instead of retrying on every start.
+    var lastQuickScanAttempt: Date?
     var lastUpdate: Date?
     var lastUpdateSummary: String?
     var lastPostureCheck: Date?

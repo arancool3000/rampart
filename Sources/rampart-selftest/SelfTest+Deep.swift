@@ -12,6 +12,29 @@ extension SelfTest {
         deepImpersonationChecks()
         deepChainChecks()
         deepBehaviourChecks()
+        deepCPUChecks()
+    }
+
+    /// Regressions for the 2026-11-15 daemon CPU storm / crash loop.
+    static func deepCPUChecks() {
+        let ins = deepInspector
+        // location.replace('…') fills only the second regex group: used to throw NSRangeException (daemon abort).
+        let html = Data("<html><script>location.replace('https://evil.test/x')</script></html>".utf8)
+        let r = ins.inspect(data: html, name: "redirect.html")
+        check(r.indicators.contains { $0.kind == .action && $0.value.contains("https://evil.test/x") }, "deep js location.replace extracted without crash")
+        // Offsets and lines still exact (UTF-8 bytes, multi-byte text before the match).
+        let txt = "é line one\nsecond 🙂 https://a.test/p\n"
+        let r2 = ins.inspect(data: Data(txt.utf8), name: "notes.txt")
+        let want = txt.utf8.count - " https://a.test/p\n".utf8.count + 1
+        check(r2.indicators.contains { $0.kind == .url && $0.location == String(format: "offset:0x%x (line 2)", want) }, "deep text offset/line exact")
+        // Big text with many matches: was quadratic (minutes per file); must finish well inside the 20 s file deadline.
+        var big = ""
+        big.reserveCapacity(9 << 20)
+        for i in 0..<120_000 { big += "row \(i) host 10.\(i % 250).\(i / 250 % 250).1 see https://h\(i).test/p ok\n" }
+        let t0 = Date()
+        let r3 = ins.inspect(data: Data(big.utf8), name: "big.txt")
+        let secs = Date().timeIntervalSince(t0)
+        check(secs < 6 && !r3.indicators.isEmpty, "deep large text bounded (\(String(format: "%.2f", secs)) s)")
     }
 
     static let deepInspector: DeepContentInspector = {

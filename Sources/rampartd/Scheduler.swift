@@ -41,8 +41,12 @@ final class Scheduler {
     private func tick() {
         let cfg = p.runtime.config, st = p.state.value
         if cfg.scheduledQuickScan, !busy.contains("quickScan"), !p.isScanning,
-           Date().timeIntervalSince(started) > 600, Self.dailyDue(hour: cfg.scheduledScanHour, last: st.lastQuickScan) {
-            run("quickScan") { [p] in _ = p.scan(paths: [], quick: true, actor: .schedule, progress: { _, _, _, _ in }) }
+           Date().timeIntervalSince(started) > 600, Self.dailyDue(hour: cfg.scheduledScanHour, last: st.lastQuickScan),
+           !Self.unfinishedAttemptBackoff(lastAttempt: st.lastQuickScanAttempt, lastFinished: st.lastQuickScan) {
+            run("quickScan") { [p] in
+                p.state.update { $0.lastQuickScanAttempt = Date() }
+                _ = p.scan(paths: [], quick: true, actor: .schedule, progress: { _, _, _, _ in })
+            }
         }
         // Definitions: soon after the first start (never updated yet), then at least daily. Network
         // failures are quiet: logged, retried within the hour, never shown as an alert.
@@ -78,6 +82,14 @@ final class Scheduler {
     static func updateFailed(_ summary: String) -> Bool {
         let s = summary.lowercased()
         return s.contains("failed") || s.contains("offline") || s.contains("could not connect") || s.contains("timed out")
+    }
+
+    /// True while a scheduled quick scan that started but never finished (crash, stop) is recent: without this
+    /// a scan that kills the daemon re-ran 10 minutes after every launchd restart, all day.
+    static func unfinishedAttemptBackoff(lastAttempt: Date?, lastFinished: Date?, now: Date = Date(),
+                                         backoff: TimeInterval = 6 * 3600) -> Bool {
+        guard let a = lastAttempt, (lastFinished ?? .distantPast) < a else { return false }
+        return now.timeIntervalSince(a) < backoff
     }
 
     /// True when the most recent occurrence of `hour`:00 is after `last` (missed runs catch up once).

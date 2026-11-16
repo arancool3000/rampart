@@ -64,6 +64,9 @@ public struct ScanOptions: Sendable {
         ".fseventsd", ".DocumentRevisions-V100", ".TemporaryItems", ".Trashes", ".local", ".gnupg", ".zsh_sessions", ".dartServer", ".pub-cache",
         ".kube", ".aws", ".azure", ".config", ".expo", ".gemini", ".ipython", ".jupyter", ".keras", ".matplotlib", ".mozbuild", ".node-gyp",
         ".nuget", ".dotnet", ".sonarlint", ".vscode-insiders", ".windsurf", ".zed",
+        // Local-AI model stores and Python virtualenvs: many GB of weights plus whole vendored Python/JS trees
+        // that the deep-content pass reads file by file. Same class as .ollama/.conda/.pyenv above.
+        ".lmstudio", ".venv",
     ]
 
     public static func hiddenHomeFolders(home: String) -> [String] {
@@ -173,8 +176,9 @@ public final class ScanCoordinator: @unchecked Sendable {
         let explicitFiles = Set(paths.filter { p in var st = stat(); return lstat(p, &st) == 0 && st.isRegular })
         let pool = WorkerPool()
 
-        func startWorker() {
-            group.enter()
+        /// `inheritMembership`: an owed replacement takes over the group slot its abandoned worker kept.
+        func startWorker(inheritMembership: Bool = false) {
+            if !inheritMembership { group.enter() }
             let slot = pool.newSlot()
             let t = Thread { [self] in
                 while let f = queue.pop() {
@@ -185,7 +189,11 @@ public final class ScanCoordinator: @unchecked Sendable {
                                               displayPath: nil, triage: triage)
                     // If the watchdog abandoned this file, it already recorded the timeout, left the group
                     // and started a replacement worker: drop the late result and let this thread end.
-                    guard pool.end(slot) else { return }
+                    guard pool.end(slot) else {
+                        // A replacement held back while too many abandoned threads were still burning CPU is owed now.
+                        if pool.orphanFinished() { startWorker(inheritMembership: true) }
+                        return
+                    }
                     let p = state.record(out, interval: opts.progressInterval)
                     if let p, let progress { progress(p) }
                 }
@@ -201,6 +209,7 @@ public final class ScanCoordinator: @unchecked Sendable {
         let watchdogDone = DispatchSemaphore(value: 0)
         let finished = ScanCancellation()
         let wake = DispatchSemaphore(value: 0)      // ends the watchdog's sleep as soon as the scan is done
+        let maxOrphans = max(2, workers / 2)
         if opts.perFileDeadline > 0 {
             let deadline = opts.perFileDeadline
             let tick = min(1.0, max(0.05, deadline / 4))
@@ -211,9 +220,15 @@ public final class ScanCoordinator: @unchecked Sendable {
                         self.log.error("scan: gave up on \(f.path, privacy: .public) after \(deadline, format: .fixed(precision: 0))s")
                         let out = FileScanOutcome(path: f.path, cacheHit: false, hashedBytes: 0, skippedReason: "timed out")
                         if let p = state.record(out, interval: opts.progressInterval), let progress { progress(p) }
-                        startWorker()          // keep the pool at full strength
-                        group.leave()          // on behalf of the stuck worker
+                        // Keep the pool at full strength, but an abandoned thread cannot be stopped and keeps
+                        // running: replacing every one let stuck files stack up into many busy cores. Past
+                        // `maxOrphans` the replacement waits until an abandoned thread ends (see `starved` for hung ones).
+                        if pool.replaceNow(maxOrphans: maxOrphans) {
+                            startWorker()
+                            group.leave()      // on behalf of the stuck worker
+                        }                      // else its group membership passes to the owed replacement
                     }
+                    if pool.starved(after: max(deadline * 4, 1)) { startWorker(inheritMembership: true) }
                 }
                 watchdogDone.signal()
             }
@@ -513,6 +528,34 @@ private final class WorkerPool: @unchecked Sendable {
         if s.abandoned { slots[ObjectIdentifier(s)] = nil; return false }
         return true
     }
+    /// Abandoned threads that have not finished yet, and replacements held back because of them.
+    private var orphans = 0
+    private var owed = 0
+    private var owedSince = Date.distantFuture
+    /// Called by the watchdog after abandoning a slot: true to start a replacement now, false if it is owed
+    /// until an abandoned thread finishes (or `starved` releases it).
+    func replaceNow(maxOrphans: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if orphans <= maxOrphans { return true }   // counted in abandonOverdue, under the same lock as end()
+        if owed == 0 { owedSince = Date() }
+        owed += 1
+        return false
+    }
+    /// Progress guarantee when abandoned threads never finish (e.g. a read hung on a dead network volume): with no
+    /// live worker left, one owed replacement is released every `after` seconds. Bounds thread growth to that rate.
+    func starved(after: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard owed > 0, !slots.values.contains(where: { !$0.abandoned }), Date().timeIntervalSince(owedSince) >= after else { return false }
+        owed -= 1; owedSince = Date()
+        return true
+    }
+    /// Called by an abandoned thread as it exits: true if it should start an owed replacement.
+    func orphanFinished() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        orphans = max(0, orphans - 1)
+        if owed > 0 { owed -= 1; owedSince = Date(); return true }
+        return false
+    }
     /// Worker is exiting normally. True if it still owns its group membership.
     func retire(_ s: Slot) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -525,7 +568,7 @@ private final class WorkerPool: @unchecked Sendable {
         let now = Date()
         var out: [WalkedFile] = []
         for s in slots.values where !s.abandoned {
-            if let f = s.file, now.timeIntervalSince(s.started) > deadline { s.abandoned = true; out.append(f) }
+            if let f = s.file, now.timeIntervalSince(s.started) > deadline { s.abandoned = true; orphans += 1; out.append(f) }
         }
         return out
     }
