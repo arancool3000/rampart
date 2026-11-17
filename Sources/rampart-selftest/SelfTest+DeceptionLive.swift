@@ -101,7 +101,7 @@ extension SelfTest {
         // Every catch emits one notification alert (posted by the app's menu bar process), playful by default.
         let first = alerts.all.first
         check(alerts.all.count == 1 && first?.title == "🐱 The cat caught a mouse!" && first?.body.hasPrefix("Something grabbed '") == true
-              && first?.timeSensitive == true && first?.catchID == read?.id, "deception.live.catchEmitsNotification")
+              && first?.timeSensitive == false && first?.severity == .medium && first?.catchID == read?.id, "deception.live.catchEmitsNotification")   // no known program: Medium, not time-sensitive
         check(svc.status().alerts?.contains { $0.id == first?.id } == true, "deception.live.alertsInStatusForLateApp")
 
         // A burst is one story: the next catch replaces the same notification with a count.
@@ -168,7 +168,8 @@ extension SelfTest {
         let mazeBefore = catches().filter { $0.access == .mazeWalk }.count
         run("/usr/bin/find", [svc.mazeRoot]); svc.watcher.pollNow()
         let walks = catches().filter { $0.access == .mazeWalk }
-        check(walks.count > mazeBefore && walks.last?.isUnattributed == true && (walks.last?.mazeDeadEnds ?? 0) >= 1, "deception.live.mazeWalkUnattributed")
+        // A folder walk with no known program (find, Finder, backups) proves nothing and is not recorded.
+        check(walks.count == mazeBefore, "deception.live.mazeWalkUnattributedIgnored")
 
         // Read while the daemon wasn't running: reported at the next start, marked as such.
         svc.shutdown()

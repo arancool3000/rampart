@@ -361,6 +361,9 @@ public final class DeceptionService: @unchecked Sendable {
         let inMaze = registry.mazeRoots.contains { t.path == $0 || t.path.hasPrefix($0 + "/") }
         var access = t.access
         var dead = 0
+        // A folder listing with no known program proves nothing: Finder showing ~/Documents, backup tools and
+        // `find`/`grep` all walk folders. Maze walks count only when the system service names the program.
+        if inMaze, t.kind == .mazeDir, proc == nil { return }
         if inMaze, t.kind == .mazeDir, access == .mazeWalk {
             lock.lock()
             let cutoff = t.date.addingTimeInterval(-600)

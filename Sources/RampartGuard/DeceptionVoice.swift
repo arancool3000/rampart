@@ -60,9 +60,9 @@ public enum DeceptionVoice {
     }
 
     /// No actor (user mode without the system service), or only a likely one from a command line. Same facts in
-    /// both tones; severity High (it is still a real touch of a file nobody legitimate opens).
+    /// both tones; severity Medium: a touch with no known program can be Quick Look, a backup or the user.
     static func caughtUnsure(_ c: DeceptionCatch, tone: DeceptionTone) -> DeceptionMessage {
-        let sev: Severity = .high
+        let sev: Severity = c.attribution == .commandLine ? .high : .medium
         let file = q((c.decoyPath as NSString).lastPathComponent)
         let what = c.access == .mazeWalk ? "searched the decoy folder maze (\(c.mazeDeadEnds) folder\(c.mazeDeadEnds == 1 ? "" : "s") so far)"
             : "\(verb(c.access)) your \(decoyLabel(c.decoyKind)) \(file)"
