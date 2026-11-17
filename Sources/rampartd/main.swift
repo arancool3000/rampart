@@ -27,6 +27,27 @@ env RAMPART_NO_PRIVILEGED_TOOLS=1: never spawn sfltool/profiles/systemextensions
 """
 
 var args = Array(CommandLine.arguments.dropFirst())
+
+/// True when the system service's socket accepts a connection (it is root-owned; we only connect, never send).
+func rootServiceAlive() -> Bool {
+    let path = IPC.socketPath
+    var st = stat()
+    guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFSOCK, st.st_uid == 0 else { return false }
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return false }
+    defer { close(fd) }
+    var addr = sockaddr_un(); addr.sun_family = sa_family_t(AF_UNIX)
+    let ok = withUnsafeMutablePointer(to: &addr.sun_path) { p -> Bool in
+        p.withMemoryRebound(to: CChar.self, capacity: 104) { c in
+            guard path.utf8.count < 104 else { return false }
+            strcpy(c, path); return true
+        }
+    }
+    guard ok else { return false }
+    let r = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
+    return r == 0
+}
+
 func flag(_ f: String) -> Bool { if let i = args.firstIndex(of: f) { args.remove(at: i); return true }; return false }
 func option(_ f: String) -> String? {
     guard let i = args.firstIndex(of: f), i + 1 < args.count else { return nil }
@@ -37,7 +58,7 @@ if flag("--help") || flag("-h") { print(usage); exit(0) }
 if flag("--version") { print("rampartd \(Product.version)"); exit(0) }
 let userMode = flag("--user")
 let verbose = flag("--verbose") || flag("-v")
-let noRealtime = flag("--no-realtime")
+var noRealtime = flag("--no-realtime")
 var noScheduler = flag("--no-scheduler")
 let forceScheduler = flag("--scheduler")
 _ = flag("--updates")   // accepted for compatibility; updates are on unless --no-updates
@@ -184,11 +205,16 @@ do { try server.start() } catch {
 
 let scheduler = Scheduler(protection, allowNetworkUpdates: !noUpdates)
 if let rt = services.realtime as? RealtimePipeline { rt.onPersistenceEvent = { scheduler.persistenceChanged() } }
+// Session-only: when the system (root) service is running, this per-user daemon exists only for what has to run
+// in the user's session (Cat & Mouse decoys in the home folder). The root service already does real-time
+// monitoring, scans and the scheduler, so doing them here too would just double the CPU, RAM and battery use.
+let sessionOnly = runtime.userMode && getuid() != 0 && socketOverride == nil && rootServiceAlive()
+if sessionOnly { noRealtime = true; noScheduler = true; logInfo("system service is running: session-only mode (Cat & Mouse only)") }
 if runtime.config.realtime && !noRealtime { protection.startRealtime() }
 services.behaviour?.apply(learningMode: runtime.config.learningMode, developerMode: runtime.config.developerMode)
-protection.applyCanaries()
+if !sessionOnly { protection.applyCanaries() }
 DetectionReevaluator.run(protection, engine: BehaviourWiring.engine)
-if let g = services.guardian {
+if let g = services.guardian, !sessionOnly {
     g.onDetection = { protection.handle($0) }
     g.startMonitor()
 }
@@ -208,7 +234,7 @@ let installed = exePath.hasPrefix("/Library/PrivilegedHelperTools/") || exePath.
 if !forceScheduler && (!installed || Privileged.noPrivilegedTools) { noScheduler = true }
 if Privileged.noPrivilegedTools { logInfo("RAMPART_NO_PRIVILEGED_TOOLS=1: no prompting tools, no pasteboard reads") }
 if !noScheduler { scheduler.start() } else { logInfo("scheduler off") }
-for w in services.warmups { DispatchQueue.global(qos: .utility).async(execute: w) }
+if !sessionOnly { for w in services.warmups { DispatchQueue.global(qos: .utility).async(execute: w) } }
 
 // Signals: TERM/INT -> clean shutdown; HUP -> reload config.
 var signalSources: [DispatchSourceSignal] = []

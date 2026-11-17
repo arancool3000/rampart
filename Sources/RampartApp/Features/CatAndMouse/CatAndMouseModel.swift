@@ -84,7 +84,10 @@ final class CatAndMouseModel {
     /// The maze shows "caught" after any real catch in the last 24 hours (or one that was contained).
     var caughtRecently: Bool { realCatches.contains { $0.contained || Date().timeIntervalSince($0.date) < 86_400 } }
 
-    private var client: DaemonClient { AppModel.shared.client }
+    /// Cat & Mouse runs in the per-user session daemon (decoys live in the home folder). With the system service
+    /// installed, the main client talks to root, so Cat & Mouse uses the session daemon's socket directly.
+    private static let sessionClient = DaemonClient(paths: [IPC.userSocketPath])
+    private var client: DaemonClient { AppModel.shared.health?.mode == "root" ? Self.sessionClient : AppModel.shared.client }
 
     private func apply(_ o: CatAndMouseBridge.Outcome) {
         switch o {

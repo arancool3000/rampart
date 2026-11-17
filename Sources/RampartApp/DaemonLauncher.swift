@@ -222,6 +222,17 @@ final class DaemonLauncher {
         }
     }
 
+    /// Keeps the per-user session daemon registered (it detects the system service and runs only Cat & Mouse).
+    func ensureSessionHelper() {
+        guard !Headless.active, isInstalledCopy else { return }
+        // Registered-but-not-loaded (e.g. booted out by an installer): re-register so launchd starts it again.
+        if !FileManager.default.fileExists(atPath: IPC.userSocketPath), #available(macOS 13, *) {
+            let svc = SMAppService.agent(plistName: Self.agentPlist)
+            if svc.status == .enabled { try? svc.unregister() }
+        }
+        _ = registerAgent()
+    }
+
     /// Called from applicationWillTerminate.
     func appWillTerminate() {
         guard let c = child, c.isRunning else { return }

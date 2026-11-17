@@ -520,7 +520,8 @@ final class AppModel {
             mode = .live
             demoTimer?.invalidate()
             await refresh()
-            if health?.mode == "root" { DaemonLauncher.shared.retireUserHelper() }
+            // The session helper stays: with the system service running it starts in session-only mode (Cat & Mouse).
+            if health?.mode == "root" { DaemonLauncher.shared.ensureSessionHelper() }
             subscribe()
             EmergencyModel.shared.startAlways()
         } else {
