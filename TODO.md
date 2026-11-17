@@ -58,6 +58,8 @@ Kept up to date while working. [x] done, [ ] to do, [~] in progress.
 - [ ] Theme VS Code + Terminal with a RamPart theme (you said yes to "theme every app")
 - [ ] Guard bots: check the walking frames and V squad look right on the live desktop
 
+- [ ] Web protection: DNS briefly fails while the root daemon restarts (installs). Hand DNS back before stopping, or keep a fallback resolver
+
 ## Later
 - [ ] P02/P03 persistence checks; duplicate canary pairs from root + user daemons; flaky redteam memory test
 - [ ] Windows version; iOS version (built on imac.local, SideStore)
