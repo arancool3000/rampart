@@ -416,65 +416,112 @@ final class BackdropNSView: NSView {
             root.addSublayer(d)
         }
 
-        // 3c. Guard bots: a patrol walking the wall and a squad marching up the road into the gate.
-        let botImage: CGImage? = {
+        // 3c. Guard bots: walking (alternating leg frames), with ground shadows. Two patrol the wall, two sentries
+        //     guard the gate, and a five-bot V squad marches up the road into the fortress.
+        let botFrames: [CGImage] = {
             let r = ImageRenderer(content: PixelBotView(state: .idle, stateStarted: .distantPast, cell: 4, paused: true)
                 .environment(\.colorScheme, .dark))
             r.scale = scale
-            return r.cgImage
+            guard let base = r.cgImage else { return [] }
+            let cellPx = Int(4 * scale)
+            let rowsAll = PixelGuard.head(PixelGuard.chosen).count + PixelGuard.body.count
+            let legTop = (BotAnimator.padTop + rowsAll - 2) * cellPx           // last two rows: legs + feet
+            let W = base.width, H = base.height
+            func frame(liftLeft: Bool) -> CGImage? {
+                guard let c = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
+                                        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+                c.interpolationQuality = .none
+                c.draw(base, in: CGRect(x: 0, y: 0, width: W, height: H))
+                // CG origin is bottom-left; the leg band sits `legTop` px from the top.
+                let bandH = H - legTop, half = W / 2
+                let src = CGRect(x: liftLeft ? 0 : half, y: 0, width: half, height: bandH)
+                guard let leg = base.cropping(to: CGRect(x: src.minX, y: CGFloat(legTop), width: src.width, height: CGFloat(bandH))) else { return c.makeImage() }
+                c.clear(src)
+                c.draw(leg, in: src.offsetBy(dx: 0, dy: CGFloat(cellPx)))     // lifted one pixel-cell
+                return c.makeImage()
+            }
+            return [base, frame(liftLeft: true), base, frame(liftLeft: false)].compactMap { $0 }
         }()
         let botSize = PixelBotView.size(cell: 4)
-        func bobbing(_ layer: CALayer, period: Double, offset: Double) {
-            let b = CAKeyframeAnimation(keyPath: "transform.translation.y")
-            b.values = [0, -3, 0, -3, 0]; b.keyTimes = [0, 0.25, 0.5, 0.75, 1]; b.calculationMode = .discrete
-            b.duration = period; b.repeatCount = .infinity; b.timeOffset = offset
-            layer.add(b, forKey: "bob")
+        func makeBot(height bh: CGFloat) -> CALayer {
+            let holder = CALayer()
+            holder.bounds = CGRect(x: 0, y: 0, width: bh * botSize.width / botSize.height, height: bh)
+            let shadow = CALayer()
+            shadow.bounds = CGRect(x: 0, y: 0, width: holder.bounds.width * 0.7, height: max(2, bh * 0.08))
+            shadow.cornerRadius = shadow.bounds.height / 2
+            shadow.position = CGPoint(x: holder.bounds.midX, y: bh * 0.93)
+            shadow.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+            holder.addSublayer(shadow)
+            let sprite = CALayer()
+            sprite.frame = holder.bounds
+            sprite.contents = botFrames.first; sprite.contentsGravity = .resizeAspect; sprite.magnificationFilter = .nearest
+            sprite.name = "sprite"
+            holder.addSublayer(sprite)
+            return holder
         }
-        if let img = botImage {
-            // Patrol: two bots pacing the wall top, turning at the ends.
+        func walk(_ bot: CALayer, step: Double, offset: Double) {
+            guard let sprite = bot.sublayers?.first(where: { $0.name == "sprite" }), botFrames.count == 4 else { return }
+            let f = CAKeyframeAnimation(keyPath: "contents")
+            f.values = botFrames; f.calculationMode = .discrete; f.duration = step * 4; f.repeatCount = .infinity; f.timeOffset = offset
+            sprite.add(f, forKey: "legs")
+            let b = CAKeyframeAnimation(keyPath: "transform.translation.y")
+            b.values = [0, -2, 0, -2]; b.calculationMode = .discrete; b.duration = step * 4; b.repeatCount = .infinity; b.timeOffset = offset
+            sprite.add(b, forKey: "bob")
+        }
+        if !botFrames.isEmpty {
             let wallTop = horizon - B.wallHeight(horizon) - max(4, (horizon / 90).rounded()) * 2
-            let patrolH: CGFloat = horizon * 0.07, patrolW = patrolH * botSize.width / botSize.height
-            for (i, span) in [(0, (w * 0.08, w * 0.30)), (1, (w * 0.70, w * 0.92))] {
-                let bot = CALayer()
-                bot.contents = img; bot.contentsGravity = .resizeAspect; bot.magnificationFilter = .nearest
-                bot.bounds = CGRect(x: 0, y: 0, width: patrolW, height: patrolH)
-                bot.position = CGPoint(x: span.0, y: wallTop - patrolH / 2 + patrolH * 0.12)
-                let walk = CAKeyframeAnimation(keyPath: "position.x")
-                walk.values = [span.0, span.1, span.1, span.0, span.0]; walk.keyTimes = [0, 0.45, 0.5, 0.95, 1]
-                walk.duration = 16 + Double(i) * 3; walk.repeatCount = .infinity; walk.timeOffset = Double(i) * 5
-                bot.add(walk, forKey: "patrol")
-                let face = CAKeyframeAnimation(keyPath: "transform.scale.x")
-                face.values = [1, 1, -1, -1, 1]; face.keyTimes = [0, 0.475, 0.476, 0.975, 0.976]; face.calculationMode = .discrete
-                face.duration = walk.duration; face.repeatCount = .infinity; face.timeOffset = walk.timeOffset
-                bot.add(face, forKey: "turn")
-                bobbing(bot, period: 0.6, offset: Double(i) * 0.3)
+            // Patrol on the wall.
+            let patrolH = horizon * 0.10
+            for (i, span) in [(0, (w * 0.06, w * 0.30)), (1, (w * 0.70, w * 0.94))] {
+                let bot = makeBot(height: patrolH)
+                bot.position = CGPoint(x: span.0, y: wallTop - patrolH / 2 + patrolH * 0.1)
+                let dur = 18 + Double(i) * 4
+                let move = CAKeyframeAnimation(keyPath: "position.x")
+                move.values = [span.0, span.1, span.1, span.0, span.0]; move.keyTimes = [0, 0.46, 0.5, 0.96, 1]
+                move.duration = dur; move.repeatCount = .infinity; move.timeOffset = Double(i) * 6
+                bot.add(move, forKey: "patrol")
+                let turn = CAKeyframeAnimation(keyPath: "transform.scale.x")
+                turn.values = [1, 1, -1, -1, 1]; turn.keyTimes = [0, 0.48, 0.481, 0.98, 0.981]; turn.calculationMode = .discrete
+                turn.duration = dur; turn.repeatCount = .infinity; turn.timeOffset = move.timeOffset
+                bot.add(turn, forKey: "turn")
+                walk(bot, step: 0.16, offset: Double(i) * 0.08)
                 root.addSublayer(bot)
             }
-            // Squad: three bots marching from near the viewer up the road into the gate, shrinking with distance.
-            let march = 14.0, mSteps = 24
-            for (i, lane) in [(0, CGFloat(-0.45)), (1, CGFloat(0.45)), (2, CGFloat(0))] {
-                let bot = CALayer()
-                bot.contents = img; bot.contentsGravity = .resizeAspect; bot.magnificationFilter = .nearest
-                var pos: [NSValue] = [], bnd: [NSValue] = [], op: [NSNumber] = []
+            // Sentries either side of the gate: standing guard, a slow breathing bob.
+            let sentryH = horizon * 0.13
+            for side: CGFloat in [-1, 1] {
+                let bot = makeBot(height: sentryH)
+                bot.position = CGPoint(x: w / 2 + side * (road.topHalf + sentryH * 0.55), y: horizon - sentryH / 2 + sentryH * 0.06)
+                let breathe = CABasicAnimation(keyPath: "transform.translation.y")
+                breathe.fromValue = 0; breathe.toValue = -1.5; breathe.duration = 1.6; breathe.autoreverses = true; breathe.repeatCount = .infinity
+                bot.add(breathe, forKey: "breathe")
+                root.addSublayer(bot)
+            }
+            // Squad: five bots in a V marching up the road, shrinking with distance and fading at the gate.
+            let march = 16.0, mSteps = 28
+            let slots: [(CGFloat, Double)] = [(0, 0), (-0.38, 0.05), (0.38, 0.05), (-0.72, 0.10), (0.72, 0.10)]
+            for (i, slot) in slots.enumerated() {
+                let fullH = horizon * 0.26
+                let bot = makeBot(height: fullH)
+                var pos: [NSValue] = [], scl: [NSNumber] = [], op: [NSNumber] = []
                 for k in 0...mSteps {
-                    let q = 0.92 - 0.9 * Double(k) / Double(mSteps)            // walking away from you
-                    let sF = B.floorS(q, ratio: ratio)
+                    let q = max(0.02, 0.97 - 0.95 * Double(k) / Double(mSteps) + slot.1)
+                    let sF = B.floorS(min(q, 1), ratio: ratio)
                     let half = road.topHalf + (road.bottomHalf - road.topHalf) * sF
-                    let scaleAt = ratio + (1 - ratio) * sF
-                    let bh = max(6, horizon * 0.22 * scaleAt), bw = bh * botSize.width / botSize.height
+                    let perspective = ratio + (1 - ratio) * sF
+                    let bh = max(5, fullH * perspective)
                     let y = horizon + (h - horizon) * sF
-                    pos.append(NSValue(point: CGPoint(x: w / 2 + lane * half * 0.55, y: y - bh / 2)))
-                    bnd.append(NSValue(rect: CGRect(x: 0, y: 0, width: bw, height: bh)))
-                    op.append(NSNumber(value: k == mSteps ? 0 : min(1, 0.25 + Double(scaleAt) * 1.5)))
+                    pos.append(NSValue(point: CGPoint(x: w / 2 + slot.0 * half * 0.8, y: y - bh / 2)))
+                    scl.append(NSNumber(value: Double(bh / fullH)))
+                    op.append(NSNumber(value: k >= mSteps - 1 ? 0 : min(1, 0.3 + Double(perspective) * 1.6)))
                 }
                 let pa = CAKeyframeAnimation(keyPath: "position"); pa.values = pos
-                let ba = CAKeyframeAnimation(keyPath: "bounds"); ba.values = bnd
+                let ba = CAKeyframeAnimation(keyPath: "transform.scale"); ba.values = scl
                 let oa = CAKeyframeAnimation(keyPath: "opacity"); oa.values = op
                 let g = CAAnimationGroup(); g.animations = [pa, ba, oa]; g.duration = march; g.repeatCount = .infinity
-                g.timeOffset = march * Double(i) / 3 + (i == 2 ? 1.2 : 0)
                 bot.opacity = 0
                 bot.add(g, forKey: "march")
-                bobbing(bot, period: 0.5, offset: Double(i) * 0.17)
+                walk(bot, step: 0.2, offset: Double(i % 2) * 0.2)
                 root.addSublayer(bot)
             }
         }

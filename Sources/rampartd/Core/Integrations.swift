@@ -50,7 +50,15 @@ enum Integrations {
             updaters.append(("hashes", {
                 let r = runBlocking { () -> String in
                     do { let r = try await updater.update(); return "\(r.feed): \(r.stored) stored, \(r.pruned) pruned (sig \(r.signatureVersion))" }
-                    catch { return "hash feed failed: \(error)" }
+                    catch {
+                        // abuse.ch closed the free export (HTTP 307/410 without an Auth-Key). That isn't a network
+                        // failure: report it as skipped so the scheduler doesn't retry (and rebuild everything) hourly.
+                        let msg = "\(error)"
+                        if msg.contains("HTTP 307") || msg.contains("HTTP 410") || msg.contains("HTTP 401") || msg.contains("HTTP 403") {
+                            return "hash feed skipped (MalwareBazaar now needs an abuse.ch Auth-Key)"
+                        }
+                        return "hash feed failed: \(error)"
+                    }
                 }
                 return r
             }))
