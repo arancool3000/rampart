@@ -56,7 +56,7 @@ enum DaemonWiring {
             hub.add(FSEventsSource(paths: runtime.watchPaths,
                                    stateURL: runtime.root.appendingPathComponent("fsevents-state.json"),
                                    excludedPrefixes: runtime.ownDataRoots))
-            hub.add(ProcessSweepSource(interval: isRoot ? 0.5 : 1.5))
+            hub.add(ProcessSweepSource(interval: isRoot ? 1.0 : 1.5))
             hub.add(UnifiedLogSource())
             hub.add(ExecWatchSource())
             hub.add(SocketSource(interval: 4))
