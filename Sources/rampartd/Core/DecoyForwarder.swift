@@ -17,6 +17,11 @@ final class DecoyForwarder: @unchecked Sendable {
     private let lock = NSLock()
     private var exact: [String: Target] = [:]
     private var mazeRoots: [(String, Target)] = []
+    private var skip: [String] = []
+    /// Decoy files the system service's scans must not read (reading one trips the user's Cat & Mouse trap).
+    /// The registry is user-writable, so a path is skipped only when, by metadata alone (reading would trip it):
+    /// a regular, non-executable file owned by that user, unmodified since it was planted.
+    var scanExclusions: [String] { lock.lock(); defer { lock.unlock() }; return skip }
     private var pending: [uid_t: (Target, [SecurityEvent])] = [:]
     private var flushScheduled = false
     private var timer: DispatchSourceTimer?
@@ -47,6 +52,7 @@ final class DecoyForwarder: @unchecked Sendable {
     func refresh() {
         var ex: [String: Target] = [:]
         var roots: [(String, Target)] = []
+        var sk: [String] = []
         let homes = (try? FileManager.default.contentsOfDirectory(atPath: usersRoot)) ?? []
         for name in homes where !name.hasPrefix(".") && name != "Shared" {
             let home = usersRoot + "/" + name
@@ -56,9 +62,18 @@ final class DecoyForwarder: @unchecked Sendable {
             for r in Self.loadRecords(Self.registryPath(home: home), uid: hst.st_uid) where Self.acceptable(r.path, home: home, uid: hst.st_uid) {
                 if r.kind == .mazeDir && r.contentSHA256 == "maze-root" { roots.append((r.path, t)) }
                 if r.kind != .mazeLink { ex[r.path] = t }
+                if r.kind != .mazeDir, r.kind != .mazeLink, Self.untouchedDecoyFile(r, uid: hst.st_uid) { sk.append(r.path) }
             }
         }
-        lock.lock(); exact = ex; mazeRoots = roots; lock.unlock()
+        lock.lock(); exact = ex; mazeRoots = roots; skip = sk; lock.unlock()
+    }
+
+    static func untouchedDecoyFile(_ r: DecoyRecord, uid: uid_t) -> Bool {
+        var st = stat()
+        guard lstat(r.path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_uid == uid,
+              st.st_mode & 0o111 == 0, st.st_size < 1 << 20 else { return false }
+        let mtime = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec))
+        return abs(mtime.timeIntervalSince(r.created)) < 120
     }
 
     static func loadRecords(_ path: String, uid: uid_t) -> [DecoyRecord] {

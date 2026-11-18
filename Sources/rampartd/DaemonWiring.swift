@@ -114,6 +114,10 @@ enum DaemonWiring {
                 let prior3 = pipeline.behaviour
                 pipeline.behaviour = { ev in fwd.consider(ev); return prior3?(ev) ?? [] }
                 DaemonWiring.forwarder = fwd
+                if let engine = s.scanner as? EngineScanService {
+                    let previous = engine.extraExclusions
+                    engine.extraExclusions = { (previous?() ?? []) + fwd.scanExclusions }
+                }
             }
             s.realtime = pipeline
             s.onDNSEvent = { [weak pipeline] e in pipeline?.inject(e) }
