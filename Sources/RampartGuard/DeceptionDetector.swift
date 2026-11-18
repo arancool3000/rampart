@@ -79,8 +79,18 @@ public enum DeceptionBenign {
         ["/System/", "/usr/", "/bin/", "/sbin/", "/Library/Apple/"].contains { path.hasPrefix($0) } && !path.hasPrefix("/usr/local/")
     }
 
+    static func isOwnInstalledComponent(_ p: ProcessInfoLite) -> Bool {
+        let lower = p.path.lowercased()
+        let installed = lower.hasPrefix("/applications/rampart.app/contents/") || lower == "/library/privilegedhelpertools/app.rampart.daemon"
+        guard installed, let sid = p.signingID else { return false }
+        return sid.hasPrefix("app.rampart.")
+    }
+
     public static func isBenign(_ p: ProcessInfoLite, ownPaths: [String] = []) -> Bool {
         if ownPaths.contains(where: { !$0.isEmpty && (p.path == $0 || p.path.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/")) }) { return true }
+        // Any installed copy of RamPart itself (its scans walk the decoys too): installed location AND RamPart signing ID,
+        // so a look-alike name elsewhere, or a foreign binary dropped into the bundle, is still caught.
+        if isOwnInstalledComponent(p) { return true }
         // wms-o6: a script driving an on-demand Apple tool (or a copy of one) to read the decoy is still a catch.
         if onDemandTools.contains(p.path) || p.signingID.map(onDemandTools.contains) == true, p.ppid != 1 { return false }
         // Signing ID AND platform binary AND still in a system location: an Apple indexer binary copied to /tmp (it
