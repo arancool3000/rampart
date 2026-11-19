@@ -88,7 +88,6 @@ struct ClientIdentity: Equatable {
         guard SecCodeCopySigningInformation(st, SecCSFlags(rawValue: kSecCSSigningInformation | kSecCSRequirementInformation), &infoCF) == errSecSuccess,
               let info = infoCF as? [String: Any] else { return nil }
         let dynamicOK = SecCodeCheckValidity(code, [], nil) == errSecSuccess
-        let staticOK = SecStaticCodeCheckValidity(st, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess
         let flags = (info[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
         let ents = info[kSecCodeInfoEntitlementsDict as String] as? [String: Any] ?? [:]
         let bad = dangerousEntitlementKeys.filter { (ents[$0] as? Bool) == true }
@@ -96,6 +95,12 @@ struct ClientIdentity: Equatable {
         var path = ""
         var url: CFURL?
         if SecCodeCopyPath(st, [], &url) == errSecSuccess, let url { path = (url as URL).path }
+        // Strict static validation hashes the whole bundle; the app makes many requests a minute, so this re-read
+        // RamPart.app constantly (most of the daemon's idle CPU). The kernel-checked dynamic validity above still runs
+        // every time; the static result is reused for 10 minutes for the same cdhash at the same path.
+        let staticOK = StaticValidityCache.shared.check(cdhash: cd, path: path) {
+            SecStaticCodeCheckValidity(st, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess
+        }
         return ClientIdentity(identifier: info[kSecCodeInfoIdentifier as String] as? String ?? "",
                               teamID: info[kSecCodeInfoTeamIdentifier as String] as? String,
                               cdhash: cd, path: path, valid: dynamicOK && staticOK && !cd.isEmpty,
@@ -491,5 +496,26 @@ enum SecureStore {
             out.append(contentsOf: buf[0..<r])
         }
         return out.count <= maxRead ? out : nil
+    }
+}
+
+
+/// Cached strict static-validation results (cdhash + path → ok), 10-minute lifetime.
+final class StaticValidityCache: @unchecked Sendable {
+    static let shared = StaticValidityCache()
+    private let lock = NSLock()
+    private var entries: [String: (ok: Bool, at: Date)] = [:]
+    func check(cdhash: String, path: String, ttl: TimeInterval = 600, _ compute: () -> Bool) -> Bool {
+        guard !cdhash.isEmpty else { return compute() }
+        let key = cdhash + "|" + path
+        lock.lock()
+        if let e = entries[key], Date().timeIntervalSince(e.at) < ttl { lock.unlock(); return e.ok }
+        lock.unlock()
+        let ok = compute()
+        lock.lock()
+        if entries.count > 64 { entries.removeAll() }
+        entries[key] = (ok, Date())
+        lock.unlock()
+        return ok
     }
 }
