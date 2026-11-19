@@ -47,8 +47,11 @@ public final class YaraRules: @unchecked Sendable {
     let patternsByString: [[Int]]
     let maxSlots: Int
     let defaultExternals: [String: YaraExternal]
-    // Aho–Corasick DFA over case-folded bytes.
+    // Aho–Corasick DFA over case-folded bytes, with byte classes: every byte that appears in no atom behaves the same
+    // (always back to the root), so it shares one column. `acClass` maps a raw byte (case fold included) to its column.
     let acNext: [Int32]
+    let acClass: [UInt8]
+    let acClasses: Int
     let acOutStart: [Int32]
     let acOutCount: [Int32]
     let acOutAtoms: [Int32]
@@ -193,7 +196,19 @@ public final class YaraRules: @unchecked Sendable {
         for s in 0..<nStates {
             oStart[s] = Int32(oAtoms.count); oCount[s] = Int32(outs[s].count); oAtoms += outs[s]
         }
-        acNext = next; acOutStart = oStart; acOutCount = oCount; acOutAtoms = oAtoms
+        // Byte classes: class 0 = bytes in no atom; each byte used by an atom gets its own column.
+        var used = [Bool](repeating: false, count: 256)
+        for a in atomList { for b in a { used[Int(b)] = true } }
+        var classOfFolded = [Int](repeating: 0, count: 256), rep = [0]   // rep[c] = a byte standing for class c
+        if let unusedByte = (0..<256).first(where: { !used[$0] }) { rep[0] = unusedByte }
+        for b in 0..<256 where used[b] { classOfFolded[b] = rep.count; rep.append(b) }
+        let nClasses = rep.count
+        var compact = [Int32](repeating: 0, count: nStates * nClasses)
+        for s in 0..<nStates { for c in 0..<nClasses { compact[s * nClasses + c] = next[s << 8 | rep[c]] } }
+        let fold = (0...255).map { Int(lowerByte(UInt8($0))) }
+        acClass = (0..<256).map { UInt8(classOfFolded[fold[$0]]) }
+        acClasses = nClasses
+        acNext = compact; acOutStart = oStart; acOutCount = oCount; acOutAtoms = oAtoms
 
         stats = YaraCompileStats(sources: sourceStats, patterns: pats.count, atoms: atomList.count, automatonStates: nStates,
                                  unanchoredPatterns: unanch.count, compileSeconds: Date().timeIntervalSince(t0))

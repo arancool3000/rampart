@@ -135,16 +135,16 @@ final class ScanContext {
 
     func searchStrings() throws {
         guard !r.patterns.isEmpty, n > 0 else { return }
-        let fold = ScanContext.fold
+        let width = r.acClasses
         try r.acNext.withUnsafeBufferPointer { next in
             try r.acOutCount.withUnsafeBufferPointer { outCount in
-                try fold.withUnsafeBufferPointer { fold in
+                try r.acClass.withUnsafeBufferPointer { cls in
                     var s = 0
                     var i = 0
                     while i < n {
                         let chunkEnd = min(n, i + (1 << 18))
                         while i < chunkEnd {
-                            s = Int(next[s << 8 | Int(fold[Int(data[i])])])
+                            s = Int(next[s * width + Int(cls[Int(data[i])])])
                             if outCount[s] != 0 { try onHit(state: s, end: i) }
                             i += 1
                         }

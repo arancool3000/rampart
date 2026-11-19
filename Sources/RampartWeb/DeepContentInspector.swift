@@ -181,6 +181,12 @@ public struct DeepContentInspector: Sendable {
             let first = (d.split(separator: ".").first.map(String.init) ?? "").drop { $0.isNumber }
             if ["com", "org", "net", "io", "group", "app"].contains(String(first)) { return }
             if d.contains("com.apple.") || d.hasPrefix("apple.") { return }
+            // Not a web address: a path component (C:\Windows\Microsoft.NET, /opt/Foo.app) or a product name with an
+            // upper-case ending (".NET"). Hosts in real links are written in lower case.
+            let r1 = m.range(at: 1)
+            if r1.location > 0, let prev = Unicode.Scalar(ns.character(at: r1.location - 1)), prev == "\\" || prev == "/" { return }
+            let original = ns.substring(with: r1)
+            if let tld = original.split(separator: ".").last, tld.count > 1, tld.allSatisfy({ $0.isUppercase }) { return }
             if s.contains("://" + d) || s.contains("@" + d) { return }                 // already a URL
             c.add(.domain, d, loc(m.range))
         }
