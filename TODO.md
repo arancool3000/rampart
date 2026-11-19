@@ -27,7 +27,7 @@ Kept up to date while working. [x] done, [ ] to do, [~] in progress.
 - [x] Cached Needs-you / open detections in the app
 - [x] Retire the redundant user daemon when the root daemon runs
 - [x] Return freed memory every minute (root daemon had 158 MB of fragmented free heap)
-- [ ] eslogger subscribes to `open`/`close` (very chatty): measure and trim
+- [x] eslogger `open` subscription removed (no consumer; was most of the idle CPU)
 - [ ] SSD writes: detections.json (~480 KB) and persistence-snapshot.json rewritten on every change → append-only or debounce
 - [ ] Root daemon IPC: Protection.status waits on the blocklist lock during reloads
 - [ ] App: 90 days / ~5,500 activity rows kept in memory → page older rows
@@ -52,13 +52,16 @@ Kept up to date while working. [x] done, [ ] to do, [~] in progress.
       Sources/rampart-selftest/SelfTest+Hx2.swift. Needs your choice: click the unblock link, or OK for me to rewrite history.
 
 ## Still to do (next session)
-- [ ] Root daemon heap fragmentation (~170 MB freed-but-kept after blocklist/YARA rebuilds): build the blocklist
+- [~] Root daemon heap fragmentation (now 120-260 MB settled, was 400-700) (~170 MB freed-but-kept after blocklist/YARA rebuilds): build the blocklist
       without giant transient strings, or rebuild only what changed
-- [ ] Definitions update rebuilds everything every run: skip components that didn't change
+- [x] Blocklist rebuilt only when a list changed; IPC code-signature checks cached (were re-hashing RamPart.app per request)
 - [ ] Theme VS Code + Terminal with a RamPart theme (you said yes to "theme every app")
 - [ ] Guard bots: check the walking frames and V squad look right on the live desktop
 
 - [ ] Web protection: DNS briefly fails while the root daemon restarts (installs). Hand DNS back before stopping, or keep a fallback resolver
+
+- [ ] App itself ~345 MB: page old activity rows, trim view caches
+- [ ] YARA rule tables: byte-class compression done; next: 16-bit state ids
 
 ## Later
 - [ ] P02/P03 persistence checks; duplicate canary pairs from root + user daemons; flaky redteam memory test
