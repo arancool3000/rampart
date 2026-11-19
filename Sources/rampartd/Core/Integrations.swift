@@ -101,7 +101,10 @@ enum Integrations {
         }
         updaters.append(("blocklists", {
             let r = runBlocking { await lists.updateAll() }
-            web.reloadBlocklist()
+            // Rebuilding the blocklist parses hundreds of thousands of domains (CPU + memory churn). Only do it when
+            // a list actually changed, not when every source said "not modified", was rejected or was unreachable.
+            let changed = r.values.contains { if case .updated = $0 { return true }; return false }
+            if changed { web.reloadBlocklist() }
             return r.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: ", ")
         }))
 
