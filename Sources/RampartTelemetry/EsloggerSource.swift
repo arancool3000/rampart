@@ -22,7 +22,9 @@ public final class EsloggerSource: EventSource, CPUReporting {
     public static let binary = "/usr/bin/eslogger"
     /// Default subscription: everything the behaviour engine and scan-on-write consume.
     public static let defaultEvents = [
-        "exec", "fork", "exit", "open", "create", "rename", "close", "unlink", "deleteextattr",
+        // No "open": it is by far the busiest ES event and the parser has no consumer for it (it was decoded and
+        // dropped, costing most of the daemon's idle CPU). Decoy reads are caught by access times instead.
+        "exec", "fork", "exit", "create", "rename", "close", "unlink", "deleteextattr",
         "btm_launch_item_add", "btm_launch_item_remove", "xp_malware_detected", "xp_malware_remediated",
         "tcc_modify", "gatekeeper_user_override", "profile_add",
         // wms-o6: second names for a file (hard link / clone / copy) so decoy and credential-store reads through
